@@ -59,6 +59,16 @@ button { cursor: pointer; }
 .quote i { background: var(--muted); border-radius: 50%; height: 3px; opacity: .5; width: 3px; }
 .connection { gap: .55rem; justify-self: end; }
 .connection strong { font-size: .72rem; }
+.retry-button {
+  align-items: center; background: #151b22; border: 1px solid var(--line);
+  border-radius: 4px; color: var(--muted-bright); display: flex; font-size: .61rem;
+  gap: .35rem; margin-left: .35rem; padding: .4rem .55rem;
+}
+.retry-button:hover, .retry-button:focus-visible {
+  border-color: var(--gold); color: var(--gold-soft); outline: none;
+}
+.retry-button:disabled { cursor: wait; opacity: .55; }
+.retry-button i { color: var(--gold); font-size: .8rem; font-style: normal; }
 .pulse {
   background: var(--gold); border-radius: 50%; box-shadow: 0 0 0 4px rgba(213, 168, 68, .09);
   height: 8px; width: 8px;
@@ -73,6 +83,11 @@ button { cursor: pointer; }
 .safety-strip > span:last-child {
   color: var(--muted); font-family: var(--font-mono); font-size: .65rem; margin-left: auto;
 }
+.retry-status {
+  color: var(--gold-soft); font-family: var(--font-mono); font-size: .6rem;
+  margin-left: auto;
+}
+.retry-status + span { margin-left: 0 !important; }
 .safe-badge {
   background: rgba(213, 168, 68, .12); border: 1px solid rgba(213, 168, 68, .24);
   border-radius: 3px; color: var(--gold-soft); font-family: var(--font-mono);
@@ -162,14 +177,35 @@ h2 { font-size: .95rem; font-weight: 600; margin-bottom: 0; }
 .legend-median { background: var(--gold); height: 2px !important; width: 12px !important; }
 .legend-live { background: transparent; border: 1px solid var(--gold-soft); }
 
-.metric-grid { display: grid; gap: 1rem; grid-template-columns: repeat(3, 1fr); }
+.metric-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
 .metric { min-height: 135px; padding: 1rem; }
 .metric > strong { display: block; font-family: var(--font-mono); font-size: 1.45rem; margin: .55rem 0 .7rem; }
 .metric small, .feedback-panel small, .lot-preview small { color: var(--muted); display: block; font-size: .61rem; line-height: 1.5; }
+.direction-values { display: grid; gap: .55rem; grid-template-columns: 1fr 1fr; margin: .55rem 0 .65rem; }
+.direction-stat {
+  align-items: center; background: #0b0f13; border: 1px solid var(--line-soft);
+  border-radius: 5px; display: flex; gap: .5rem; min-width: 0; padding: .48rem .55rem;
+}
+.direction-stat > i {
+  align-items: center; border-radius: 50%; display: flex; flex: 0 0 auto;
+  font-family: var(--font-mono); font-size: .82rem; font-style: normal; font-weight: 900;
+  height: 24px; justify-content: center; width: 24px;
+}
+.direction-stat strong { display: block; font-family: var(--font-mono); font-size: .92rem; margin-top: .08rem; }
+.direction-stat.up > i { background: rgba(72, 196, 154, .12); color: var(--green); }
+.direction-stat.down > i { background: rgba(228, 111, 111, .12); color: var(--red); }
+.direction-stat.up strong { color: var(--green); }
+.direction-stat.down strong { color: var(--red); }
+.direction-meter { background: #262d34; border-radius: 2px; display: flex; height: 4px; margin-bottom: .45rem; overflow: hidden; }
+.direction-meter i { display: block; height: 100%; }
+.direction-meter .up { background: var(--green); }
+.direction-meter .down { background: var(--red); }
+.direction-summary { text-align: center; }
 .meter { background: #262d34; border-radius: 2px; height: 3px; margin-bottom: .55rem; overflow: hidden; }
 .meter i { background: var(--green); display: block; height: 100%; }
 .meter.amber i { background: var(--gold); }
 .meter.coverage i { background: var(--blue); }
+.meter.realized i { background: var(--green); }
 
 .side-column .panel { padding: 1rem; }
 .decision-card { border-top: 2px solid var(--gold); min-height: 255px; }
@@ -240,6 +276,8 @@ footer strong { color: var(--muted-bright); font-weight: 500; }
   .topbar { gap: .75rem; grid-template-columns: 1fr auto; padding: .7rem 1rem; }
   .topbar-center { grid-column: 1 / -1; grid-row: 2; justify-self: stretch; }
   .connection { grid-column: 2; grid-row: 1; }
+  .connection > div { display: none; }
+  .retry-button { margin-left: 0; }
   .safety-strip { align-items: flex-start; flex-wrap: wrap; padding: .55rem 1rem; }
   .safety-strip > span:last-child { display: none; }
   .workspace { padding: .7rem; }

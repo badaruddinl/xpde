@@ -81,10 +81,18 @@ struct ModelRegistration {
 fn barrier_outcome(
     start_price: f64,
     expected_mfe_usd: f64,
-    proposal: Option<&DecisionProposal>,
+    proposals: &[DecisionProposal],
     bars: &[(f64, f64, f64)],
 ) -> Option<i64> {
-    let proposal = proposal?;
+    if !expected_mfe_usd.is_finite() || expected_mfe_usd <= 0.0 {
+        return None;
+    }
+    let proposal = proposals.iter().find(|proposal| {
+        matches!(
+            proposal.action,
+            DecisionAction::Long | DecisionAction::Short
+        ) && proposal.invalidation_price.is_some()
+    })?;
     let invalidation = proposal.invalidation_price?;
     let target = match proposal.action {
         DecisionAction::Long => start_price + expected_mfe_usd,
@@ -489,7 +497,7 @@ impl Store {
             let tp_before_sl = barrier_outcome(
                 start_price,
                 forecast.expected_mfe_usd,
-                proposals.first(),
+                &proposals,
                 &outcome_bars,
             );
             let metrics = serde_json::json!({
@@ -528,6 +536,7 @@ impl Store {
             "SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
                     COALESCE(AVG(o.direction_hit), 0.0),
+                    COUNT(o.tp_before_sl),
                     AVG(CASE WHEN o.tp_before_sl IS NOT NULL THEN o.tp_before_sl END)
              FROM prediction_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
@@ -538,13 +547,15 @@ impl Store {
                     "settled_predictions": row.get::<_, i64>(0)?,
                     "interval_coverage": row.get::<_, f64>(1)?,
                     "direction_accuracy": row.get::<_, f64>(2)?,
-                    "tp_before_sl_rate": row.get::<_, Option<f64>>(3)?,
+                    "tp_before_sl_samples": row.get::<_, i64>(3)?,
+                    "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
                 }))
             },
         )?;
         let by_model = {
             let mut statement = connection.prepare(
                 "SELECT p.model_id, COUNT(*), AVG(o.interval_hit), AVG(o.direction_hit),
+                        COUNT(o.tp_before_sl),
                         AVG(CASE WHEN o.tp_before_sl IS NOT NULL THEN o.tp_before_sl END)
                  FROM prediction_outcomes o
                  JOIN predictions p ON p.prediction_id=o.prediction_id
@@ -557,7 +568,8 @@ impl Store {
                         "settled_predictions": row.get::<_, i64>(1)?,
                         "interval_coverage": row.get::<_, f64>(2)?,
                         "direction_accuracy": row.get::<_, f64>(3)?,
-                        "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
+                        "tp_before_sl_samples": row.get::<_, i64>(4)?,
+                        "tp_before_sl_rate": row.get::<_, Option<f64>>(5)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -1036,5 +1048,54 @@ fn demo_state() -> RuntimeState {
             human_confirmation_required: true,
             feed_is_demo: true,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xpde_domain::TradingProfile;
+
+    fn proposal(action: DecisionAction, invalidation_price: Option<f64>) -> DecisionProposal {
+        let generated_at = Utc::now();
+        DecisionProposal {
+            prediction_id: Uuid::new_v4(),
+            profile: TradingProfile::Scalper,
+            action,
+            generated_at,
+            expires_at: generated_at + chrono::Duration::minutes(15),
+            expected_edge_after_cost_usd: 1.0,
+            reference_lot: 0.1,
+            invalidation_price,
+            reason_codes: Vec::new(),
+            risk_warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn barrier_outcome_uses_first_actionable_proposal() {
+        let proposals = vec![
+            proposal(DecisionAction::Wait, None),
+            proposal(DecisionAction::Long, Some(99.0)),
+        ];
+        let bars = vec![(101.2, 99.5, 101.0)];
+
+        assert_eq!(barrier_outcome(100.0, 1.0, &proposals, &bars), Some(1));
+    }
+
+    #[test]
+    fn barrier_outcome_detects_short_stop_first() {
+        let proposals = vec![proposal(DecisionAction::Short, Some(101.0))];
+        let bars = vec![(101.2, 99.5, 100.8)];
+
+        assert_eq!(barrier_outcome(100.0, 1.0, &proposals, &bars), Some(0));
+    }
+
+    #[test]
+    fn barrier_outcome_keeps_same_bar_ambiguity_unresolved() {
+        let proposals = vec![proposal(DecisionAction::Long, Some(99.0))];
+        let bars = vec![(101.2, 98.8, 100.2)];
+
+        assert_eq!(barrier_outcome(100.0, 1.0, &proposals, &bars), None);
     }
 }

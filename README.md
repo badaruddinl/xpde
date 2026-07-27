@@ -66,6 +66,11 @@ in the background. Stop only the processes started by that launcher with:
 .\scripts\stop-realtime.ps1
 ```
 
+The bridge automatically retries rejected or temporarily unreachable API calls
+with capped exponential backoff. The dashboard's **Retry realtime** button
+restarts only the local read-only MT5 bridge, prevents duplicate bridge roots,
+and waits until a fresh MT5 snapshot reaches the core.
+
 Alternatively, keep the bridge visible in terminal three:
 
 ```powershell

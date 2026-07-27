@@ -22,6 +22,10 @@ test("server-renders the XPDE shadow terminal", async () => {
   assert.match(html, /GOLDm#/);
   assert.match(html, /SHADOW MODE/);
   assert.match(html, /Auto-trading nonaktif/);
+  assert.match(html, /Probabilitas naik 57\.0%/);
+  assert.match(html, /Probabilitas turun 43\.0%/);
+  assert.match(html, /Retry realtime/);
+  assert.match(html, /Realized TP before SL/);
   assert.match(html, /Decision support only/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
 });

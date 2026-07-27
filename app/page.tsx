@@ -96,6 +96,21 @@ interface DashboardState {
   };
 }
 
+interface EvaluationMetrics {
+  settled_predictions: number;
+  interval_coverage: number;
+  direction_accuracy: number;
+  tp_before_sl_samples: number;
+  tp_before_sl_rate: number | null;
+}
+
+interface EvaluationSummary {
+  overall: EvaluationMetrics;
+  by_model: Array<EvaluationMetrics & { model_id: string }>;
+  target_coverage: number;
+  updated_at: string;
+}
+
 const API_BASE = "http://127.0.0.1:8787";
 const DEMO_REFERENCE_MS = Date.parse("2026-01-01T00:00:00.000Z");
 
@@ -257,6 +272,9 @@ export default function Home() {
   const [transport, setTransport] = useState<"connected" | "fallback">("fallback");
   const [feedbackStatus, setFeedbackStatus] = useState("");
   const [riskPercent, setRiskPercent] = useState(1);
+  const [evaluation, setEvaluation] = useState<EvaluationSummary | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [retryStatus, setRetryStatus] = useState("");
 
   const loadState = useCallback(async () => {
     try {
@@ -269,6 +287,18 @@ export default function Home() {
     }
   }, []);
 
+  const loadEvaluation = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/evaluation/summary`, {
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error("Evaluation API unavailable");
+      setEvaluation((await response.json()) as EvaluationSummary);
+    } catch {
+      setEvaluation(null);
+    }
+  }, []);
+
   useEffect(() => {
     const initial = window.setTimeout(loadState, 0);
     const timer = window.setInterval(loadState, 3000);
@@ -277,6 +307,15 @@ export default function Home() {
       window.clearInterval(timer);
     };
   }, [loadState]);
+
+  useEffect(() => {
+    const initial = window.setTimeout(loadEvaluation, 0);
+    const timer = window.setInterval(loadEvaluation, 15_000);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, [loadEvaluation]);
 
   useEffect(() => {
     const socket = new WebSocket("ws://127.0.0.1:8787/ws");
@@ -294,6 +333,20 @@ export default function Home() {
   }, []);
 
   const proposal = state.proposals.find((item) => item.profile === profile) ?? state.proposals[0];
+  const activeEvaluation =
+    evaluation?.by_model.find((item) => item.model_id === state.forecast.model_id) ??
+    evaluation?.overall;
+  const realizedTpRate = activeEvaluation?.tp_before_sl_rate ?? null;
+  const probabilityUp = state.forecast.direction_probability_up;
+  const probabilityUpPercent = Math.round(probabilityUp * 1000) / 10;
+  const probabilityDownPercent = Math.round((100 - probabilityUpPercent) * 10) / 10;
+  const directionDifferencePoints = Math.abs(
+    probabilityUpPercent - probabilityDownPercent,
+  );
+  const directionSummary =
+    directionDifferencePoints < 0.1
+      ? "Seimbang"
+      : `Selisih ${directionDifferencePoints.toFixed(1)} poin`;
   const observedCoverage = state.forecast.calibration.observed_coverage;
   const coverageHealthy =
     profile === "SCALPER"
@@ -345,6 +398,51 @@ export default function Home() {
     }
   }
 
+  async function retryRealtime() {
+    setRetrying(true);
+    setRetryStatus("Me-restart bridge MT5…");
+    try {
+      const response = await fetch("/api/local/retry-mt5-bridge", {
+        method: "POST",
+        headers: { "X-XPDE-Action": "retry-mt5-bridge" },
+      });
+      const result = (await response.json()) as {
+        status?: "started" | "restarted" | "failed";
+        error?: string;
+      };
+      if (!response.ok || result.status === "failed") {
+        throw new Error(result.error ?? "Retry bridge ditolak");
+      }
+
+      setRetryStatus("Bridge aktif; menunggu tick MT5…");
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 750));
+        const stateResponse = await fetch(`${API_BASE}/api/v1/state`, {
+          cache: "no-store",
+        });
+        if (!stateResponse.ok) continue;
+        const nextState = (await stateResponse.json()) as DashboardState;
+        setState(nextState);
+        const stateAgeMs = Date.now() - Date.parse(nextState.updated_at);
+        if (
+          nextState.connection_status === "MT5_CONNECTED" &&
+          stateAgeMs < 15_000
+        ) {
+          setTransport("connected");
+          setRetryStatus("Realtime tersambung kembali.");
+          return;
+        }
+      }
+      setRetryStatus("Bridge aktif; masih menunggu tick MT5.");
+    } catch (error) {
+      setRetryStatus(
+        error instanceof Error ? `Retry gagal: ${error.message}` : "Retry gagal.",
+      );
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   return (
     <main className="terminal-shell">
       <header className="topbar">
@@ -370,12 +468,22 @@ export default function Home() {
             <strong>{transport === "connected" ? "Core tersambung" : "Demo lokal"}</strong>
             <span>{state.connection_status.replaceAll("_", " ")}</span>
           </div>
+          <button
+            className="retry-button"
+            disabled={retrying}
+            onClick={retryRealtime}
+            type="button"
+          >
+            <i aria-hidden="true">↻</i>
+            {retrying ? "Retrying…" : "Retry realtime"}
+          </button>
         </div>
       </header>
 
       <section className="safety-strip">
         <span className="safe-badge">SHADOW MODE</span>
         <p>Auto-trading nonaktif. Semua proposal membutuhkan verifikasi dan keputusan manusia.</p>
+        {retryStatus ? <span className="retry-status" aria-live="polite">{retryStatus}</span> : null}
         <span>UTC {time(state.updated_at)}</span>
       </section>
 
@@ -465,11 +573,27 @@ export default function Home() {
           </div>
 
           <div className="metric-grid">
-            <article className="panel metric">
-              <span>Probability up</span>
-              <strong>{percent(state.forecast.direction_probability_up)}</strong>
-              <div className="meter"><i style={{ width: percent(state.forecast.direction_probability_up) }} /></div>
-              <small>Down {percent(1 - state.forecast.direction_probability_up)}</small>
+            <article className="panel metric direction-metric">
+              <span>Probabilitas arah</span>
+              <div className="direction-values">
+                <div className="direction-stat up" aria-label={`Probabilitas naik ${probabilityUpPercent.toFixed(1)}%`}>
+                  <i aria-hidden="true">↑</i>
+                  <strong>{probabilityUpPercent.toFixed(1)}%</strong>
+                </div>
+                <div className="direction-stat down" aria-label={`Probabilitas turun ${probabilityDownPercent.toFixed(1)}%`}>
+                  <i aria-hidden="true">↓</i>
+                  <strong>{probabilityDownPercent.toFixed(1)}%</strong>
+                </div>
+              </div>
+              <div
+                className="direction-meter"
+                aria-label={`${probabilityUpPercent.toFixed(1)}% naik, ${probabilityDownPercent.toFixed(1)}% turun`}
+                role="img"
+              >
+                <i className="up" style={{ width: `${probabilityUpPercent}%` }} />
+                <i className="down" style={{ width: `${probabilityDownPercent}%` }} />
+              </div>
+              <small className="direction-summary">{directionSummary}</small>
             </article>
             <article className="panel metric">
               <span>TP before invalidation</span>
@@ -482,6 +606,18 @@ export default function Home() {
               <strong>{percent(state.forecast.calibration.observed_coverage)}</strong>
               <div className="meter coverage"><i style={{ width: percent(state.forecast.calibration.observed_coverage) }} /></div>
               <small>Target 80% · n={state.forecast.calibration.sample_size}</small>
+            </article>
+            <article className="panel metric">
+              <span>Realized TP before SL</span>
+              <strong>{realizedTpRate === null ? "—" : percent(realizedTpRate)}</strong>
+              <div className="meter realized">
+                <i style={{ width: realizedTpRate === null ? "0%" : percent(realizedTpRate) }} />
+              </div>
+              <small>
+                {activeEvaluation
+                  ? `Outcome valid n=${activeEvaluation.tp_before_sl_samples} · settled=${activeEvaluation.settled_predictions}`
+                  : "Menunggu evaluation API"}
+              </small>
             </article>
           </div>
         </section>

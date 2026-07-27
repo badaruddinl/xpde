@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+import io
+import urllib.error
+import urllib.request
+
+import pytest
+
+from xpde_ml.mt5_bridge import PayloadRejected, next_retry_delay, post_payload
+
+
+def test_http_error_includes_api_response_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    def reject(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "http://127.0.0.1:8787/api/v1/market/snapshot",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"snapshot rejected because data is stale"}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", reject)
+
+    with pytest.raises(PayloadRejected) as raised:
+        post_payload(
+            "http://127.0.0.1:8787/api/v1/market/snapshot",
+            {"symbol": "GOLDm#"},
+        )
+
+    assert raised.value.status == 400
+    assert "snapshot rejected because data is stale" in raised.value.body
+    assert "HTTP 400" in str(raised.value)
+
+
+def test_retry_delay_doubles_and_respects_cap() -> None:
+    assert next_retry_delay(1.0, 10.0) == 2.0
+    assert next_retry_delay(8.0, 10.0) == 10.0

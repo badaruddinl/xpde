@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,19 @@ from .time_utils import BrokerClock
 
 SYMBOL = "GOLDm#"
 TIMEFRAME = "M5"
+
+
+class PayloadRejected(RuntimeError):
+    def __init__(self, url: str, status: int, body: str) -> None:
+        self.url = url
+        self.status = status
+        self.body = body
+        detail = body.strip() or "empty response body"
+        super().__init__(f"{url} rejected payload with HTTP {status}: {detail}")
+
+
+def next_retry_delay(current: float, maximum: float) -> float:
+    return min(maximum, max(current * 2, 0.5))
 
 
 def initialize_mt5(mt5: Any) -> None:
@@ -131,9 +146,14 @@ def post_payload(api_url: str, payload: dict[str, Any], expected_status: int = 2
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        if response.status != expected_status:
-            raise RuntimeError(f"payload rejected with HTTP {response.status}")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status != expected_status:
+                body = response.read().decode("utf-8", errors="replace")
+                raise PayloadRejected(api_url, response.status, body)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise PayloadRejected(api_url, error.code, body) from error
 
 
 def main() -> None:
@@ -144,6 +164,7 @@ def main() -> None:
         default="http://127.0.0.1:8787/api/v1/forecast",
     )
     parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--max-retry-delay", type=float, default=10.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--snapshot-only", action="store_true")
     parser.add_argument("--print", action="store_true", dest="print_snapshot")
@@ -185,31 +206,52 @@ def main() -> None:
         last_forecast_bar: str | None = None
         last_tick_signature: tuple[str, float, float] | None = None
         last_tick_change = time.monotonic()
+        retry_delay = max(args.interval, 0.5)
         while True:
-            snapshot = build_snapshot(mt5, broker_clock=broker_clock)
-            tick_signature = (
-                snapshot["timestamp"],
-                snapshot["bid"],
-                snapshot["ask"],
-            )
-            if tick_signature != last_tick_signature:
-                last_tick_signature = tick_signature
-                last_tick_change = time.monotonic()
-            snapshot["data_quality"]["tick_age_ms"] = int(
-                (time.monotonic() - last_tick_change) * 1000
-            )
-            if args.print_snapshot:
-                print(json.dumps(snapshot, indent=2))
-            post_payload(args.api_url, snapshot)
-            latest_bar = snapshot["bars"][-1]["timestamp"]
-            if not args.snapshot_only and latest_bar != last_forecast_bar:
-                forecast = (
-                    candidate.forecast(snapshot)
-                    if candidate is not None
-                    else forecast_from_snapshot(snapshot)
+            try:
+                snapshot = build_snapshot(mt5, broker_clock=broker_clock)
+                tick_signature = (
+                    snapshot["timestamp"],
+                    snapshot["bid"],
+                    snapshot["ask"],
                 )
-                post_payload(args.forecast_url, forecast)
-                last_forecast_bar = latest_bar
+                if tick_signature != last_tick_signature:
+                    last_tick_signature = tick_signature
+                    last_tick_change = time.monotonic()
+                snapshot["data_quality"]["tick_age_ms"] = int(
+                    (time.monotonic() - last_tick_change) * 1000
+                )
+                if args.print_snapshot:
+                    print(json.dumps(snapshot, indent=2))
+                post_payload(args.api_url, snapshot)
+                latest_bar = snapshot["bars"][-1]["timestamp"]
+                if not args.snapshot_only and latest_bar != last_forecast_bar:
+                    forecast = (
+                        candidate.forecast(snapshot)
+                        if candidate is not None
+                        else forecast_from_snapshot(snapshot)
+                    )
+                    post_payload(args.forecast_url, forecast)
+                    last_forecast_bar = latest_bar
+            except (
+                PayloadRejected,
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                RuntimeError,
+            ) as error:
+                print(
+                    f"XPDE bridge retrying in {retry_delay:.1f}s after: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if args.once:
+                    raise
+                time.sleep(retry_delay)
+                retry_delay = next_retry_delay(retry_delay, args.max_retry_delay)
+                continue
+
+            retry_delay = max(args.interval, 0.5)
             if args.once:
                 break
             time.sleep(max(args.interval, 0.25))
