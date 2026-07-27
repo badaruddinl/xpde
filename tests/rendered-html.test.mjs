@@ -1,0 +1,40 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { readFile } from "node:fs/promises";
+
+async function render() {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  return worker.fetch(
+    new Request("http://localhost/", { headers: { accept: "text/html" } }),
+    { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
+    { waitUntil() {}, passThroughOnException() {} },
+  );
+}
+
+test("server-renders the XPDE shadow terminal", async () => {
+  const response = await render();
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
+  const html = await response.text();
+  assert.match(html, /<title>XPDE — GOLDm# Shadow Terminal<\/title>/i);
+  assert.match(html, /GOLDm#/);
+  assert.match(html, /SHADOW MODE/);
+  assert.match(html, /Auto-trading nonaktif/);
+  assert.match(html, /Decision support only/);
+  assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
+});
+
+test("keeps the server and client hydration fixture deterministic", async () => {
+  const source = await readFile(
+    new URL("../app/page.tsx", import.meta.url),
+    "utf8",
+  );
+  const fixtureStart = source.indexOf("function buildDemoState");
+  const fixtureEnd = source.indexOf("function money");
+  assert.ok(fixtureStart >= 0 && fixtureEnd > fixtureStart);
+  const fixture = source.slice(fixtureStart, fixtureEnd);
+  assert.doesNotMatch(fixture, /Date\.now\(\)|new Date\(\)\.toISOString\(\)/);
+  assert.match(fixture, /DEMO_REFERENCE_MS/);
+});

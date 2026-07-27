@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xpde-ml"
+version = "0.1.0"
+description = "Probabilistic forecasting and MetaTrader 5 bridge for GOLDm#"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+mt5 = ["MetaTrader5>=5.0.45"]
+train = [
+  "catboost>=1.2.8",
+  "numpy>=2.1",
+  "pandas>=2.2",
+  "scikit-learn>=1.6",
+]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+xpde-baseline = "xpde_ml.baseline:main"
+xpde-mt5 = "xpde_ml.mt5_bridge:main"
+xpde-backfill = "xpde_ml.backfill_mt5:main"
+xpde-settle = "xpde_ml.settle_outcomes:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xpde_ml*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,32 @@
+[server]
+bind = "127.0.0.1:8787"
+database_path = "data/xpde.sqlite"
+
+[provider]
+name = "MetaTrader5"
+symbol = "GOLDm#"
+timeframe = "M5"
+poll_interval_ms = 1000
+max_tick_age_ms = 10000
+
+[broker_profile]
+instrument_name = "GOLD"
+asset_class = "Precious Metals"
+expected_leverage = 1000
+contract_size_oz_per_lot = 1.0
+minimum_lot = 0.1
+maximum_lot = 100.0
+minimum_price_fluctuation = 0.01
+advertised_min_spread_usd = 0.24
+
+[policy.scalper]
+max_spread_usd = 0.80
+slippage_buffer_usd = 0.08
+min_direction_probability = 0.56
+min_barrier_probability = 0.52
+
+[policy.sniper]
+max_spread_usd = 0.55
+slippage_buffer_usd = 0.08
+min_direction_probability = 0.64
+min_barrier_probability = 0.60
