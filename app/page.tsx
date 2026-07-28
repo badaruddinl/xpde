@@ -4,6 +4,12 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 type Profile = "SCALPER" | "SNIPER";
 type DecisionAction = "LONG" | "SHORT" | "WAIT" | "NO_PREDICTION";
+type ForecastStatus =
+  | "DEMO"
+  | "WAITING_FOR_FIRST_FORECAST"
+  | "CURRENT"
+  | "ORIGIN_MISMATCH"
+  | "EXPIRED";
 
 interface MarketBar {
   timestamp: string;
@@ -28,10 +34,12 @@ interface Proposal {
   profile: Profile;
   action: DecisionAction;
   generated_at: string;
-  expires_at: string;
+  decision_valid_until: string;
+  outcome_matures_at: string;
   expected_edge_after_cost_usd: number;
   reference_lot: number;
   invalidation_price: number | null;
+  target_price: number | null;
   reason_codes: string[];
   risk_warnings: string[];
 }
@@ -40,6 +48,7 @@ interface DashboardState {
   mode: string;
   connection_status: string;
   updated_at: string;
+  forecast_status: ForecastStatus;
   snapshot: {
     symbol: string;
     provider: string;
@@ -82,6 +91,12 @@ interface DashboardState {
     direction_probability_up: number;
     barrier_probability_long: number;
     barrier_probability_short: number;
+    barrier_spec_id: string;
+    barrier_horizon_bars: number;
+    target_price_long: number;
+    stop_price_long: number;
+    target_price_short: number;
+    stop_price_short: number;
     expected_mfe_long: number;
     expected_mae_long: number;
     expected_mfe_short: number;
@@ -121,11 +136,13 @@ interface EvaluationSummary {
   };
   by_model: Array<EvaluationMetrics & { model_id: string }>;
   target_coverage: number;
+  current_model_window: number;
   updated_at: string;
 }
 
 const API_BASE = "http://127.0.0.1:8787";
 const DEMO_REFERENCE_MS = Date.parse("2026-01-01T00:00:00.000Z");
+const MIN_LIVE_EVIDENCE = 100;
 
 function buildDemoState(): DashboardState {
   // This fixture is rendered on both the server and the browser during
@@ -147,11 +164,13 @@ function buildDemoState(): DashboardState {
   });
   const predictionId = "demo-shadow-prediction";
   const now = new Date(DEMO_REFERENCE_MS).toISOString();
-  const expiresAt = new Date(DEMO_REFERENCE_MS + 15 * 60_000).toISOString();
+  const decisionValidUntil = new Date(DEMO_REFERENCE_MS + 10 * 60_000).toISOString();
+  const outcomeMaturesAt = new Date(DEMO_REFERENCE_MS + 20 * 60_000).toISOString();
   return {
     mode: "DEMO_SHADOW",
     connection_status: "WAITING_FOR_MT5",
     updated_at: now,
+    forecast_status: "DEMO",
     snapshot: {
       symbol: "GOLDm#",
       provider: "MetaTrader5 demo fixture",
@@ -196,6 +215,12 @@ function buildDemoState(): DashboardState {
       direction_probability_up: 0.57,
       barrier_probability_long: 0.54,
       barrier_probability_short: 0.46,
+      barrier_spec_id: "atr-1.25tp-1.00sl-h3-v1",
+      barrier_horizon_bars: 3,
+      target_price_long: bars[bars.length - 1].close + 1.25,
+      stop_price_long: bars[bars.length - 1].close - 1,
+      target_price_short: bars[bars.length - 1].close - 1.25,
+      stop_price_short: bars[bars.length - 1].close + 1,
       expected_mfe_long: 1.42,
       expected_mae_long: 0.91,
       expected_mfe_short: 1.31,
@@ -220,10 +245,12 @@ function buildDemoState(): DashboardState {
         profile: "SCALPER",
         action: "WAIT",
         generated_at: now,
-        expires_at: expiresAt,
+        decision_valid_until: decisionValidUntil,
+        outcome_matures_at: outcomeMaturesAt,
         expected_edge_after_cost_usd: -0.01,
         reference_lot: 0.1,
         invalidation_price: null,
+        target_price: null,
         reason_codes: ["EDGE_TOO_SMALL_AFTER_COST"],
         risk_warnings: ["HIGH_LEVERAGE_ACCOUNT", "MANUAL_CONFIRMATION_REQUIRED"],
       },
@@ -232,10 +259,12 @@ function buildDemoState(): DashboardState {
         profile: "SNIPER",
         action: "WAIT",
         generated_at: now,
-        expires_at: expiresAt,
+        decision_valid_until: decisionValidUntil,
+        outcome_matures_at: outcomeMaturesAt,
         expected_edge_after_cost_usd: -0.01,
         reference_lot: 0.1,
         invalidation_price: null,
+        target_price: null,
         reason_codes: [
           "EDGE_TOO_SMALL_AFTER_COST",
           "DIRECTION_PROBABILITY_TOO_LOW",
@@ -265,14 +294,16 @@ function percent(value: number, digits = 1) {
   return `${(value * 100).toFixed(digits)}%`;
 }
 
-function time(value: string) {
+function time(value: string | null | undefined) {
+  const parsed = new Date(value ?? "");
+  if (Number.isNaN(parsed.getTime())) return "—";
   return new Intl.DateTimeFormat("id-ID", {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
     timeZone: "UTC",
-  }).format(new Date(value));
+  }).format(parsed);
 }
 
 function reasonLabel(reason: string) {
@@ -285,6 +316,9 @@ function reasonLabel(reason: string) {
     SPREAD_ABOVE_LIMIT: "Spread melewati batas profil",
     DRIFT_DETECTED: "Drift model terdeteksi",
     FORECAST_SIDE_CONFLICT: "Arah quantile, classifier, dan barrier tidak selaras",
+    FORECAST_ORIGIN_MISMATCH: "Forecast belum tersedia untuk candle M5 terbaru",
+    FORECAST_EXPIRED: "Masa berlaku keputusan forecast sudah lewat",
+    FORECAST_INVALID: "Kontrak forecast atau barrier tidak valid",
     EXCURSION_MODEL_UNAVAILABLE: "Model MFE/MAE dinamis belum tersedia",
   };
   return labels[reason] ?? reason.replaceAll("_", " ").toLowerCase();
@@ -360,14 +394,20 @@ export default function Home() {
   const activeEvaluation = evaluation?.current_model ?? null;
   const sessionEvaluation = evaluation?.current_session ?? null;
   const liveCoverage =
-    activeEvaluation && activeEvaluation.settled_predictions > 0
+    activeEvaluation &&
+    activeEvaluation.settled_predictions >= MIN_LIVE_EVIDENCE
       ? activeEvaluation.interval_coverage
       : null;
   const sessionDirectionAccuracy =
-    sessionEvaluation && sessionEvaluation.settled_predictions > 0
+    sessionEvaluation &&
+    sessionEvaluation.settled_predictions >= MIN_LIVE_EVIDENCE
       ? sessionEvaluation.direction_accuracy
       : null;
-  const realizedTpRate = activeEvaluation?.tp_before_sl_rate ?? null;
+  const realizedTpRate =
+    activeEvaluation &&
+    activeEvaluation.tp_before_sl_samples >= MIN_LIVE_EVIDENCE
+      ? activeEvaluation.tp_before_sl_rate
+      : null;
   const horizonThree =
     state.forecast.points.find((point) => point.horizon_bars === 3) ??
     state.forecast.points[0];
@@ -377,6 +417,14 @@ export default function Home() {
       : horizonThree.q50 >= 0
         ? "LONG"
         : "SHORT";
+  const barrierTarget =
+    forecastSide === "LONG"
+      ? state.forecast.target_price_long
+      : state.forecast.target_price_short;
+  const barrierStop =
+    forecastSide === "LONG"
+      ? state.forecast.stop_price_long
+      : state.forecast.stop_price_short;
   const barrierProbability =
     forecastSide === "LONG"
       ? state.forecast.barrier_probability_long
@@ -411,26 +459,61 @@ export default function Home() {
   const lastBars = state.snapshot.current_bar
     ? [...completedBars, state.snapshot.current_bar]
     : completedBars;
-  const prices = lastBars.flatMap((bar) => [bar.high, bar.low]);
+  const forecastPrices = state.forecast.points.flatMap((point) => [
+    state.forecast.origin_close * Math.exp(point.q10),
+    state.forecast.origin_close * Math.exp(point.q25),
+    state.forecast.origin_close * Math.exp(point.q50),
+    state.forecast.origin_close * Math.exp(point.q75),
+    state.forecast.origin_close * Math.exp(point.q90),
+  ]);
+  const prices = [
+    ...lastBars.flatMap((bar) => [bar.high, bar.low]),
+    ...forecastPrices,
+    barrierTarget,
+    barrierStop,
+  ];
   const minPrice = Math.min(...prices);
   const maxPrice = Math.max(...prices);
   const range = Math.max(maxPrice - minPrice, 0.01);
   const lastPrice = (state.snapshot.bid + state.snapshot.ask) / 2;
 
-  const suggestedLot = useMemo(() => {
-    if (!state.forecast.excursion_modelled) return null;
+  const riskPreview = useMemo(() => {
+    if (!state.forecast.excursion_modelled || state.forecast_status !== "CURRENT") {
+      return { lot: null, reason: "Forecast current dan model excursion diperlukan." };
+    }
     const riskUsd = state.snapshot.account.equity * (riskPercent / 100);
-    const stopDistance = Math.max(expectedMae, spread * 1.5);
-    const raw = riskUsd / (stopDistance * state.snapshot.symbol_spec.contract_size);
+    const stopDistance = Math.abs(state.forecast.origin_close - barrierStop);
+    const tickSize = state.snapshot.symbol_spec.tick_size;
+    const tickValue = state.snapshot.symbol_spec.tick_value;
+    const lossPerLot = (stopDistance / tickSize) * tickValue;
+    if (!Number.isFinite(lossPerLot) || lossPerLot <= 0) {
+      return { lot: null, reason: "Tick value atau jarak stop tidak valid." };
+    }
+    const raw = riskUsd / lossPerLot;
+    const minimumLot = state.snapshot.symbol_spec.volume_min;
+    if (raw < minimumLot) {
+      return { lot: null, reason: "MIN_LOT_EXCEEDS_RISK" };
+    }
     const step = state.snapshot.symbol_spec.volume_step;
     const rounded = Math.floor(raw / step) * step;
-    return Math.min(
+    const lot = Math.min(
       state.snapshot.symbol_spec.volume_max,
-      Math.max(state.snapshot.symbol_spec.volume_min, rounded),
+      rounded,
     );
-  }, [expectedMae, riskPercent, spread, state]);
+    const estimatedMargin =
+      (lastPrice * state.snapshot.symbol_spec.contract_size * lot) /
+      state.snapshot.account.leverage;
+    if (estimatedMargin > state.snapshot.account.free_margin) {
+      return { lot: null, reason: "FREE_MARGIN_INSUFFICIENT" };
+    }
+    return { lot, reason: "" };
+  }, [barrierStop, lastPrice, riskPercent, state]);
 
   async function submitFeedback(verdict: "ACCEPTED" | "REJECTED" | "UNCERTAIN") {
+    if (state.safety.feed_is_demo || state.forecast_status !== "CURRENT") {
+      setFeedbackStatus("Feedback hanya aktif untuk forecast live yang current.");
+      return;
+    }
     setFeedbackStatus("Menyimpan…");
     try {
       const response = await fetch(`${API_BASE}/api/v1/feedback`, {
@@ -538,6 +621,9 @@ export default function Home() {
         <span className={`data-badge ${state.safety.feed_is_demo ? "demo" : "live"}`}>
           {state.safety.feed_is_demo ? "DEMO DATA" : "MT5 LIVE"}
         </span>
+        <span className={`data-badge ${state.forecast_status === "CURRENT" ? "live" : "demo"}`}>
+          FORECAST {state.forecast_status.replaceAll("_", " ")}
+        </span>
         <p>Auto-trading nonaktif. Semua proposal membutuhkan verifikasi dan keputusan manusia.</p>
         {retryStatus ? <span className="retry-status" aria-live="polite">{retryStatus}</span> : null}
         <span>UTC {time(state.updated_at)}</span>
@@ -568,7 +654,8 @@ export default function Home() {
             <div className="chart-meta">
               <div><span>Last live</span><strong>{lastPrice.toFixed(2)}</strong></div>
               <div><span>Spread aktual</span><strong>{spread.toFixed(2)} USD</strong></div>
-              <div><span>Expiry</span><strong>{time(proposal.expires_at)} UTC</strong></div>
+              <div><span>Keputusan valid</span><strong>{time(proposal.decision_valid_until)} UTC</strong></div>
+              <div><span>Outcome matang</span><strong>{time(proposal.outcome_matures_at)} UTC</strong></div>
               <div><span>Model</span><strong>{state.forecast.model_id}</strong></div>
             </div>
 
@@ -602,17 +689,34 @@ export default function Home() {
               </div>
               <div className="forecast-zone">
                 <span className="forecast-label">FORECAST</span>
+                <div
+                  className="barrier-reference target"
+                  style={{ top: `${((maxPrice - barrierTarget) / range) * 100}%` }}
+                >
+                  <span>TP {barrierTarget.toFixed(2)}</span>
+                </div>
+                <div
+                  className="barrier-reference stop"
+                  style={{ top: `${((maxPrice - barrierStop) / range) * 100}%` }}
+                >
+                  <span>SL {barrierStop.toFixed(2)}</span>
+                </div>
                 {state.forecast.points.map((point, index) => {
-                  const upper = lastPrice * (1 + point.q90);
-                  const lower = lastPrice * (1 + point.q10);
-                  const median = lastPrice * (1 + point.q50);
+                  const upper = state.forecast.origin_close * Math.exp(point.q90);
+                  const innerUpper = state.forecast.origin_close * Math.exp(point.q75);
+                  const median = state.forecast.origin_close * Math.exp(point.q50);
+                  const innerLower = state.forecast.origin_close * Math.exp(point.q25);
+                  const lower = state.forecast.origin_close * Math.exp(point.q10);
                   const top = ((maxPrice - upper) / range) * 100;
                   const bandHeight = ((upper - lower) / range) * 100;
+                  const innerTop = ((maxPrice - innerUpper) / range) * 100;
+                  const innerHeight = ((innerUpper - innerLower) / range) * 100;
                   const medianTop = ((maxPrice - median) / range) * 100;
                   return (
                     <div className="forecast-step" key={point.horizon_bars} style={{ left: `${index * 24}%`, width: "25%" }}>
-                      <i className="band-80" style={{ top: `${Math.max(2, top)}%`, height: `${Math.min(94, Math.max(5, bandHeight))}%` }} />
-                      <b className="median" style={{ top: `${Math.min(96, Math.max(2, medianTop))}%` }} />
+                      <i className="band-80" style={{ top: `${top}%`, height: `${Math.max(1, bandHeight)}%` }} />
+                      <i className="band-50" style={{ top: `${innerTop}%`, height: `${Math.max(1, innerHeight)}%` }} />
+                      <b className="median" style={{ top: `${medianTop}%` }} />
                       <span>+{point.horizon_bars}</span>
                     </div>
                   );
@@ -623,6 +727,7 @@ export default function Home() {
               <span><i className="legend-up" /> Bull candle</span>
               <span><i className="legend-down" /> Bear candle</span>
               <span><i className="legend-band" /> 80% interval</span>
+              <span><i className="legend-inner-band" /> 50% interval</span>
               <span><i className="legend-median" /> Median forecast</span>
               <span><i className="legend-live" /> Live M5</span>
             </div>
@@ -666,14 +771,16 @@ export default function Home() {
               </small>
             </article>
             <article className="panel metric">
-              <span>Live rolling coverage · current model</span>
+              <span>Live coverage · 200 prediksi terakhir</span>
               <strong>{liveCoverage === null ? "—" : percent(liveCoverage)}</strong>
               <div className="meter coverage">
                 <i style={{ width: liveCoverage === null ? "0%" : percent(liveCoverage) }} />
               </div>
               <small>
                 {activeEvaluation
-                  ? `Live H3 settled n=${activeEvaluation.settled_predictions}`
+                  ? liveCoverage === null
+                    ? `Mengumpulkan evidence · ${activeEvaluation.settled_predictions}/${MIN_LIVE_EVIDENCE}`
+                    : `Live H3 settled n=${activeEvaluation.settled_predictions}`
                   : "Menunggu evaluation API"}
               </small>
             </article>
@@ -696,7 +803,9 @@ export default function Home() {
               </div>
               <small>
                 {sessionEvaluation
-                  ? `Sejak core start · settled n=${sessionEvaluation.settled_predictions}`
+                  ? sessionDirectionAccuracy === null
+                    ? `Mengumpulkan evidence · ${sessionEvaluation.settled_predictions}/${MIN_LIVE_EVIDENCE}`
+                    : `Prediction sejak core start · n=${sessionEvaluation.settled_predictions}`
                   : "Menunggu evaluation API"}
               </small>
             </article>
@@ -708,7 +817,9 @@ export default function Home() {
               </div>
               <small>
                 {activeEvaluation
-                  ? `Outcome valid n=${activeEvaluation.tp_before_sl_samples} · settled=${activeEvaluation.settled_predictions}`
+                  ? realizedTpRate === null
+                    ? `Mengumpulkan outcome valid · ${activeEvaluation.tp_before_sl_samples}/${MIN_LIVE_EVIDENCE}`
+                    : `Outcome TP/SL valid n=${activeEvaluation.tp_before_sl_samples}`
                   : "Menunggu evaluation API"}
               </small>
             </article>
@@ -730,6 +841,10 @@ export default function Home() {
                     : "Belum tersedia"}
                 </strong>
               </div>
+              <div>
+                <span>Barrier TP / SL · {forecastSide}</span>
+                <strong>{barrierTarget.toFixed(2)} / {barrierStop.toFixed(2)}</strong>
+              </div>
             </div>
             <ul className="reason-list">
               {proposal.reason_codes.map((reason) => <li key={reason}>{reasonLabel(reason)}</li>)}
@@ -748,14 +863,14 @@ export default function Home() {
             </div>
             <label className="risk-input">
               <span>Risk budget <strong>{riskPercent.toFixed(1)}%</strong></span>
-              <input aria-label="Risk budget percent" disabled={!state.forecast.excursion_modelled} max="3" min="0.1" onChange={(event) => setRiskPercent(Number(event.target.value))} step="0.1" type="range" value={riskPercent} />
+              <input aria-label="Risk budget percent" disabled={!state.forecast.excursion_modelled || state.forecast_status !== "CURRENT"} max="3" min="0.1" onChange={(event) => setRiskPercent(Number(event.target.value))} step="0.1" type="range" value={riskPercent} />
             </label>
             <div className="lot-preview">
-              <span>Lot indikatif</span><strong>{suggestedLot === null ? "—" : suggestedLot.toFixed(1)}</strong>
+              <span>Lot indikatif</span><strong>{riskPreview.lot === null ? "—" : riskPreview.lot.toFixed(1)}</strong>
               <small>
-                {suggestedLot === null
-                  ? "Nonaktif sampai model MAE dinamis tersedia."
-                  : "Berdasarkan MAE model; verifikasi manual tetap wajib."}
+                {riskPreview.lot === null
+                  ? riskPreview.reason
+                  : "Berdasarkan barrier stop, tick value, dan margin; verifikasi manual tetap wajib."}
               </small>
             </div>
           </section>
@@ -775,9 +890,9 @@ export default function Home() {
             <span className="eyebrow">Human verification</span>
             <h2>Apakah proposal ini layak?</h2>
             <div className="feedback-actions">
-              <button type="button" onClick={() => submitFeedback("ACCEPTED")}>Accept</button>
-              <button type="button" onClick={() => submitFeedback("UNCERTAIN")}>Unsure</button>
-              <button type="button" onClick={() => submitFeedback("REJECTED")}>Reject</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT"} type="button" onClick={() => submitFeedback("ACCEPTED")}>Accept</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT"} type="button" onClick={() => submitFeedback("UNCERTAIN")}>Unsure</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT"} type="button" onClick={() => submitFeedback("REJECTED")}>Reject</button>
             </div>
             <small>{feedbackStatus || "Feedback tidak mengubah label harga objektif."}</small>
           </section>

@@ -45,11 +45,31 @@ METADATA = DatasetMetadata(
 )
 
 BARRIER_HORIZON = 3
+BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-v1"
+BARRIER_TP_ATR_MULTIPLIER = 1.25
+BARRIER_SL_ATR_MULTIPLIER = 1.0
 BARRIER_CLASS = {
     "TP_FIRST": 0,
     "SL_FIRST": 1,
     "NO_HIT_BEFORE_EXPIRY": 2,
 }
+
+
+def barrier_prices(origin_close: float, atr: float) -> dict[str, float]:
+    """Return the exact prices represented by the barrier classifiers."""
+    if not all(map(np_is_finite, (origin_close, atr))) or origin_close <= 0 or atr <= 0:
+        raise ValueError("barrier origin and ATR must be finite positive values")
+    return {
+        "target_price_long": origin_close + BARRIER_TP_ATR_MULTIPLIER * atr,
+        "stop_price_long": origin_close - BARRIER_SL_ATR_MULTIPLIER * atr,
+        "target_price_short": origin_close - BARRIER_TP_ATR_MULTIPLIER * atr,
+        "stop_price_short": origin_close + BARRIER_SL_ATR_MULTIPLIER * atr,
+    }
+
+
+def np_is_finite(value: float) -> bool:
+    # Kept dependency-free so the contract helper can be used by baseline inference.
+    return value == value and value not in (float("inf"), float("-inf"))
 
 
 def engineer_features(frame):
@@ -93,6 +113,14 @@ def engineer_features(frame):
     result["weekday_sin"] = np.sin(2 * np.pi * weekday / 7)
     result["weekday_cos"] = np.cos(2 * np.pi * weekday / 7)
     return result
+
+
+def postprocess_quantiles(values):
+    """Apply the same monotonic quantile contract in evaluation and live inference."""
+    import numpy as np
+
+    array = np.asarray(values, dtype=float).copy()
+    return np.maximum.accumulate(array, axis=-1)
 
 
 def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
@@ -151,16 +179,17 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
             mae_short.append(np.nan)
             continue
 
+        prices = barrier_prices(start, atr)
         long_outcome = classify_barrier(
             future,
-            target=start + 1.25 * atr,
-            stop=start - atr,
+            target=prices["target_price_long"],
+            stop=prices["stop_price_long"],
             side="long",
         )
         short_outcome = classify_barrier(
             future,
-            target=start - 1.25 * atr,
-            stop=start + atr,
+            target=prices["target_price_short"],
+            stop=prices["stop_price_short"],
             side="short",
         )
         barrier_long_outcome.append(long_outcome)

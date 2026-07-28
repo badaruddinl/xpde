@@ -22,13 +22,14 @@ test("server-renders the XPDE shadow terminal", async () => {
   assert.match(html, /GOLDm#/);
   assert.match(html, /SHADOW MODE/);
   assert.match(html, /DEMO DATA/);
+  assert.match(html, /FORECAST/);
   assert.match(html, /Auto-trading nonaktif/);
   assert.match(html, /Probabilitas naik 57\.0%/);
   assert.match(html, /Probabilitas turun 43\.0%/);
   assert.match(html, /Peluang arah dalam 3 bar \/ 15 menit/);
-  assert.match(html, /Nonaktif sampai model MAE dinamis tersedia/);
+  assert.match(html, /Forecast current dan model excursion diperlukan/);
   assert.match(html, /Offline holdout coverage/);
-  assert.match(html, /Live rolling coverage · current model/);
+  assert.match(html, /Live coverage · 200 prediksi terakhir/);
   assert.match(html, /Current runtime session · direction/);
   assert.match(html, /Retry realtime/);
   assert.match(html, /Live realized TP before SL · current model/);

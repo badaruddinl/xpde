@@ -11,7 +11,9 @@ from xpde_ml.dataset import (
     BARRIER_HORIZON,
     FEATURE_COLUMNS,
     add_objective_labels,
+    barrier_prices,
     build_training_frame,
+    postprocess_quantiles,
 )
 
 
@@ -71,3 +73,15 @@ def test_barrier_labels_keep_no_hit_and_report_same_bar_ambiguity() -> None:
     ambiguous = add_objective_labels(frame)
     assert ambiguous.loc[0, "barrier_long_outcome"] == "AMBIGUOUS_SAME_BAR"
     assert ambiguous.loc[0, "barrier_long_class"] != ambiguous.loc[0, "barrier_long_class"]
+
+
+def test_barrier_contract_and_quantile_postprocessing_are_explicit() -> None:
+    prices = barrier_prices(100.0, 2.0)
+    assert prices == {
+        "target_price_long": 102.5,
+        "stop_price_long": 98.0,
+        "target_price_short": 97.5,
+        "stop_price_short": 102.0,
+    }
+    processed = postprocess_quantiles([[0.1, -0.2, 0.0, 0.3, 0.2]])
+    assert processed.tolist() == [[0.1, 0.1, 0.1, 0.3, 0.3]]

@@ -316,6 +316,7 @@ def main() -> None:
                 cursor = get_payload(args.cursor_url).get(
                     "last_completed_bar_timestamp"
                 )
+                startup_had_gap = False
                 if cursor and completed_bar_distance(
                     str(cursor), latest_completed_bar
                 ) > 0:
@@ -326,11 +327,23 @@ def main() -> None:
                         clock=broker_clock,
                     )
                     post_catchup(args.backfill_url, catchup_bars, clock=broker_clock)
+                    startup_had_gap = True
                     print(
                         f"XPDE catch-up appended {len(catchup_bars)} completed M5 bars",
                         flush=True,
                     )
                 post_payload(args.api_url, startup_snapshot)
+                if not args.snapshot_only and not startup_had_gap:
+                    startup_forecast = (
+                        candidate.forecast(startup_snapshot)
+                        if candidate is not None
+                        else forecast_from_snapshot(startup_snapshot)
+                    )
+                    post_payload(args.forecast_url, startup_forecast)
+                    print(
+                        f"XPDE startup forecast posted for {latest_completed_bar}",
+                        flush=True,
+                    )
                 break
             except (
                 PayloadRejected,
@@ -351,8 +364,8 @@ def main() -> None:
                     retry_delay, args.max_retry_delay
                 )
 
-        # A restart may backfill market history, but it must never manufacture
-        # retroactive "live" predictions. Wait for the next completed M5 bar.
+        # A restart with a history gap must never manufacture retroactive live
+        # predictions. A gap-free restart may forecast the latest completed bar.
         last_forecast_bar: str | None = latest_completed_bar
         last_tick_signature: tuple[str, float, float] | None = (
             startup_snapshot["timestamp"],

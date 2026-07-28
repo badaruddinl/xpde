@@ -11,6 +11,7 @@ from statistics import fmean
 from typing import Any
 
 from .contracts import HORIZONS, QUANTILES, Bar, validate_quantiles, validate_snapshot
+from .dataset import BARRIER_HORIZON, BARRIER_SPEC_ID, barrier_prices
 from .features import log_returns, true_ranges
 
 
@@ -78,6 +79,8 @@ def forecast_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     probability_up = (positive + 1) / (len(direction_samples) + 2)
     ranges = true_ranges(bars)[-48:]
     expected_range = fmean(ranges)
+    atr_24 = fmean(true_ranges(bars)[-24:])
+    barriers = barrier_prices(bars[-1].close, atr_24)
     previous_returns = returns[: max(1, len(returns) - 48)][-96:]
     recent_returns = returns[-48:]
     previous_mean_abs = fmean(abs(value) for value in previous_returns)
@@ -101,6 +104,9 @@ def forecast_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         # this neutral forces the policy to abstain until a validated model is promoted.
         "barrier_probability_long": 0.50,
         "barrier_probability_short": 0.50,
+        "barrier_spec_id": BARRIER_SPEC_ID,
+        "barrier_horizon_bars": BARRIER_HORIZON,
+        **barriers,
         "expected_mfe_long": expected_range * 1.15,
         "expected_mae_long": expected_range * 0.85,
         "expected_mfe_short": expected_range * 1.15,

@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS model_registry (
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id TEXT PRIMARY KEY,
     model_id TEXT NOT NULL,
+    barrier_spec_id TEXT,
     symbol TEXT NOT NULL,
     timeframe TEXT NOT NULL,
     origin_bar_timestamp TEXT,
@@ -71,6 +72,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     origin_bar_index INTEGER,
     generated_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
+    decision_valid_until TEXT,
+    outcome_matures_at TEXT,
     forecast_json TEXT NOT NULL,
     proposal_json TEXT NOT NULL,
     created_at TEXT NOT NULL

@@ -13,10 +13,14 @@ from typing import Any
 from .contracts import HORIZONS, QUANTILES
 from .dataset import (
     BARRIER_HORIZON,
+    BARRIER_SL_ATR_MULTIPLIER,
+    BARRIER_SPEC_ID,
+    BARRIER_TP_ATR_MULTIPLIER,
     FEATURE_COLUMNS,
     FEATURE_VERSION,
     METADATA,
     build_training_frame,
+    postprocess_quantiles,
 )
 
 
@@ -203,24 +207,29 @@ def train(args) -> dict[str, Any]:
             fold_prediction = np.asarray(
                 fold_model.predict(evaluation_x.iloc[validation_indices])
             )
+            fold_crossing_rate = float(
+                np.mean(np.any(np.diff(fold_prediction, axis=1) < 0, axis=1))
+            )
+            fold_prediction = postprocess_quantiles(fold_prediction)
+            fold_truth = fold_target.iloc[validation_indices].to_numpy()
+            fold_baseline = float(np.quantile(fold_target.iloc[fit_indices], 0.5))
+            fold_pinball = _pinball(fold_truth, fold_prediction[:, 2], 0.5)
             fold_metrics[str(horizon)].append(
                 {
                     "fold": float(fold),
-                    "pinball_q50": _pinball(
-                        fold_target.iloc[validation_indices].to_numpy(),
-                        fold_prediction[:, 2],
+                    "pinball_q50": fold_pinball,
+                    "baseline_pinball_q50": _pinball(
+                        fold_truth,
+                        np.repeat(fold_baseline, len(fold_truth)),
                         0.5,
                     ),
+                    "quantile_crossing_rate": fold_crossing_rate,
                     "coverage_80": float(
                         np.mean(
                             (
-                                fold_target.iloc[validation_indices].to_numpy()
-                                >= fold_prediction[:, 0]
+                                fold_truth >= fold_prediction[:, 0]
                             )
-                            & (
-                                fold_target.iloc[validation_indices].to_numpy()
-                                <= fold_prediction[:, 4]
-                            )
+                            & (fold_truth <= fold_prediction[:, 4])
                         )
                     ),
                 }
@@ -236,7 +245,9 @@ def train(args) -> dict[str, Any]:
             allow_writing_files=False,
         )
         model.fit(x_train, target.iloc[train_slice])
-        calibration_prediction = np.asarray(model.predict(x_calibration))
+        calibration_prediction = postprocess_quantiles(
+            np.asarray(model.predict(x_calibration))
+        )
         calibration_truth = target.iloc[calibration_slice].to_numpy()
         nonconformity = np.maximum(
             calibration_prediction[:, 0] - calibration_truth,
@@ -245,7 +256,11 @@ def train(args) -> dict[str, Any]:
         correction = float(np.quantile(np.maximum(nonconformity, 0.0), 0.80))
         conformal[str(horizon)] = correction
 
-        holdout_prediction = np.asarray(model.predict(x_holdout))
+        holdout_prediction_raw = np.asarray(model.predict(x_holdout))
+        crossing_rate = float(
+            np.mean(np.any(np.diff(holdout_prediction_raw, axis=1) < 0, axis=1))
+        )
+        holdout_prediction = postprocess_quantiles(holdout_prediction_raw)
         holdout_prediction[:, 0] -= correction
         holdout_prediction[:, 4] += correction
         holdout_truth = target.iloc[holdout_slice].to_numpy()
@@ -266,6 +281,7 @@ def train(args) -> dict[str, Any]:
         metrics["interval_width"] = float(
             np.mean(holdout_prediction[:, 4] - holdout_prediction[:, 0])
         )
+        metrics["quantile_crossing_rate_before_postprocess"] = crossing_rate
         holdout_metrics[str(horizon)] = metrics
 
         train_quantiles = np.quantile(target.iloc[train_slice], QUANTILES)
@@ -336,11 +352,16 @@ def train(args) -> dict[str, Any]:
         )[:, tp_index]
         calibrated_holdout = calibrator.predict(raw_holdout)
         holdout_tp_truth = (side_holdout[label].to_numpy() == 0).astype(int)
+        train_tp_rate = float((side_train[label].to_numpy() == 0).mean())
         holdout_outcomes = dataset.iloc[holdout_slice][outcome_label]
         outcome_counts = holdout_outcomes.value_counts()
         labelled_count = max(1, int(holdout_outcomes.notna().sum()))
         barrier_metrics[side] = {
             "tp_first_brier": _brier(holdout_tp_truth, calibrated_holdout),
+            "baseline_tp_first_brier": _brier(
+                holdout_tp_truth,
+                np.repeat(train_tp_rate, len(holdout_tp_truth)),
+            ),
             "resolved_sample_size": float(len(side_holdout)),
             "labelled_sample_size": float(labelled_count),
             "tp_first": float(outcome_counts.get("TP_FIRST", 0)),
@@ -374,14 +395,26 @@ def train(args) -> dict[str, Any]:
                 alpha=alpha,
                 iterations=args.iterations,
             )
-            holdout_prediction = excursion_model.predict(x_holdout)
-            excursion_metrics[side][f"{excursion}_q{int(alpha * 100)}_pinball"] = (
-                _pinball(
-                    dataset[label].iloc[holdout_slice].to_numpy(),
-                    holdout_prediction,
-                    alpha,
-                )
+            holdout_prediction = np.maximum(
+                0.0,
+                np.asarray(excursion_model.predict(x_holdout)),
             )
+            holdout_truth = dataset[label].iloc[holdout_slice].to_numpy()
+            model_pinball = _pinball(holdout_truth, holdout_prediction, alpha)
+            baseline_value = float(
+                np.quantile(dataset[label].iloc[train_slice], alpha)
+            )
+            prefix = f"{excursion}_q{int(alpha * 100)}"
+            excursion_metrics[side][f"{prefix}_pinball"] = model_pinball
+            excursion_metrics[side][f"{prefix}_baseline_pinball"] = _pinball(
+                holdout_truth,
+                np.repeat(baseline_value, len(holdout_truth)),
+                alpha,
+            )
+            if excursion == "mae":
+                excursion_metrics[side]["mae_q90_coverage"] = float(
+                    np.mean(holdout_truth <= holdout_prediction)
+                )
             excursion_model.save_model(
                 args.output / f"{excursion}_{side}_h3.cbm"
             )
@@ -412,22 +445,67 @@ def train(args) -> dict[str, Any]:
         )
     )
     pinball_improvement = 1.0 - mean_pinball_model / mean_pinball_baseline
-    eligible = (
-        dataset_integrity_ok
-        and pinball_improvement >= 0.01
-        and 0.74 <= coverage_h3 <= 0.86
-        and direction_metrics["brier"] <= direction_metrics["baseline_brier"]
+    barrier_beats_baseline = all(
+        metrics["tp_first_brier"] < metrics["baseline_tp_first_brier"]
+        for metrics in barrier_metrics.values()
     )
+    excursion_beats_baseline = all(
+        metrics[f"{excursion}_q{int(alpha * 100)}_pinball"]
+        < metrics[f"{excursion}_q{int(alpha * 100)}_baseline_pinball"]
+        for metrics in excursion_metrics.values()
+        for excursion, alpha in (("mfe", 0.50), ("mae", 0.90))
+    )
+    mae_coverage_ok = all(
+        0.87 <= metrics["mae_q90_coverage"] <= 0.93
+        for metrics in excursion_metrics.values()
+    )
+    fold_stability_ok = all(
+        fold["pinball_q50"] <= 1.25 * fold["baseline_pinball_q50"]
+        for metrics in fold_metrics.values()
+        for fold in metrics
+    )
+    ambiguity_ok = all(
+        metrics["ambiguity_rate"] <= 0.05 for metrics in barrier_metrics.values()
+    )
+    crossing_ok = all(
+        metrics["quantile_crossing_rate_before_postprocess"] <= 0.01
+        for metrics in holdout_metrics.values()
+    )
+    calibration_sample_ok = len(x_calibration) >= 500 and len(x_holdout) >= 500
+    eligibility_gates = {
+        "dataset_integrity": dataset_integrity_ok,
+        "mean_pinball_improvement": pinball_improvement >= 0.01,
+        "h3_coverage": 0.74 <= coverage_h3 <= 0.86,
+        "direction_brier": (
+            direction_metrics["brier"] <= direction_metrics["baseline_brier"]
+        ),
+        "barrier_brier": barrier_beats_baseline,
+        "excursion_pinball": excursion_beats_baseline,
+        "mae_q90_coverage": mae_coverage_ok,
+        "fold_stability": fold_stability_ok,
+        "ambiguity_rate": ambiguity_ok,
+        "quantile_crossing": crossing_ok,
+        "minimum_calibration_samples": calibration_sample_ok,
+    }
+    eligible = all(eligibility_gates.values())
     train_frame = dataset.iloc[train_slice]
     manifest = {
         "schema_version": 2,
         "model_id": model_id,
         "status": "candidate",
         "eligible_for_shadow": eligible,
+        "eligibility_gate_version": 2,
+        "eligibility_gates": eligibility_gates,
         "feature_version": FEATURE_VERSION,
         "feature_columns": list(FEATURE_COLUMNS),
         "horizons": list(HORIZONS),
         "barrier_horizon": BARRIER_HORIZON,
+        "barrier_spec": {
+            "id": BARRIER_SPEC_ID,
+            "horizon_bars": BARRIER_HORIZON,
+            "take_profit_atr_multiplier": BARRIER_TP_ATR_MULTIPLIER,
+            "stop_loss_atr_multiplier": BARRIER_SL_ATR_MULTIPLIER,
+        },
         "quantiles": list(QUANTILES),
         "purge_gap": METADATA.purge_gap,
         "created_at": datetime.now(UTC).isoformat(),

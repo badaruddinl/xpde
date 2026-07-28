@@ -26,9 +26,9 @@ use tower_http::{
 use tracing::{info, warn};
 use uuid::Uuid;
 use xpde_domain::{
-    AccountSnapshot, CalibrationStatus, DataQuality, DecisionAction, DecisionPolicy,
-    DecisionProposal, ForecastEnvelope, ForecastPoint, HumanFeedback, MarketBar, MarketSnapshot,
-    SymbolSpec, decide,
+    AccountSnapshot, BARRIER_HORIZON_BARS, BARRIER_SPEC_ID, CalibrationStatus, DataQuality,
+    DecisionAction, DecisionPolicy, DecisionProposal, ForecastEnvelope, ForecastPoint,
+    HumanFeedback, MarketBar, MarketSnapshot, SymbolSpec, decide,
 };
 
 const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
@@ -45,10 +45,49 @@ struct RuntimeState {
     mode: &'static str,
     connection_status: &'static str,
     updated_at: DateTime<Utc>,
+    forecast_status: ForecastStatus,
     snapshot: MarketSnapshot,
     forecast: ForecastEnvelope,
     proposals: Vec<DecisionProposal>,
     safety: SafetyStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ForecastStatus {
+    Demo,
+    WaitingForFirstForecast,
+    Current,
+    OriginMismatch,
+    Expired,
+}
+
+fn forecast_status(
+    snapshot: &MarketSnapshot,
+    forecast: &ForecastEnvelope,
+    feed_is_demo: bool,
+    now: DateTime<Utc>,
+) -> ForecastStatus {
+    if feed_is_demo {
+        return ForecastStatus::Demo;
+    }
+    if forecast.model_id == "baseline-demo-v1" {
+        return ForecastStatus::WaitingForFirstForecast;
+    }
+    let Some(latest_completed) = snapshot.bars.iter().max_by_key(|bar| bar.timestamp) else {
+        return ForecastStatus::OriginMismatch;
+    };
+    if forecast.origin_bar_timestamp != latest_completed.timestamp
+        || (forecast.origin_close - latest_completed.close).abs() > 1e-8
+    {
+        return ForecastStatus::OriginMismatch;
+    }
+    let decision_valid_until = forecast.origin_bar_timestamp + chrono::Duration::minutes(10);
+    if now > decision_valid_until {
+        ForecastStatus::Expired
+    } else {
+        ForecastStatus::Current
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,26 +139,18 @@ impl BarrierOutcome {
 }
 
 fn barrier_outcome(
-    start_price: f64,
-    expected_mfe_usd: f64,
     proposals: &[DecisionProposal],
     bars: &[(f64, f64, f64)],
 ) -> Option<BarrierOutcome> {
-    if !expected_mfe_usd.is_finite() || expected_mfe_usd <= 0.0 {
-        return None;
-    }
     let proposal = proposals.iter().find(|proposal| {
         matches!(
             proposal.action,
             DecisionAction::Long | DecisionAction::Short
         ) && proposal.invalidation_price.is_some()
+            && proposal.target_price.is_some()
     })?;
     let invalidation = proposal.invalidation_price?;
-    let target = match proposal.action {
-        DecisionAction::Long => start_price + expected_mfe_usd,
-        DecisionAction::Short => start_price - expected_mfe_usd,
-        _ => return None,
-    };
+    let target = proposal.target_price?;
     for &(high, low, _) in bars {
         let (tp_hit, sl_hit) = match proposal.action {
             DecisionAction::Long => (high >= target, low <= invalidation),
@@ -185,6 +216,9 @@ impl Store {
         ensure_column(&connection, "predictions", "origin_bar_timestamp", "TEXT")?;
         ensure_column(&connection, "predictions", "origin_close", "REAL")?;
         ensure_column(&connection, "predictions", "origin_bar_index", "INTEGER")?;
+        ensure_column(&connection, "predictions", "barrier_spec_id", "TEXT")?;
+        ensure_column(&connection, "predictions", "decision_valid_until", "TEXT")?;
+        ensure_column(&connection, "predictions", "outcome_matures_at", "TEXT")?;
         connection.execute(
             "DELETE FROM market_bars
              WHERE timeframe='M5'
@@ -379,26 +413,34 @@ impl Store {
         proposals: &[DecisionProposal],
     ) -> Result<(), rusqlite::Error> {
         let connection = self.connection.lock().expect("database mutex poisoned");
-        let expiry = proposals
+        let decision_valid_until = proposals
             .first()
-            .map(|proposal| proposal.expires_at)
+            .map(|proposal| proposal.decision_valid_until)
+            .unwrap_or(forecast.generated_at);
+        let outcome_matures_at = proposals
+            .first()
+            .map(|proposal| proposal.outcome_matures_at)
             .unwrap_or(forecast.generated_at);
         connection.execute(
             "INSERT OR REPLACE INTO predictions
-             (prediction_id, model_id, symbol, timeframe, origin_bar_timestamp,
+             (prediction_id, model_id, barrier_spec_id, symbol, timeframe, origin_bar_timestamp,
               origin_close, origin_bar_index, generated_at, expires_at,
+              decision_valid_until, outcome_matures_at,
               forecast_json, proposal_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 forecast.prediction_id.to_string(),
                 forecast.model_id,
+                forecast.barrier_spec_id,
                 snapshot.symbol,
                 snapshot.timeframe,
                 forecast.origin_bar_timestamp.to_rfc3339(),
                 forecast.origin_close,
                 forecast.origin_bar_index,
                 forecast.generated_at.to_rfc3339(),
-                expiry.to_rfc3339(),
+                outcome_matures_at.to_rfc3339(),
+                decision_valid_until.to_rfc3339(),
+                outcome_matures_at.to_rfc3339(),
                 serde_json::to_string(forecast).unwrap_or_else(|_| "{}".to_owned()),
                 serde_json::to_string(proposals).unwrap_or_else(|_| "[]".to_owned()),
                 Utc::now().to_rfc3339(),
@@ -609,8 +651,7 @@ impl Store {
                         .iter()
                         .map(|bar| (bar.1, bar.2, bar.3))
                         .collect::<Vec<_>>();
-                    barrier_outcome(origin_close, expected_mfe, &proposals, &barrier_bars)
-                        .map(BarrierOutcome::as_str)
+                    barrier_outcome(&proposals, &barrier_bars).map(BarrierOutcome::as_str)
                 } else {
                     None
                 };
@@ -618,8 +659,16 @@ impl Store {
                     "median_error": (actual_return - target.q50).abs(),
                     "interval_miss": interval_hit == 0,
                     "direction_error": direction_hit == 0,
-                    "mfe_error_usd": expected_mfe - actual_mfe,
-                    "mae_error_usd": expected_mae - actual_mae,
+                    "mfe_error_usd": if target.horizon_bars == BARRIER_HORIZON_BARS {
+                        Some(expected_mfe - actual_mfe)
+                    } else {
+                        None
+                    },
+                    "mae_error_usd": if target.horizon_bars == BARRIER_HORIZON_BARS {
+                        Some(expected_mae - actual_mae)
+                    } else {
+                        None
+                    },
                 });
                 transaction.execute(
                     "INSERT INTO prediction_horizon_outcomes
@@ -660,16 +709,17 @@ impl Store {
             "SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
                     COALESCE(AVG(o.direction_hit), 0.0),
-                    COUNT(o.barrier_outcome),
+                    COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
-                          WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                          WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END)
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
              WHERE p.model_id != 'baseline-demo-v1'
+               AND p.barrier_spec_id=?1
                AND o.horizon_bars=3",
-            [],
+            [BARRIER_SPEC_ID],
             |row| {
                 Ok(serde_json::json!({
                     "settled_predictions": row.get::<_, i64>(0)?,
@@ -683,18 +733,18 @@ impl Store {
         let by_model = {
             let mut statement = connection.prepare(
                 "SELECT p.model_id, COUNT(*), AVG(o.interval_hit), AVG(o.direction_hit),
-                        COUNT(o.barrier_outcome),
+                        COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                         AVG(CASE
                               WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
-                              WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                              WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                             END)
                  FROM prediction_horizon_outcomes o
                  JOIN predictions p ON p.prediction_id=o.prediction_id
-                 WHERE o.horizon_bars=3
+                 WHERE o.horizon_bars=3 AND p.barrier_spec_id=?1
                  GROUP BY p.model_id ORDER BY MAX(o.settled_at) DESC",
             )?;
             statement
-                .query_map([], |row| {
+                .query_map([BARRIER_SPEC_ID], |row| {
                     Ok(serde_json::json!({
                         "model_id": row.get::<_, String>(0)?,
                         "settled_predictions": row.get::<_, i64>(1)?,
@@ -707,18 +757,26 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let current_model = connection.query_row(
-            "SELECT COUNT(*),
+            "WITH recent AS (
+               SELECT o.*
+               FROM prediction_horizon_outcomes o
+               JOIN predictions p ON p.prediction_id=o.prediction_id
+               WHERE o.horizon_bars=3
+                 AND p.model_id=?1
+                 AND p.barrier_spec_id=?2
+               ORDER BY o.origin_bar_timestamp DESC
+               LIMIT 200
+             )
+             SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
                     COALESCE(AVG(o.direction_hit), 0.0),
-                    COUNT(o.barrier_outcome),
+                    COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
-                          WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                          WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END)
-             FROM prediction_horizon_outcomes o
-             JOIN predictions p ON p.prediction_id=o.prediction_id
-             WHERE o.horizon_bars=3 AND p.model_id=?1",
-            [current_model_id],
+             FROM recent o",
+            params![current_model_id, BARRIER_SPEC_ID],
             |row| {
                 Ok(serde_json::json!({
                     "model_id": current_model_id,
@@ -735,17 +793,18 @@ impl Store {
             "SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
                     COALESCE(AVG(o.direction_hit), 0.0),
-                    COUNT(o.barrier_outcome),
+                    COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
-                          WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                          WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END)
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
              WHERE o.horizon_bars=3
                AND p.model_id=?1
-               AND o.settled_at>=?2",
-            params![current_model_id, session_started_at_text],
+               AND p.generated_at>=?2
+               AND p.barrier_spec_id=?3",
+            params![current_model_id, session_started_at_text, BARRIER_SPEC_ID],
             |row| {
                 Ok(serde_json::json!({
                     "model_id": current_model_id,
@@ -765,6 +824,7 @@ impl Store {
             "current_session": current_session,
             "by_model": by_model,
             "target_coverage": 0.80,
+            "current_model_window": 200,
             "updated_at": Utc::now(),
         }))
     }
@@ -956,6 +1016,12 @@ async fn post_snapshot(
     runtime.mode = "LIVE_SHADOW";
     runtime.updated_at = Utc::now();
     runtime.safety.feed_is_demo = false;
+    runtime.forecast_status = forecast_status(
+        &runtime.snapshot,
+        &runtime.forecast,
+        runtime.safety.feed_is_demo,
+        runtime.updated_at,
+    );
     let scalper = decide(
         &runtime.snapshot,
         &runtime.forecast,
@@ -1002,6 +1068,12 @@ async fn post_forecast(
     runtime.forecast = forecast;
     runtime.proposals = proposals;
     runtime.updated_at = Utc::now();
+    runtime.forecast_status = forecast_status(
+        &runtime.snapshot,
+        &runtime.forecast,
+        runtime.safety.feed_is_demo,
+        runtime.updated_at,
+    );
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -1093,6 +1165,12 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 
 async fn public_runtime_state(state: &AppState) -> RuntimeState {
     let mut runtime = state.runtime.read().await.clone();
+    runtime.forecast_status = forecast_status(
+        &runtime.snapshot,
+        &runtime.forecast,
+        runtime.safety.feed_is_demo,
+        Utc::now(),
+    );
     if !runtime.safety.feed_is_demo {
         let bridge_age_ms = Utc::now()
             .signed_duration_since(runtime.updated_at)
@@ -1214,6 +1292,12 @@ fn demo_state() -> RuntimeState {
         direction_probability_up: 0.57,
         barrier_probability_long: 0.54,
         barrier_probability_short: 0.46,
+        barrier_spec_id: BARRIER_SPEC_ID.to_owned(),
+        barrier_horizon_bars: BARRIER_HORIZON_BARS,
+        target_price_long: origin.close + 1.25,
+        stop_price_long: origin.close - 1.0,
+        target_price_short: origin.close - 1.25,
+        stop_price_short: origin.close + 1.0,
         expected_mfe_long: 1.42,
         expected_mae_long: 0.91,
         expected_mfe_short: 1.31,
@@ -1269,6 +1353,7 @@ fn demo_state() -> RuntimeState {
         mode: "DEMO_SHADOW",
         connection_status: "WAITING_FOR_MT5",
         updated_at: now,
+        forecast_status: ForecastStatus::Demo,
         snapshot,
         forecast,
         proposals,
@@ -1285,17 +1370,23 @@ mod tests {
     use super::*;
     use xpde_domain::TradingProfile;
 
-    fn proposal(action: DecisionAction, invalidation_price: Option<f64>) -> DecisionProposal {
+    fn proposal(
+        action: DecisionAction,
+        target_price: Option<f64>,
+        invalidation_price: Option<f64>,
+    ) -> DecisionProposal {
         let generated_at = Utc::now();
         DecisionProposal {
             prediction_id: Uuid::new_v4(),
             profile: TradingProfile::Scalper,
             action,
             generated_at,
-            expires_at: generated_at + chrono::Duration::minutes(15),
+            decision_valid_until: generated_at + chrono::Duration::minutes(5),
+            outcome_matures_at: generated_at + chrono::Duration::minutes(20),
             expected_edge_after_cost_usd: 1.0,
             reference_lot: 0.1,
             invalidation_price,
+            target_price,
             reason_codes: Vec::new(),
             risk_warnings: Vec::new(),
         }
@@ -1304,47 +1395,91 @@ mod tests {
     #[test]
     fn barrier_outcome_uses_first_actionable_proposal() {
         let proposals = vec![
-            proposal(DecisionAction::Wait, None),
-            proposal(DecisionAction::Long, Some(99.0)),
+            proposal(DecisionAction::Wait, None, None),
+            proposal(DecisionAction::Long, Some(101.0), Some(99.0)),
         ];
         let bars = vec![(101.2, 99.5, 101.0)];
 
         assert_eq!(
-            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            barrier_outcome(&proposals, &bars),
             Some(BarrierOutcome::TpFirst)
         );
     }
 
     #[test]
     fn barrier_outcome_detects_short_stop_first() {
-        let proposals = vec![proposal(DecisionAction::Short, Some(101.0))];
+        let proposals = vec![proposal(DecisionAction::Short, Some(99.0), Some(101.0))];
         let bars = vec![(101.2, 99.5, 100.8)];
 
         assert_eq!(
-            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            barrier_outcome(&proposals, &bars),
             Some(BarrierOutcome::SlFirst)
         );
     }
 
     #[test]
     fn barrier_outcome_keeps_same_bar_ambiguity_explicit() {
-        let proposals = vec![proposal(DecisionAction::Long, Some(99.0))];
+        let proposals = vec![proposal(DecisionAction::Long, Some(101.0), Some(99.0))];
         let bars = vec![(101.2, 98.8, 100.2)];
 
         assert_eq!(
-            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            barrier_outcome(&proposals, &bars),
             Some(BarrierOutcome::AmbiguousSameBar)
         );
     }
 
     #[test]
     fn barrier_outcome_keeps_no_hit_before_expiry() {
-        let proposals = vec![proposal(DecisionAction::Long, Some(99.0))];
+        let proposals = vec![proposal(DecisionAction::Long, Some(101.0), Some(99.0))];
         let bars = vec![(100.8, 99.4, 100.2)];
 
         assert_eq!(
-            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            barrier_outcome(&proposals, &bars),
             Some(BarrierOutcome::NoHitBeforeExpiry)
+        );
+    }
+
+    #[test]
+    fn forecast_lifecycle_distinguishes_demo_waiting_mismatch_and_expiry() {
+        let runtime = demo_state();
+        assert_eq!(
+            forecast_status(
+                &runtime.snapshot,
+                &runtime.forecast,
+                true,
+                runtime.updated_at
+            ),
+            ForecastStatus::Demo
+        );
+        assert_eq!(
+            forecast_status(
+                &runtime.snapshot,
+                &runtime.forecast,
+                false,
+                runtime.updated_at
+            ),
+            ForecastStatus::WaitingForFirstForecast
+        );
+
+        let mut forecast = runtime.forecast.clone();
+        forecast.model_id = "candidate-v1".to_owned();
+        assert_eq!(
+            forecast_status(&runtime.snapshot, &forecast, false, runtime.updated_at),
+            ForecastStatus::Current
+        );
+        assert_eq!(
+            forecast_status(
+                &runtime.snapshot,
+                &forecast,
+                false,
+                forecast.origin_bar_timestamp + chrono::Duration::minutes(11)
+            ),
+            ForecastStatus::Expired
+        );
+        forecast.origin_bar_timestamp -= chrono::Duration::minutes(5);
+        assert_eq!(
+            forecast_status(&runtime.snapshot, &forecast, false, runtime.updated_at),
+            ForecastStatus::OriginMismatch
         );
     }
 }

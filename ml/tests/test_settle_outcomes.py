@@ -10,50 +10,55 @@ import pytest
 from xpde_ml.settle_outcomes import barrier_outcome, settle_with_report
 
 
-def proposal(action: str, invalidation_price: float | None) -> dict:
+def proposal(
+    action: str,
+    target_price: float | None,
+    invalidation_price: float | None,
+) -> dict:
     return {
         "action": action,
+        "target_price": target_price,
         "invalidation_price": invalidation_price,
     }
 
 
 def test_barrier_outcome_uses_first_actionable_proposal() -> None:
     proposals = [
-        proposal("WAIT", None),
-        proposal("LONG", 99.0),
+        proposal("WAIT", None, None),
+        proposal("LONG", 101.0, 99.0),
     ]
     bars = [{"high": 101.2, "low": 99.5, "close": 101.0}]
 
-    assert barrier_outcome(100.0, 1.0, proposals, bars) == "TP_FIRST"
+    assert barrier_outcome(proposals, bars) == "TP_FIRST"
 
 
 def test_barrier_outcome_detects_short_stop_first() -> None:
-    proposals = [proposal("SHORT", 101.0)]
+    proposals = [proposal("SHORT", 99.0, 101.0)]
     bars = [{"high": 101.2, "low": 99.5, "close": 100.8}]
 
-    assert barrier_outcome(100.0, 1.0, proposals, bars) == "SL_FIRST"
+    assert barrier_outcome(proposals, bars) == "SL_FIRST"
 
 
 def test_barrier_outcome_keeps_same_bar_ambiguity_explicit() -> None:
-    proposals = [proposal("LONG", 99.0)]
+    proposals = [proposal("LONG", 101.0, 99.0)]
     bars = [{"high": 101.2, "low": 98.8, "close": 100.2}]
 
-    assert barrier_outcome(100.0, 1.0, proposals, bars) == "AMBIGUOUS_SAME_BAR"
+    assert barrier_outcome(proposals, bars) == "AMBIGUOUS_SAME_BAR"
 
 
 def test_barrier_outcome_requires_directional_proposal() -> None:
-    proposals = [proposal("NO_PREDICTION", None)]
+    proposals = [proposal("NO_PREDICTION", None, None)]
     bars = [{"high": 102.0, "low": 98.0, "close": 101.0}]
 
-    assert barrier_outcome(100.0, 1.0, proposals, bars) is None
+    assert barrier_outcome(proposals, bars) is None
 
 
 def test_barrier_outcome_keeps_no_hit_before_expiry() -> None:
-    proposals = [proposal("LONG", 99.0)]
+    proposals = [proposal("LONG", 101.0, 99.0)]
     bars = [{"high": 100.8, "low": 99.4, "close": 100.2}]
 
     assert (
-        barrier_outcome(100.0, 1.0, proposals, bars)
+        barrier_outcome(proposals, bars)
         == "NO_HIT_BEFORE_EXPIRY"
     )
 
@@ -109,7 +114,7 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             for horizon in (1, 3, 6, 12)
         ],
     }
-    proposals = [proposal("LONG", 99.0)]
+    proposals = [proposal("LONG", 101.0, 99.0)]
     connection.execute(
         """
         INSERT INTO predictions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -165,4 +170,10 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
     ).isoformat()
     assert float(rows[1]["actual_return"]) == pytest.approx(math.log(103.0 / 100.0))
     assert rows[1]["barrier_outcome"] == "TP_FIRST"
+    h1_metrics = json.loads(rows[0]["error_metrics_json"])
+    h3_metrics = json.loads(rows[1]["error_metrics_json"])
+    assert h1_metrics["mfe_error_usd"] is None
+    assert h1_metrics["mae_error_usd"] is None
+    assert h3_metrics["mfe_error_usd"] is not None
+    assert h3_metrics["mae_error_usd"] is not None
     connection.close()

@@ -16,19 +16,16 @@ BARRIER_OUTCOMES = {
 
 
 def barrier_outcome(
-    start_price: float,
-    expected_mfe_usd: float,
     proposals: list[dict],
     bars: list[sqlite3.Row | dict],
 ) -> str | None:
-    if not math.isfinite(expected_mfe_usd) or expected_mfe_usd <= 0:
-        return None
     proposal = next(
         (
             item
             for item in proposals
             if item.get("action") in {"LONG", "SHORT"}
             and item.get("invalidation_price") is not None
+            and item.get("target_price") is not None
         ),
         None,
     )
@@ -37,11 +34,9 @@ def barrier_outcome(
 
     action = proposal["action"]
     invalidation = float(proposal["invalidation_price"])
-    target = (
-        start_price + expected_mfe_usd
-        if action == "LONG"
-        else start_price - expected_mfe_usd
-    )
+    target = float(proposal["target_price"])
+    if not math.isfinite(invalidation) or not math.isfinite(target):
+        return None
     for bar in bars:
         high = float(bar["high"])
         low = float(bar["low"])
@@ -163,7 +158,7 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 actual_mfe = max(0.0, origin_close - actual_low)
                 actual_mae = max(0.0, actual_high - origin_close)
             barrier = (
-                barrier_outcome(origin_close, expected_mfe, proposals, bars)
+                barrier_outcome(proposals, bars)
                 if horizon == 3
                 else None
             )
@@ -171,8 +166,8 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 "median_error": abs(actual_return - point["q50"]),
                 "interval_miss": not bool(interval_hit),
                 "direction_error": not bool(direction_hit),
-                "mfe_error_usd": expected_mfe - actual_mfe,
-                "mae_error_usd": expected_mae - actual_mae,
+                "mfe_error_usd": expected_mfe - actual_mfe if horizon == 3 else None,
+                "mae_error_usd": expected_mae - actual_mae if horizon == 3 else None,
             }
             inserted = connection.execute(
                 """

@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import HORIZONS, validate_snapshot
-from .dataset import FEATURE_COLUMNS, FEATURE_VERSION, engineer_features
+from .dataset import (
+    BARRIER_HORIZON,
+    BARRIER_SPEC_ID,
+    FEATURE_COLUMNS,
+    FEATURE_VERSION,
+    barrier_prices,
+    engineer_features,
+    postprocess_quantiles,
+)
 
 
 def verify_artifact_checksums(artifact_dir: Path) -> None:
@@ -110,7 +118,7 @@ class CandidateModel:
             )
             values[0] -= correction
             values[4] += correction
-            values = np.maximum.accumulate(values)
+            values = postprocess_quantiles(values)
             points.append(
                 {
                     "horizon_bars": horizon,
@@ -160,6 +168,8 @@ class CandidateModel:
 
         calibration = self.manifest["calibration_status"]
         origin = bars[-1]
+        atr_24 = float(features.iloc[-1]["atr_24"])
+        barriers = barrier_prices(origin.close, atr_24)
         return {
             "prediction_id": str(uuid.uuid4()),
             "model_id": self.model_id,
@@ -175,6 +185,9 @@ class CandidateModel:
             "barrier_probability_short": min(
                 1.0, max(0.0, barrier_probabilities["short"])
             ),
+            "barrier_spec_id": BARRIER_SPEC_ID,
+            "barrier_horizon_bars": BARRIER_HORIZON,
+            **barriers,
             "expected_mfe_long": excursions["long"]["mfe"],
             "expected_mae_long": excursions["long"]["mae"],
             "expected_mfe_short": excursions["short"]["mfe"],

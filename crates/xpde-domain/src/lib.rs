@@ -5,6 +5,9 @@ use uuid::Uuid;
 
 pub const SUPPORTED_SYMBOL: &str = "GOLDm#";
 pub const SUPPORTED_TIMEFRAME: &str = "M5";
+pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-v1";
+pub const BARRIER_HORIZON_BARS: u32 = 3;
+pub const M5_BAR_MINUTES: i64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketBar {
@@ -173,6 +176,12 @@ pub struct ForecastEnvelope {
     pub direction_probability_up: f64,
     pub barrier_probability_long: f64,
     pub barrier_probability_short: f64,
+    pub barrier_spec_id: String,
+    pub barrier_horizon_bars: u32,
+    pub target_price_long: f64,
+    pub stop_price_long: f64,
+    pub target_price_short: f64,
+    pub stop_price_short: f64,
     pub expected_mfe_long: f64,
     pub expected_mae_long: f64,
     pub expected_mfe_short: f64,
@@ -199,6 +208,10 @@ impl ForecastEnvelope {
             return Err(ContractError::InvalidPredictionOrigin);
         }
         if [
+            self.target_price_long,
+            self.stop_price_long,
+            self.target_price_short,
+            self.stop_price_short,
             self.expected_mfe_long,
             self.expected_mae_long,
             self.expected_mfe_short,
@@ -208,6 +221,15 @@ impl ForecastEnvelope {
         .any(|value| !value.is_finite() || *value < 0.0)
         {
             return Err(ContractError::InvalidExcursion);
+        }
+        if self.barrier_spec_id != BARRIER_SPEC_ID
+            || self.barrier_horizon_bars != BARRIER_HORIZON_BARS
+            || self.stop_price_long >= self.origin_close
+            || self.target_price_long <= self.origin_close
+            || self.target_price_short >= self.origin_close
+            || self.stop_price_short <= self.origin_close
+        {
+            return Err(ContractError::InvalidBarrierContract);
         }
         if self.points.is_empty() {
             return Err(ContractError::MissingForecastPoints);
@@ -241,10 +263,12 @@ pub struct DecisionProposal {
     pub profile: TradingProfile,
     pub action: DecisionAction,
     pub generated_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub decision_valid_until: DateTime<Utc>,
+    pub outcome_matures_at: DateTime<Utc>,
     pub expected_edge_after_cost_usd: f64,
     pub reference_lot: f64,
     pub invalidation_price: Option<f64>,
+    pub target_price: Option<f64>,
     pub reason_codes: Vec<String>,
     pub risk_warnings: Vec<String>,
 }
@@ -298,45 +322,84 @@ pub fn decide(
     policy: &DecisionPolicy,
 ) -> DecisionProposal {
     let generated_at = forecast.generated_at;
-    let fallback_expiry = generated_at + chrono::Duration::minutes(5);
-    let no_prediction = |reason: &str, expires_at| DecisionProposal {
+    let fallback_valid_until = generated_at + chrono::Duration::minutes(M5_BAR_MINUTES);
+    let fallback_matures_at = generated_at
+        + chrono::Duration::minutes((BARRIER_HORIZON_BARS as i64 + 1) * M5_BAR_MINUTES);
+    let no_prediction = |reason: &str, decision_valid_until, outcome_matures_at| DecisionProposal {
         prediction_id: forecast.prediction_id,
         profile: policy.profile,
         action: DecisionAction::NoPrediction,
         generated_at,
-        expires_at,
+        decision_valid_until,
+        outcome_matures_at,
         expected_edge_after_cost_usd: 0.0,
         reference_lot: snapshot.symbol_spec.volume_min,
         invalidation_price: None,
+        target_price: None,
         reason_codes: vec![reason.to_owned()],
         risk_warnings: Vec::new(),
     };
 
     if snapshot.validate().is_err() {
-        return no_prediction("CONTRACT_INVALID", fallback_expiry);
+        return no_prediction(
+            "CONTRACT_INVALID",
+            fallback_valid_until,
+            fallback_matures_at,
+        );
     }
     if forecast.validate().is_err() {
-        return no_prediction("FORECAST_INVALID", fallback_expiry);
+        return no_prediction(
+            "FORECAST_INVALID",
+            fallback_valid_until,
+            fallback_matures_at,
+        );
+    }
+    let latest_completed = snapshot
+        .bars
+        .iter()
+        .max_by_key(|bar| bar.timestamp)
+        .expect("snapshot bars were validated");
+    let decision_valid_until =
+        forecast.origin_bar_timestamp + chrono::Duration::minutes(2 * M5_BAR_MINUTES);
+    let outcome_matures_at = forecast.origin_bar_timestamp
+        + chrono::Duration::minutes((forecast.barrier_horizon_bars as i64 + 1) * M5_BAR_MINUTES);
+    if forecast.origin_bar_timestamp != latest_completed.timestamp
+        || (forecast.origin_close - latest_completed.close).abs() > 1e-8
+    {
+        return no_prediction(
+            "FORECAST_ORIGIN_MISMATCH",
+            decision_valid_until,
+            outcome_matures_at,
+        );
+    }
+    if Utc::now() > decision_valid_until {
+        return no_prediction("FORECAST_EXPIRED", decision_valid_until, outcome_matures_at);
     }
     let horizon = forecast
         .points
         .iter()
-        .find(|point| point.horizon_bars == 3)
+        .find(|point| point.horizon_bars == BARRIER_HORIZON_BARS)
         .or_else(|| forecast.points.first())
         .expect("forecast points were validated");
-    let expires_at = forecast.origin_bar_timestamp
-        + chrono::Duration::minutes((horizon.horizon_bars * 5) as i64);
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
 
     if !snapshot.data_quality.is_valid(policy.max_tick_age_ms) {
-        return no_prediction("DATA_INVALID_OR_STALE", expires_at);
+        return no_prediction(
+            "DATA_INVALID_OR_STALE",
+            decision_valid_until,
+            outcome_matures_at,
+        );
     }
     if snapshot.spread_usd() > policy.max_spread_usd {
-        return no_prediction("SPREAD_ABOVE_LIMIT", expires_at);
+        return no_prediction(
+            "SPREAD_ABOVE_LIMIT",
+            decision_valid_until,
+            outcome_matures_at,
+        );
     }
     if forecast.drift_detected {
-        return no_prediction("DRIFT_DETECTED", expires_at);
+        return no_prediction("DRIFT_DETECTED", decision_valid_until, outcome_matures_at);
     }
 
     if forecast.calibration.observed_coverage < policy.min_coverage
@@ -371,21 +434,25 @@ pub fn decide(
     }
 
     let selected_side = q50_side.unwrap_or(classifier_side);
-    let (direction_probability, barrier_probability, expected_mae) = match selected_side {
+    let (direction_probability, barrier_probability, target_price, stop_price) = match selected_side
+    {
         DecisionAction::Long => (
             forecast.direction_probability_up,
             forecast.barrier_probability_long,
-            forecast.expected_mae_long,
+            forecast.target_price_long,
+            forecast.stop_price_long,
         ),
         DecisionAction::Short => (
             1.0 - forecast.direction_probability_up,
             forecast.barrier_probability_short,
-            forecast.expected_mae_short,
+            forecast.target_price_short,
+            forecast.stop_price_short,
         ),
         _ => unreachable!("selected side is always directional"),
     };
     let reference_lot = snapshot.symbol_spec.volume_min;
-    let expected_move_usd = horizon.q50.abs() * snapshot.mid_price();
+    let expected_move_usd =
+        (forecast.origin_close * horizon.q50.exp() - forecast.origin_close).abs();
     let all_in_cost_usd = snapshot.spread_usd()
         + policy.slippage_buffer_usd
         + policy.commission_usd_per_lot / snapshot.symbol_spec.contract_size;
@@ -419,10 +486,9 @@ pub fn decide(
     }
     warnings.push("MANUAL_CONFIRMATION_REQUIRED".to_owned());
 
-    let invalidation = match action {
-        DecisionAction::Long => Some(snapshot.bid - expected_mae.max(all_in_cost_usd)),
-        DecisionAction::Short => Some(snapshot.ask + expected_mae.max(all_in_cost_usd)),
-        _ => None,
+    let (target, invalidation) = match action {
+        DecisionAction::Long | DecisionAction::Short => (Some(target_price), Some(stop_price)),
+        _ => (None, None),
     };
 
     DecisionProposal {
@@ -430,10 +496,12 @@ pub fn decide(
         profile: policy.profile,
         action,
         generated_at,
-        expires_at,
+        decision_valid_until,
+        outcome_matures_at,
         expected_edge_after_cost_usd: expected_edge,
         reference_lot,
         invalidation_price: invalidation,
+        target_price: target,
         reason_codes: reasons,
         risk_warnings: warnings,
     }
@@ -482,6 +550,8 @@ pub enum ContractError {
     InvalidPredictionOrigin,
     #[error("forecast excursions must be finite non-negative values")]
     InvalidExcursion,
+    #[error("forecast barrier contract does not match the trained objective")]
+    InvalidBarrierContract,
     #[error("forecast points are required")]
     MissingForecastPoints,
 }
@@ -560,6 +630,12 @@ mod tests {
             direction_probability_up: 0.67,
             barrier_probability_long: 0.63,
             barrier_probability_short: 0.37,
+            barrier_spec_id: BARRIER_SPEC_ID.to_owned(),
+            barrier_horizon_bars: BARRIER_HORIZON_BARS,
+            target_price_long: 3333.0,
+            stop_price_long: 3328.5,
+            target_price_short: 3328.0,
+            stop_price_short: 3332.5,
             expected_mfe_long: 2.4,
             expected_mae_long: 1.1,
             expected_mfe_short: 1.8,
@@ -605,6 +681,33 @@ mod tests {
         let decision = decide(&snapshot, &sample_forecast(), &DecisionPolicy::scalper());
         assert_eq!(decision.action, DecisionAction::NoPrediction);
         assert_eq!(decision.reason_codes, vec!["DATA_INVALID_OR_STALE"]);
+    }
+
+    #[test]
+    fn forecast_for_previous_completed_bar_forces_no_prediction() {
+        let snapshot = sample_snapshot();
+        let mut forecast = sample_forecast();
+        forecast.origin_bar_timestamp -= chrono::Duration::minutes(M5_BAR_MINUTES);
+        forecast.origin_bar_index = forecast.origin_bar_timestamp.timestamp().div_euclid(300);
+        let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+        assert_eq!(decision.action, DecisionAction::NoPrediction);
+        assert_eq!(decision.reason_codes, vec!["FORECAST_ORIGIN_MISMATCH"]);
+    }
+
+    #[test]
+    fn actionable_proposal_uses_trained_barrier_and_separate_clocks() {
+        let forecast = sample_forecast();
+        let decision = decide(&sample_snapshot(), &forecast, &DecisionPolicy::scalper());
+        assert_eq!(decision.target_price, Some(forecast.target_price_long));
+        assert_eq!(decision.invalidation_price, Some(forecast.stop_price_long));
+        assert_eq!(
+            decision.decision_valid_until,
+            forecast.origin_bar_timestamp + chrono::Duration::minutes(10)
+        );
+        assert_eq!(
+            decision.outcome_matures_at,
+            forecast.origin_bar_timestamp + chrono::Duration::minutes(20)
+        );
     }
 
     #[test]
