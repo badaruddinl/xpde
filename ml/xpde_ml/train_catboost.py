@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import urllib.request
@@ -134,7 +135,26 @@ def train(args) -> dict[str, Any]:
     model_id = f"catboost-goldm-m5-{datetime.now(UTC):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:6]}"
     if args.output is None:
         args.output = Path("artifacts/catboost/runs") / model_id
+    source_sha256 = hashlib.sha256(args.bars_csv.read_bytes()).hexdigest()
+    source_manifest_path = args.bars_csv.with_suffix(".manifest.json")
+    source_manifest = None
+    if source_manifest_path.is_file():
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        if source_manifest.get("sha256") != source_sha256:
+            raise ValueError("dataset SHA-256 does not match its manifest")
     raw = pd.read_csv(args.bars_csv, parse_dates=["timestamp"]).sort_values("timestamp")
+    if source_manifest is not None:
+        if source_manifest.get("symbol") != "GOLDm#":
+            raise ValueError("dataset manifest symbol is incompatible")
+        if source_manifest.get("timeframe") != "M5":
+            raise ValueError("dataset manifest timeframe is incompatible")
+        if int(source_manifest.get("row_count", -1)) != len(raw):
+            raise ValueError("dataset row count does not match its manifest")
+    dataset_integrity_ok = bool(
+        source_manifest is not None
+        and source_manifest.get("contains_incomplete_bar") is False
+        and source_manifest.get("git_dirty") is False
+    )
     frame = build_training_frame(raw)
     required = list(FEATURE_COLUMNS) + [
         *(f"target_{horizon}" for horizon in HORIZONS),
@@ -393,7 +413,8 @@ def train(args) -> dict[str, Any]:
     )
     pinball_improvement = 1.0 - mean_pinball_model / mean_pinball_baseline
     eligible = (
-        pinball_improvement >= 0.01
+        dataset_integrity_ok
+        and pinball_improvement >= 0.01
         and 0.74 <= coverage_h3 <= 0.86
         and direction_metrics["brier"] <= direction_metrics["baseline_brier"]
     )
@@ -411,6 +432,21 @@ def train(args) -> dict[str, Any]:
         "purge_gap": METADATA.purge_gap,
         "created_at": datetime.now(UTC).isoformat(),
         "source": str(args.bars_csv.resolve()),
+        "source_dataset": {
+            "sha256": source_sha256,
+            "manifest": (
+                str(source_manifest_path.resolve())
+                if source_manifest is not None
+                else None
+            ),
+            "manifest_verified": source_manifest is not None,
+            "integrity_gate_passed": dataset_integrity_ok,
+            "export_git_commit": (
+                source_manifest.get("git_commit")
+                if source_manifest is not None
+                else None
+            ),
+        },
         "rows": {
             "raw": len(raw),
             "labelled": len(dataset),
@@ -453,8 +489,67 @@ def train(args) -> dict[str, Any]:
             "pinball_improvement": pinball_improvement,
         },
     }
+    artifact_files = [
+        *(f"quantile_h{horizon}.cbm" for horizon in HORIZONS),
+        "direction.cbm",
+        "barrier_long_h3.cbm",
+        "barrier_short_h3.cbm",
+        "mfe_long_h3.cbm",
+        "mae_long_h3.cbm",
+        "mfe_short_h3.cbm",
+        "mae_short_h3.cbm",
+        "evaluation.json",
+        "model_card.md",
+        "manifest.json",
+        "checksums.sha256",
+    ]
+    manifest["artifact_files"] = artifact_files
+    (args.output / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "model_id": model_id,
+                "eligible_for_shadow": eligible,
+                "rows": manifest["rows"],
+                "time_range": manifest["time_range"],
+                "metrics": manifest["metrics"],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (args.output / "model_card.md").write_text(
+        "\n".join(
+            [
+                f"# XPDE candidate {model_id}",
+                "",
+                "- Symbol: `GOLDm#`",
+                "- Timeframe: `M5`",
+                "- Mode: candidate / shadow-only",
+                f"- Feature version: `{FEATURE_VERSION}`",
+                f"- Dataset SHA-256: `{source_sha256}`",
+                f"- Eligible for shadow: `{str(eligible).lower()}`",
+                "",
+                "This artifact cannot execute orders and requires manual promotion.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     (args.output / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    checksum_lines = []
+    for filename in sorted(
+        name for name in artifact_files if name != "checksums.sha256"
+    ):
+        artifact = args.output / filename
+        checksum_lines.append(
+            f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  {filename}"
+        )
+    (args.output / "checksums.sha256").write_text(
+        "\n".join(checksum_lines) + "\n",
         encoding="utf-8",
     )
     if args.register_url:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
@@ -8,6 +9,24 @@ from typing import Any
 
 from .contracts import HORIZONS, validate_snapshot
 from .dataset import FEATURE_COLUMNS, FEATURE_VERSION, engineer_features
+
+
+def verify_artifact_checksums(artifact_dir: Path) -> None:
+    checksum_path = artifact_dir / "checksums.sha256"
+    if not checksum_path.is_file():
+        raise ValueError("artifact checksums.sha256 is missing")
+    for line in checksum_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        expected, separator, filename = line.partition("  ")
+        if not separator or not filename or Path(filename).name != filename:
+            raise ValueError("artifact checksum manifest contains an invalid entry")
+        artifact = artifact_dir / filename
+        if not artifact.is_file():
+            raise ValueError(f"artifact file is missing: {filename}")
+        actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if actual != expected:
+            raise ValueError(f"artifact checksum mismatch: {filename}")
 
 
 def _calibrate_probability(value: float, calibration: dict[str, list[float]]) -> float:
@@ -24,6 +43,7 @@ class CandidateModel:
             raise RuntimeError("CatBoost is required for candidate inference") from error
 
         self.artifact_dir = artifact_dir
+        verify_artifact_checksums(artifact_dir)
         self.manifest = json.loads(
             (artifact_dir / "manifest.json").read_text(encoding="utf-8")
         )

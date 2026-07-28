@@ -21,7 +21,8 @@ records outcomes and feedback, then leaves the final decision to a human.
 - Dynamic MT5 account and symbol specifications.
 - SQLite WAL audit trail, prediction registry and outcome settlement.
 - Rust REST/WebSocket service bound to localhost.
-- Local dashboard with forecast interval, coverage, cost gate and feedback.
+- Local dashboard with forecast interval, cost gate and feedback.
+- Explicitly separated offline holdout, live rolling and current-session metrics.
 
 The broker profile starts with leverage `1000:1`, one troy ounce per lot,
 minimum `0.1` lot and minimum price fluctuation `$0.01`. Runtime values from
@@ -132,7 +133,19 @@ Git.
 
 The backfill command treats the fetched MT5 window as authoritative and replaces
 the local `GOLDm#`/M5 bar cache before importing chunks. Use `--append` only when
-an intentional incremental import is required.
+an intentional incremental import is required. Every export also creates a
+sanitized `.manifest.json` containing timestamps, row count, gap summary,
+Git commit and SHA-256.
+
+For CPU training in Google Colab, open
+`notebooks/xpde_colab_training.ipynb`, set the exact commit and Drive paths,
+then run the cells in order. The notebook copies the dataset to `/content`,
+verifies its manifest, runs tests, trains the candidate, verifies artifact
+checksums and copies an immutable candidate folder plus ZIP back to Drive.
+
+Candidate schema v2 contains `evaluation.json`, `model_card.md`,
+`checksums.sha256`, quantile/direction/barrier models and dynamic MFE/MAE
+models. The local bridge verifies every checksum before loading a candidate.
 
 Useful read-only endpoints:
 

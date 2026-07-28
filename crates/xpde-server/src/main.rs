@@ -37,6 +37,7 @@ const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
 struct AppState {
     store: Arc<Store>,
     runtime: Arc<RwLock<RuntimeState>>,
+    started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -649,7 +650,11 @@ impl Store {
         Ok(settled)
     }
 
-    fn evaluation_summary(&self) -> Result<serde_json::Value, rusqlite::Error> {
+    fn evaluation_summary(
+        &self,
+        current_model_id: &str,
+        session_started_at: DateTime<Utc>,
+    ) -> Result<serde_json::Value, rusqlite::Error> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         let overall = connection.query_row(
             "SELECT COUNT(*),
@@ -701,8 +706,63 @@ impl Store {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let current_model = connection.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(AVG(o.interval_hit), 0.0),
+                    COALESCE(AVG(o.direction_hit), 0.0),
+                    COUNT(o.barrier_outcome),
+                    AVG(CASE
+                          WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                          WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                        END)
+             FROM prediction_horizon_outcomes o
+             JOIN predictions p ON p.prediction_id=o.prediction_id
+             WHERE o.horizon_bars=3 AND p.model_id=?1",
+            [current_model_id],
+            |row| {
+                Ok(serde_json::json!({
+                    "model_id": current_model_id,
+                    "settled_predictions": row.get::<_, i64>(0)?,
+                    "interval_coverage": row.get::<_, f64>(1)?,
+                    "direction_accuracy": row.get::<_, f64>(2)?,
+                    "tp_before_sl_samples": row.get::<_, i64>(3)?,
+                    "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
+                }))
+            },
+        )?;
+        let session_started_at_text = session_started_at.to_rfc3339();
+        let current_session = connection.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(AVG(o.interval_hit), 0.0),
+                    COALESCE(AVG(o.direction_hit), 0.0),
+                    COUNT(o.barrier_outcome),
+                    AVG(CASE
+                          WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                          WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                        END)
+             FROM prediction_horizon_outcomes o
+             JOIN predictions p ON p.prediction_id=o.prediction_id
+             WHERE o.horizon_bars=3
+               AND p.model_id=?1
+               AND o.settled_at>=?2",
+            params![current_model_id, session_started_at_text],
+            |row| {
+                Ok(serde_json::json!({
+                    "model_id": current_model_id,
+                    "started_at": session_started_at,
+                    "settled_predictions": row.get::<_, i64>(0)?,
+                    "interval_coverage": row.get::<_, f64>(1)?,
+                    "direction_accuracy": row.get::<_, f64>(2)?,
+                    "tp_before_sl_samples": row.get::<_, i64>(3)?,
+                    "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
+                }))
+            },
+        )?;
         Ok(serde_json::json!({
+            "scope": "LIVE_SHADOW_H3",
             "overall": overall,
+            "current_model": current_model,
+            "current_session": current_session,
             "by_model": by_model,
             "target_coverage": 0.80,
             "updated_at": Utc::now(),
@@ -759,6 +819,7 @@ async fn main() {
     let state = AppState {
         store,
         runtime: Arc::new(RwLock::new(runtime)),
+        started_at: Utc::now(),
     };
     tokio::spawn(settlement_loop(state.store.clone()));
 
@@ -1001,9 +1062,10 @@ async fn get_models(State(state): State<AppState>) -> Result<Json<Vec<ModelRecor
 async fn get_evaluation_summary(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let current_model_id = state.runtime.read().await.forecast.model_id.clone();
     state
         .store
-        .evaluation_summary()
+        .evaluation_summary(&current_model_id, state.started_at)
         .map(Json)
         .map_err(|error| ApiError::internal(error.to_string()))
 }

@@ -10,6 +10,7 @@ $statePath = Join-Path $workDir "realtime-processes.json"
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
 $candidateDir = Join-Path $repoRoot "artifacts\catboost\latest"
 $requiredCandidateFiles = @(
+    "checksums.sha256",
     "barrier_long_h3.cbm",
     "barrier_short_h3.cbm",
     "mfe_long_h3.cbm",

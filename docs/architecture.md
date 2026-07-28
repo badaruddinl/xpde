@@ -87,3 +87,24 @@ the direction classifier, and the stronger barrier side yields
 After downtime, market bars are backfilled from the last local completed candle.
 Predictions are never generated retroactively: the bridge waits for the next
 new completed M5 candle after catch-up.
+
+Dashboard evaluation scopes are deliberately separate:
+
+- offline holdout coverage comes only from the immutable model artifact;
+- live rolling metrics come only from settled shadow predictions for the
+  currently loaded model;
+- current-session metrics reset when the Rust core starts.
+
+Zero live samples are rendered as unavailable rather than as a misleading
+zero-percent result.
+
+## Reproducible training boundary
+
+MT5 dataset exports receive a sidecar manifest with symbol, timeframe, UTC
+range, row count, gap summary, repository commit and SHA-256. Colab copies the
+dataset from Drive to ephemeral `/content`, verifies the hash, checks out the
+exact repository commit and runs the test suite before training.
+
+Every candidate includes a model card, machine-readable evaluation report and
+SHA-256 checksum list. Local inference refuses missing, modified or incomplete
+schema-v2 artifacts. Candidates remain shadow-only and immutable in Drive.

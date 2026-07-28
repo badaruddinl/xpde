@@ -112,7 +112,13 @@ interface EvaluationMetrics {
 }
 
 interface EvaluationSummary {
+  scope: "LIVE_SHADOW_H3";
   overall: EvaluationMetrics;
+  current_model: EvaluationMetrics & { model_id: string };
+  current_session: EvaluationMetrics & {
+    model_id: string;
+    started_at: string;
+  };
   by_model: Array<EvaluationMetrics & { model_id: string }>;
   target_coverage: number;
   updated_at: string;
@@ -351,9 +357,16 @@ export default function Home() {
   }, []);
 
   const proposal = state.proposals.find((item) => item.profile === profile) ?? state.proposals[0];
-  const activeEvaluation =
-    evaluation?.by_model.find((item) => item.model_id === state.forecast.model_id) ??
-    evaluation?.overall;
+  const activeEvaluation = evaluation?.current_model ?? null;
+  const sessionEvaluation = evaluation?.current_session ?? null;
+  const liveCoverage =
+    activeEvaluation && activeEvaluation.settled_predictions > 0
+      ? activeEvaluation.interval_coverage
+      : null;
+  const sessionDirectionAccuracy =
+    sessionEvaluation && sessionEvaluation.settled_predictions > 0
+      ? sessionEvaluation.direction_accuracy
+      : null;
   const realizedTpRate = activeEvaluation?.tp_before_sl_rate ?? null;
   const horizonThree =
     state.forecast.points.find((point) => point.horizon_bars === 3) ??
@@ -522,6 +535,9 @@ export default function Home() {
 
       <section className="safety-strip">
         <span className="safe-badge">SHADOW MODE</span>
+        <span className={`data-badge ${state.safety.feed_is_demo ? "demo" : "live"}`}>
+          {state.safety.feed_is_demo ? "DEMO DATA" : "MT5 LIVE"}
+        </span>
         <p>Auto-trading nonaktif. Semua proposal membutuhkan verifikasi dan keputusan manusia.</p>
         {retryStatus ? <span className="retry-status" aria-live="polite">{retryStatus}</span> : null}
         <span>UTC {time(state.updated_at)}</span>
@@ -642,13 +658,50 @@ export default function Home() {
               <small>Gate Sniper 60% · sisi harus konsisten</small>
             </article>
             <article className="panel metric">
-              <span>Observed coverage</span>
+              <span>Offline holdout coverage</span>
               <strong>{percent(state.forecast.calibration.observed_coverage)}</strong>
               <div className="meter coverage"><i style={{ width: percent(state.forecast.calibration.observed_coverage) }} /></div>
-              <small>Target 80% · n={state.forecast.calibration.sample_size}</small>
+              <small>
+                Artifact evaluation · target 80% · n={state.forecast.calibration.sample_size}
+              </small>
             </article>
             <article className="panel metric">
-              <span>Realized TP before SL</span>
+              <span>Live rolling coverage · current model</span>
+              <strong>{liveCoverage === null ? "—" : percent(liveCoverage)}</strong>
+              <div className="meter coverage">
+                <i style={{ width: liveCoverage === null ? "0%" : percent(liveCoverage) }} />
+              </div>
+              <small>
+                {activeEvaluation
+                  ? `Live H3 settled n=${activeEvaluation.settled_predictions}`
+                  : "Menunggu evaluation API"}
+              </small>
+            </article>
+            <article className="panel metric">
+              <span>Current runtime session · direction</span>
+              <strong>
+                {sessionDirectionAccuracy === null
+                  ? "—"
+                  : percent(sessionDirectionAccuracy)}
+              </strong>
+              <div className="meter coverage">
+                <i
+                  style={{
+                    width:
+                      sessionDirectionAccuracy === null
+                        ? "0%"
+                        : percent(sessionDirectionAccuracy),
+                  }}
+                />
+              </div>
+              <small>
+                {sessionEvaluation
+                  ? `Sejak core start · settled n=${sessionEvaluation.settled_predictions}`
+                  : "Menunggu evaluation API"}
+              </small>
+            </article>
+            <article className="panel metric">
+              <span>Live realized TP before SL · current model</span>
               <strong>{realizedTpRate === null ? "—" : percent(realizedTpRate)}</strong>
               <div className="meter realized">
                 <i style={{ width: realizedTpRate === null ? "0%" : percent(realizedTpRate) }} />
