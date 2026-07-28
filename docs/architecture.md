@@ -42,9 +42,10 @@ dead-letter handling and idempotent writes.
 ## Frozen contracts
 
 - `MarketSnapshot`: provider data and account/symbol specification.
-- `ForecastEnvelope`: direct-horizon quantiles, probabilities and calibration.
+- `ForecastEnvelope`: exact origin candle, direct-horizon quantiles, symmetric
+  LONG/SHORT probabilities, dynamic excursions and calibration.
 - `DecisionProposal`: cost-aware action, expiry, reasons and warnings.
-- `OutcomeRecord`: objective result after a prediction expires.
+- `OutcomeRecord`: objective result at the exact completed bar for each horizon.
 
 Rust owns the canonical JSON shape. Python mirrors and validates the parts it
 produces. Contract fixtures and golden parity tests should be added before an
@@ -69,3 +70,20 @@ walk-forward folds, a separate calibration window and a final untouched
 holdout. Conformal corrections target 80% interval coverage. An eligible
 artifact may run in shadow mode but remains a registry `candidate`; champion
 promotion is manual after enough objective outcomes have been settled.
+
+## Prediction and downtime semantics
+
+Every prediction stores `origin_bar_timestamp`, `origin_close`,
+`origin_bar_index`, and a separate `generated_at`. Outcome settlement selects
+the first `h` completed candles strictly after that origin for horizons 1, 3, 6
+and 12; wall-clock expiry is not used as a proxy for the outcome candle.
+
+Barrier training and live evaluation use the same explicit three-bar horizon.
+LONG and SHORT are modelled independently and retain `TP_FIRST`, `SL_FIRST`,
+`NO_HIT_BEFORE_EXPIRY`, and `AMBIGUOUS_SAME_BAR`. A disagreement between q50,
+the direction classifier, and the stronger barrier side yields
+`FORECAST_SIDE_CONFLICT` and therefore `WAIT`.
+
+After downtime, market bars are backfilled from the last local completed candle.
+Predictions are never generated retroactively: the bridge waits for the next
+new completed M5 candle after catch-up.

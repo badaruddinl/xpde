@@ -44,6 +44,13 @@ METADATA = DatasetMetadata(
     purge_gap=max(HORIZONS),
 )
 
+BARRIER_HORIZON = 3
+BARRIER_CLASS = {
+    "TP_FIRST": 0,
+    "SL_FIRST": 1,
+    "NO_HIT_BEFORE_EXPIRY": 2,
+}
+
 
 def engineer_features(frame):
     """Create causal features shared by training and live inference."""
@@ -88,7 +95,7 @@ def engineer_features(frame):
     return result
 
 
-def add_objective_labels(frame, *, barrier_horizon: int = 12):
+def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
     """Add future-return, direction, excursion and TP-before-SL labels."""
     import numpy as np
 
@@ -98,55 +105,83 @@ def add_objective_labels(frame, *, barrier_horizon: int = 12):
         result[f"target_{horizon}"] = np.log(close.shift(-horizon) / close)
     result["direction_3"] = (result["target_3"] > 0).astype(float)
 
-    barrier_up: list[float] = []
-    barrier_down: list[float] = []
-    mfe_up: list[float] = []
-    mae_up: list[float] = []
-    mfe_down: list[float] = []
-    mae_down: list[float] = []
+    barrier_long_outcome: list[str | None] = []
+    barrier_short_outcome: list[str | None] = []
+    barrier_long_class: list[float] = []
+    barrier_short_class: list[float] = []
+    mfe_long: list[float] = []
+    mae_long: list[float] = []
+    mfe_short: list[float] = []
+    mae_short: list[float] = []
+
+    def classify_barrier(
+        future,
+        *,
+        target: float,
+        stop: float,
+        side: str,
+    ) -> str:
+        for _, future_bar in future.iterrows():
+            high = float(future_bar["high"])
+            low = float(future_bar["low"])
+            if side == "long":
+                tp_hit, sl_hit = high >= target, low <= stop
+            else:
+                tp_hit, sl_hit = low <= target, high >= stop
+            if tp_hit and sl_hit:
+                return "AMBIGUOUS_SAME_BAR"
+            if tp_hit:
+                return "TP_FIRST"
+            if sl_hit:
+                return "SL_FIRST"
+        return "NO_HIT_BEFORE_EXPIRY"
+
     for index, row in result.iterrows():
         future = result.iloc[index + 1 : index + 1 + barrier_horizon]
         atr = float(row.get("atr_24", np.nan))
         start = float(row["close"])
         if len(future) < barrier_horizon or not np.isfinite(atr) or atr <= 0:
-            barrier_up.append(np.nan)
-            barrier_down.append(np.nan)
-            mfe_up.append(np.nan)
-            mae_up.append(np.nan)
-            mfe_down.append(np.nan)
-            mae_down.append(np.nan)
+            barrier_long_outcome.append(None)
+            barrier_short_outcome.append(None)
+            barrier_long_class.append(np.nan)
+            barrier_short_class.append(np.nan)
+            mfe_long.append(np.nan)
+            mae_long.append(np.nan)
+            mfe_short.append(np.nan)
+            mae_short.append(np.nan)
             continue
 
-        upper = start + 1.25 * atr
-        lower = start - atr
-        up_label = np.nan
-        down_label = np.nan
-        for _, future_bar in future.iterrows():
-            hits_upper = float(future_bar["high"]) >= upper
-            hits_lower = float(future_bar["low"]) <= lower
-            if hits_upper and hits_lower:
-                break
-            if hits_upper:
-                up_label, down_label = 1.0, 0.0
-                break
-            if hits_lower:
-                up_label, down_label = 0.0, 1.0
-                break
-        barrier_up.append(up_label)
-        barrier_down.append(down_label)
+        long_outcome = classify_barrier(
+            future,
+            target=start + 1.25 * atr,
+            stop=start - atr,
+            side="long",
+        )
+        short_outcome = classify_barrier(
+            future,
+            target=start - 1.25 * atr,
+            stop=start + atr,
+            side="short",
+        )
+        barrier_long_outcome.append(long_outcome)
+        barrier_short_outcome.append(short_outcome)
+        barrier_long_class.append(BARRIER_CLASS.get(long_outcome, np.nan))
+        barrier_short_class.append(BARRIER_CLASS.get(short_outcome, np.nan))
         future_high = float(future["high"].max())
         future_low = float(future["low"].min())
-        mfe_up.append(max(0.0, future_high - start))
-        mae_up.append(max(0.0, start - future_low))
-        mfe_down.append(max(0.0, start - future_low))
-        mae_down.append(max(0.0, future_high - start))
+        mfe_long.append(max(0.0, future_high - start))
+        mae_long.append(max(0.0, start - future_low))
+        mfe_short.append(max(0.0, start - future_low))
+        mae_short.append(max(0.0, future_high - start))
 
-    result["barrier_up"] = barrier_up
-    result["barrier_down"] = barrier_down
-    result["mfe_up_usd"] = mfe_up
-    result["mae_up_usd"] = mae_up
-    result["mfe_down_usd"] = mfe_down
-    result["mae_down_usd"] = mae_down
+    result["barrier_long_outcome"] = barrier_long_outcome
+    result["barrier_short_outcome"] = barrier_short_outcome
+    result["barrier_long_class"] = barrier_long_class
+    result["barrier_short_class"] = barrier_short_class
+    result["mfe_long_usd"] = mfe_long
+    result["mae_long_usd"] = mae_long
+    result["mfe_short_usd"] = mfe_short
+    result["mae_short_usd"] = mae_short
     return result
 
 

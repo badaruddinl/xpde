@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,19 @@ class PayloadRejected(RuntimeError):
         self.body = body
         detail = body.strip() or "empty response body"
         super().__init__(f"{url} rejected payload with HTTP {status}: {detail}")
+
+
+def load_local_env(path: Path = Path(".env")) -> None:
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip().strip("\"'")
 
 
 def next_retry_delay(current: float, maximum: float) -> float:
@@ -67,7 +81,7 @@ def build_snapshot(
         raise RuntimeError(f"MetaTrader5 snapshot failed ({code}): {message}")
 
     tick_time_ms = int(getattr(tick, "time_msc", int(tick.time * 1000)))
-    clock = broker_clock or BrokerClock.from_tick(tick_time_ms / 1000)
+    clock = broker_clock or BrokerClock()
     missing_flags: list[str] = []
     if tick.bid <= 0:
         missing_flags.append("BID_MISSING")
@@ -130,11 +144,15 @@ def build_snapshot(
         },
         "data_quality": {
             "completeness": 1.0 if not missing_flags else 0.0,
-            # The broker server clock may not be UTC. The polling loop replaces
+            # MT5 Python epoch timestamps are UTC. The polling loop replaces
             # this with a monotonic age based on actual tick changes.
             "tick_age_ms": 0,
             "missing_flags": missing_flags,
-            "reason_codes": [f"BROKER_TIME_OFFSET_HOURS_{clock.offset_hours}"],
+            "reason_codes": (
+                [f"UTC_PROVIDER_OVERRIDE_HOURS_{clock.offset_hours}"]
+                if clock.offset_hours
+                else ["UTC_PROVIDER_TIME"]
+            ),
         },
     }
 
@@ -156,12 +174,101 @@ def post_payload(api_url: str, payload: dict[str, Any], expected_status: int = 2
         raise PayloadRejected(api_url, error.code, body) from error
 
 
+def get_payload(api_url: str) -> dict[str, Any]:
+    request = urllib.request.Request(api_url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status != 200:
+                body = response.read().decode("utf-8", errors="replace")
+                raise PayloadRejected(api_url, response.status, body)
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise PayloadRejected(api_url, error.code, body) from error
+
+
+def fetch_catchup_bars(
+    mt5: Any,
+    *,
+    after_timestamp: str,
+    through_timestamp: str,
+    clock: BrokerClock,
+) -> list[dict[str, Any]]:
+    after = datetime.fromisoformat(after_timestamp.replace("Z", "+00:00"))
+    through = datetime.fromisoformat(through_timestamp.replace("Z", "+00:00"))
+    start = after + timedelta(minutes=5, hours=clock.offset_hours)
+    end = through + timedelta(hours=clock.offset_hours)
+    if start > end:
+        return []
+    rates = mt5.copy_rates_range(SYMBOL, mt5.TIMEFRAME_M5, start, end)
+    if rates is None:
+        code, message = mt5.last_error()
+        raise RuntimeError(f"MetaTrader5 catch-up failed ({code}): {message}")
+    bars = [
+        {
+            "timestamp": clock.iso_utc(float(rate["time"])),
+            "open": float(rate["open"]),
+            "high": float(rate["high"]),
+            "low": float(rate["low"]),
+            "close": float(rate["close"]),
+            "tick_volume": float(rate["tick_volume"]),
+        }
+        for rate in rates
+    ]
+    return sorted(
+        {
+            bar["timestamp"]: bar
+            for bar in bars
+            if after
+            < datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00"))
+            <= through
+        }.values(),
+        key=lambda bar: bar["timestamp"],
+    )
+
+
+def post_catchup(
+    api_url: str,
+    bars: list[dict[str, Any]],
+    *,
+    clock: BrokerClock,
+) -> None:
+    for start in range(0, len(bars), 5_000):
+        post_payload(
+            api_url,
+            {
+                "symbol": SYMBOL,
+                "timeframe": TIMEFRAME,
+                "provider": "MetaTrader5",
+                "broker_offset_hours": clock.offset_hours,
+                "reset": False,
+                "bars": bars[start : start + 5_000],
+            },
+            expected_status=201,
+        )
+
+
+def completed_bar_distance(earlier: str, later: str) -> int:
+    earlier_time = datetime.fromisoformat(earlier.replace("Z", "+00:00"))
+    later_time = datetime.fromisoformat(later.replace("Z", "+00:00"))
+    return max(0, int((later_time - earlier_time).total_seconds() // 300))
+
+
 def main() -> None:
+    load_local_env()
     parser = argparse.ArgumentParser(description="Read-only MetaTrader5 bridge for GOLDm#")
     parser.add_argument("--api-url", default="http://127.0.0.1:8787/api/v1/market/snapshot")
     parser.add_argument(
         "--forecast-url",
         default="http://127.0.0.1:8787/api/v1/forecast",
+    )
+    parser.add_argument(
+        "--cursor-url",
+        default="http://127.0.0.1:8787/api/v1/market/cursor",
+    )
+    parser.add_argument(
+        "--backfill-url",
+        default="http://127.0.0.1:8787/api/v1/market/backfill",
     )
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--max-retry-delay", type=float, default=10.0)
@@ -188,10 +295,8 @@ def main() -> None:
         initial_tick = mt5.symbol_info_tick(SYMBOL)
         if initial_tick is None:
             raise RuntimeError("MetaTrader5 did not return an initial tick")
-        broker_clock = (
-            BrokerClock(int(os.environ["MT5_BROKER_UTC_OFFSET_HOURS"]))
-            if os.getenv("MT5_BROKER_UTC_OFFSET_HOURS")
-            else BrokerClock.from_tick(float(initial_tick.time))
+        broker_clock = BrokerClock(
+            int(os.getenv("MT5_UTC_OFFSET_OVERRIDE_HOURS", "0"))
         )
         candidate = None
         if args.model_dir:
@@ -203,8 +308,57 @@ def main() -> None:
                     f"candidate {candidate.model_id} did not pass the shadow eligibility gate"
                 )
             print(f"XPDE candidate model loaded: {candidate.model_id}", flush=True)
-        last_forecast_bar: str | None = None
-        last_tick_signature: tuple[str, float, float] | None = None
+        retry_delay = max(args.interval, 0.5)
+        while True:
+            try:
+                startup_snapshot = build_snapshot(mt5, broker_clock=broker_clock)
+                latest_completed_bar = startup_snapshot["bars"][-1]["timestamp"]
+                cursor = get_payload(args.cursor_url).get(
+                    "last_completed_bar_timestamp"
+                )
+                if cursor and completed_bar_distance(
+                    str(cursor), latest_completed_bar
+                ) > 0:
+                    catchup_bars = fetch_catchup_bars(
+                        mt5,
+                        after_timestamp=str(cursor),
+                        through_timestamp=latest_completed_bar,
+                        clock=broker_clock,
+                    )
+                    post_catchup(args.backfill_url, catchup_bars, clock=broker_clock)
+                    print(
+                        f"XPDE catch-up appended {len(catchup_bars)} completed M5 bars",
+                        flush=True,
+                    )
+                post_payload(args.api_url, startup_snapshot)
+                break
+            except (
+                PayloadRejected,
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                RuntimeError,
+            ) as error:
+                print(
+                    f"XPDE startup retrying in {retry_delay:.1f}s after: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if args.once:
+                    raise
+                time.sleep(retry_delay)
+                retry_delay = next_retry_delay(
+                    retry_delay, args.max_retry_delay
+                )
+
+        # A restart may backfill market history, but it must never manufacture
+        # retroactive "live" predictions. Wait for the next completed M5 bar.
+        last_forecast_bar: str | None = latest_completed_bar
+        last_tick_signature: tuple[str, float, float] | None = (
+            startup_snapshot["timestamp"],
+            startup_snapshot["bid"],
+            startup_snapshot["ask"],
+        )
         last_tick_change = time.monotonic()
         retry_delay = max(args.interval, 0.5)
         while True:
@@ -223,9 +377,37 @@ def main() -> None:
                 )
                 if args.print_snapshot:
                     print(json.dumps(snapshot, indent=2))
-                post_payload(args.api_url, snapshot)
                 latest_bar = snapshot["bars"][-1]["timestamp"]
-                if not args.snapshot_only and latest_bar != last_forecast_bar:
+                skipped_retroactive_forecast = False
+                if (
+                    last_forecast_bar is not None
+                    and completed_bar_distance(last_forecast_bar, latest_bar) > 1
+                ):
+                    catchup_bars = fetch_catchup_bars(
+                        mt5,
+                        after_timestamp=last_forecast_bar,
+                        through_timestamp=latest_bar,
+                        clock=broker_clock,
+                    )
+                    post_catchup(
+                        args.backfill_url,
+                        catchup_bars,
+                        clock=broker_clock,
+                    )
+                    last_forecast_bar = latest_bar
+                    skipped_retroactive_forecast = True
+                    print(
+                        "XPDE recovered a downtime gap; historical bars were "
+                        f"backfilled ({len(catchup_bars)}) without retroactive "
+                        "live predictions",
+                        flush=True,
+                    )
+                post_payload(args.api_url, snapshot)
+                if (
+                    not args.snapshot_only
+                    and not skipped_retroactive_forecast
+                    and latest_bar != last_forecast_bar
+                ):
                     forecast = (
                         candidate.forecast(snapshot)
                         if candidate is not None

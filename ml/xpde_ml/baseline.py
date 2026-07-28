@@ -85,18 +85,27 @@ def forecast_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     volatility_ratio = recent_mean_abs / max(previous_mean_abs, 1e-9)
     drift_detected = volatility_ratio > 2.5 or volatility_ratio < 0.4
     generated_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    origin = bars[-1]
+    origin_bar_index = int(origin.timestamp.timestamp() // 300)
 
     return {
         "prediction_id": str(uuid.uuid4()),
         "model_id": "empirical-direct-baseline-v1",
         "feature_version": "goldm-m5-v1",
+        "origin_bar_timestamp": origin.timestamp.isoformat().replace("+00:00", "Z"),
+        "origin_close": origin.close,
+        "origin_bar_index": origin_bar_index,
         "generated_at": generated_at,
         "direction_probability_up": probability_up,
         # The transparent baseline has no trained barrier classifier. Keeping
         # this neutral forces the policy to abstain until a validated model is promoted.
-        "barrier_probability": 0.50,
-        "expected_mfe_usd": expected_range * 1.15,
-        "expected_mae_usd": expected_range * 0.85,
+        "barrier_probability_long": 0.50,
+        "barrier_probability_short": 0.50,
+        "expected_mfe_long": expected_range * 1.15,
+        "expected_mae_long": expected_range * 0.85,
+        "expected_mfe_short": expected_range * 1.15,
+        "expected_mae_short": expected_range * 0.85,
+        "excursion_modelled": False,
         "calibration": {
             "target_coverage": 0.80,
             "observed_coverage": observed_coverage,

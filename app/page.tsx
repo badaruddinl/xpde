@@ -75,11 +75,18 @@ interface DashboardState {
     prediction_id: string;
     model_id: string;
     feature_version: string;
+    origin_bar_timestamp: string;
+    origin_close: number;
+    origin_bar_index: number;
     generated_at: string;
     direction_probability_up: number;
-    barrier_probability: number;
-    expected_mfe_usd: number;
-    expected_mae_usd: number;
+    barrier_probability_long: number;
+    barrier_probability_short: number;
+    expected_mfe_long: number;
+    expected_mae_long: number;
+    expected_mfe_short: number;
+    expected_mae_short: number;
+    excursion_modelled: boolean;
     calibration: {
       target_coverage: number;
       observed_coverage: number;
@@ -174,11 +181,20 @@ function buildDemoState(): DashboardState {
       prediction_id: predictionId,
       model_id: "baseline-demo-v1",
       feature_version: "goldm-m5-v1",
+      origin_bar_timestamp: bars[bars.length - 1].timestamp,
+      origin_close: bars[bars.length - 1].close,
+      origin_bar_index: Math.floor(
+        Date.parse(bars[bars.length - 1].timestamp) / (5 * 60_000),
+      ),
       generated_at: now,
       direction_probability_up: 0.57,
-      barrier_probability: 0.54,
-      expected_mfe_usd: 1.42,
-      expected_mae_usd: 0.91,
+      barrier_probability_long: 0.54,
+      barrier_probability_short: 0.46,
+      expected_mfe_long: 1.42,
+      expected_mae_long: 0.91,
+      expected_mfe_short: 1.31,
+      expected_mae_short: 0.98,
+      excursion_modelled: false,
       calibration: {
         target_coverage: 0.8,
         observed_coverage: 0.786,
@@ -262,6 +278,8 @@ function reasonLabel(reason: string) {
     DATA_INVALID_OR_STALE: "Feed tidak valid atau stale",
     SPREAD_ABOVE_LIMIT: "Spread melewati batas profil",
     DRIFT_DETECTED: "Drift model terdeteksi",
+    FORECAST_SIDE_CONFLICT: "Arah quantile, classifier, dan barrier tidak selaras",
+    EXCURSION_MODEL_UNAVAILABLE: "Model MFE/MAE dinamis belum tersedia",
   };
   return labels[reason] ?? reason.replaceAll("_", " ").toLowerCase();
 }
@@ -337,6 +355,27 @@ export default function Home() {
     evaluation?.by_model.find((item) => item.model_id === state.forecast.model_id) ??
     evaluation?.overall;
   const realizedTpRate = activeEvaluation?.tp_before_sl_rate ?? null;
+  const horizonThree =
+    state.forecast.points.find((point) => point.horizon_bars === 3) ??
+    state.forecast.points[0];
+  const forecastSide =
+    proposal.action === "LONG" || proposal.action === "SHORT"
+      ? proposal.action
+      : horizonThree.q50 >= 0
+        ? "LONG"
+        : "SHORT";
+  const barrierProbability =
+    forecastSide === "LONG"
+      ? state.forecast.barrier_probability_long
+      : state.forecast.barrier_probability_short;
+  const expectedMfe =
+    forecastSide === "LONG"
+      ? state.forecast.expected_mfe_long
+      : state.forecast.expected_mfe_short;
+  const expectedMae =
+    forecastSide === "LONG"
+      ? state.forecast.expected_mae_long
+      : state.forecast.expected_mae_short;
   const probabilityUp = state.forecast.direction_probability_up;
   const probabilityUpPercent = Math.round(probabilityUp * 1000) / 10;
   const probabilityDownPercent = Math.round((100 - probabilityUpPercent) * 10) / 10;
@@ -366,8 +405,9 @@ export default function Home() {
   const lastPrice = (state.snapshot.bid + state.snapshot.ask) / 2;
 
   const suggestedLot = useMemo(() => {
+    if (!state.forecast.excursion_modelled) return null;
     const riskUsd = state.snapshot.account.equity * (riskPercent / 100);
-    const stopDistance = Math.max(state.forecast.expected_mae_usd, spread * 1.5);
+    const stopDistance = Math.max(expectedMae, spread * 1.5);
     const raw = riskUsd / (stopDistance * state.snapshot.symbol_spec.contract_size);
     const step = state.snapshot.symbol_spec.volume_step;
     const rounded = Math.floor(raw / step) * step;
@@ -375,7 +415,7 @@ export default function Home() {
       state.snapshot.symbol_spec.volume_max,
       Math.max(state.snapshot.symbol_spec.volume_min, rounded),
     );
-  }, [riskPercent, spread, state]);
+  }, [expectedMae, riskPercent, spread, state]);
 
   async function submitFeedback(verdict: "ACCEPTED" | "REJECTED" | "UNCERTAIN") {
     setFeedbackStatus("Menyimpan…");
@@ -574,7 +614,7 @@ export default function Home() {
 
           <div className="metric-grid">
             <article className="panel metric direction-metric">
-              <span>Probabilitas arah</span>
+              <span>Peluang arah dalam 3 bar / 15 menit</span>
               <div className="direction-values">
                 <div className="direction-stat up" aria-label={`Probabilitas naik ${probabilityUpPercent.toFixed(1)}%`}>
                   <i aria-hidden="true">↑</i>
@@ -596,10 +636,10 @@ export default function Home() {
               <small className="direction-summary">{directionSummary}</small>
             </article>
             <article className="panel metric">
-              <span>TP before invalidation</span>
-              <strong>{percent(state.forecast.barrier_probability)}</strong>
-              <div className="meter amber"><i style={{ width: percent(state.forecast.barrier_probability) }} /></div>
-              <small>Belum melewati gate Sniper 60%</small>
+              <span>TP before invalidation · {forecastSide} · 3 bar</span>
+              <strong>{percent(barrierProbability)}</strong>
+              <div className="meter amber"><i style={{ width: percent(barrierProbability) }} /></div>
+              <small>Gate Sniper 60% · sisi harus konsisten</small>
             </article>
             <article className="panel metric">
               <span>Observed coverage</span>
@@ -629,7 +669,14 @@ export default function Home() {
             <p>{proposal.reason_codes.length ? reasonLabel(proposal.reason_codes[0]) : "Semua gate profil terpenuhi."}</p>
             <div className="decision-numbers">
               <div><span>Net edge · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.expected_edge_after_cost_usd)}</strong></div>
-              <div><span>Expected MFE / MAE</span><strong>{state.forecast.expected_mfe_usd.toFixed(2)} / {state.forecast.expected_mae_usd.toFixed(2)}</strong></div>
+              <div>
+                <span>Model MFE / MAE · {forecastSide}</span>
+                <strong>
+                  {state.forecast.excursion_modelled
+                    ? `${expectedMfe.toFixed(2)} / ${expectedMae.toFixed(2)}`
+                    : "Belum tersedia"}
+                </strong>
+              </div>
             </div>
             <ul className="reason-list">
               {proposal.reason_codes.map((reason) => <li key={reason}>{reasonLabel(reason)}</li>)}
@@ -648,11 +695,15 @@ export default function Home() {
             </div>
             <label className="risk-input">
               <span>Risk budget <strong>{riskPercent.toFixed(1)}%</strong></span>
-              <input aria-label="Risk budget percent" max="3" min="0.1" onChange={(event) => setRiskPercent(Number(event.target.value))} step="0.1" type="range" value={riskPercent} />
+              <input aria-label="Risk budget percent" disabled={!state.forecast.excursion_modelled} max="3" min="0.1" onChange={(event) => setRiskPercent(Number(event.target.value))} step="0.1" type="range" value={riskPercent} />
             </label>
             <div className="lot-preview">
-              <span>Lot indikatif</span><strong>{suggestedLot.toFixed(1)}</strong>
-              <small>Berdasarkan MAE forecast; verifikasi manual tetap wajib.</small>
+              <span>Lot indikatif</span><strong>{suggestedLot === null ? "—" : suggestedLot.toFixed(1)}</strong>
+              <small>
+                {suggestedLot === null
+                  ? "Nonaktif sampai model MAE dinamis tersedia."
+                  : "Berdasarkan MAE model; verifikasi manual tetap wajib."}
+              </small>
             </div>
           </section>
 

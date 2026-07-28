@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .mt5_bridge import SYMBOL, TIMEFRAME, initialize_mt5
+from .mt5_bridge import SYMBOL, TIMEFRAME, initialize_mt5, load_local_env
 from .time_utils import BrokerClock
 
 
@@ -21,11 +21,7 @@ def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int]:
     if tick is None or symbol is None or rates is None:
         code, message = mt5.last_error()
         raise RuntimeError(f"MetaTrader5 backfill failed ({code}): {message}")
-    clock = (
-        BrokerClock(int(os.environ["MT5_BROKER_UTC_OFFSET_HOURS"]))
-        if os.getenv("MT5_BROKER_UTC_OFFSET_HOURS")
-        else BrokerClock.from_tick(float(tick.time))
-    )
+    clock = BrokerClock(int(os.getenv("MT5_UTC_OFFSET_OVERRIDE_HOURS", "0")))
     point = float(symbol.point)
     bars = [
         {
@@ -86,6 +82,7 @@ def post_chunks(
 
 
 def main() -> None:
+    load_local_env()
     parser = argparse.ArgumentParser(description="Backfill completed GOLDm# M5 bars from MT5")
     parser.add_argument("--bars", type=int, default=50_000)
     parser.add_argument("--output", type=Path, default=Path("data/goldm_m5.csv"))

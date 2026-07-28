@@ -166,11 +166,18 @@ pub struct ForecastEnvelope {
     pub prediction_id: Uuid,
     pub model_id: String,
     pub feature_version: String,
+    pub origin_bar_timestamp: DateTime<Utc>,
+    pub origin_close: f64,
+    pub origin_bar_index: i64,
     pub generated_at: DateTime<Utc>,
     pub direction_probability_up: f64,
-    pub barrier_probability: f64,
-    pub expected_mfe_usd: f64,
-    pub expected_mae_usd: f64,
+    pub barrier_probability_long: f64,
+    pub barrier_probability_short: f64,
+    pub expected_mfe_long: f64,
+    pub expected_mae_long: f64,
+    pub expected_mfe_short: f64,
+    pub expected_mae_short: f64,
+    pub excursion_modelled: bool,
     pub calibration: CalibrationStatus,
     pub drift_detected: bool,
     pub points: Vec<ForecastPoint>,
@@ -179,9 +186,28 @@ pub struct ForecastEnvelope {
 impl ForecastEnvelope {
     pub fn validate(&self) -> Result<(), ContractError> {
         if !(0.0..=1.0).contains(&self.direction_probability_up)
-            || !(0.0..=1.0).contains(&self.barrier_probability)
+            || !(0.0..=1.0).contains(&self.barrier_probability_long)
+            || !(0.0..=1.0).contains(&self.barrier_probability_short)
         {
             return Err(ContractError::InvalidProbability);
+        }
+        if self.origin_close <= 0.0
+            || !self.origin_close.is_finite()
+            || self.origin_bar_timestamp.timestamp() % 300 != 0
+            || self.origin_bar_index != self.origin_bar_timestamp.timestamp().div_euclid(300)
+        {
+            return Err(ContractError::InvalidPredictionOrigin);
+        }
+        if [
+            self.expected_mfe_long,
+            self.expected_mae_long,
+            self.expected_mfe_short,
+            self.expected_mae_short,
+        ]
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(ContractError::InvalidExcursion);
         }
         if self.points.is_empty() {
             return Err(ContractError::MissingForecastPoints);
@@ -298,7 +324,8 @@ pub fn decide(
         .find(|point| point.horizon_bars == 3)
         .or_else(|| forecast.points.first())
         .expect("forecast points were validated");
-    let expires_at = generated_at + chrono::Duration::minutes((horizon.horizon_bars * 5) as i64);
+    let expires_at = forecast.origin_bar_timestamp
+        + chrono::Duration::minutes((horizon.horizon_bars * 5) as i64);
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
 
@@ -318,6 +345,45 @@ pub fn decide(
         reasons.push("CALIBRATION_OUTSIDE_GATE".to_owned());
     }
 
+    let q50_side = if horizon.q50 > 0.0 {
+        Some(DecisionAction::Long)
+    } else if horizon.q50 < 0.0 {
+        Some(DecisionAction::Short)
+    } else {
+        None
+    };
+    let classifier_side = if forecast.direction_probability_up >= 0.5 {
+        DecisionAction::Long
+    } else {
+        DecisionAction::Short
+    };
+    let barrier_side = if forecast.barrier_probability_long > forecast.barrier_probability_short {
+        Some(DecisionAction::Long)
+    } else if forecast.barrier_probability_short > forecast.barrier_probability_long {
+        Some(DecisionAction::Short)
+    } else {
+        None
+    };
+    let side_is_coherent =
+        q50_side.is_some() && q50_side == Some(classifier_side) && q50_side == barrier_side;
+    if !side_is_coherent {
+        reasons.push("FORECAST_SIDE_CONFLICT".to_owned());
+    }
+
+    let selected_side = q50_side.unwrap_or(classifier_side);
+    let (direction_probability, barrier_probability, expected_mae) = match selected_side {
+        DecisionAction::Long => (
+            forecast.direction_probability_up,
+            forecast.barrier_probability_long,
+            forecast.expected_mae_long,
+        ),
+        DecisionAction::Short => (
+            1.0 - forecast.direction_probability_up,
+            forecast.barrier_probability_short,
+            forecast.expected_mae_short,
+        ),
+        _ => unreachable!("selected side is always directional"),
+    };
     let reference_lot = snapshot.symbol_spec.volume_min;
     let expected_move_usd = horizon.q50.abs() * snapshot.mid_price();
     let all_in_cost_usd = snapshot.spread_usd()
@@ -326,9 +392,8 @@ pub fn decide(
     let edge_per_lot = (expected_move_usd - all_in_cost_usd) * snapshot.symbol_spec.contract_size;
     let expected_edge = edge_per_lot * reference_lot;
 
-    let direction_ok = forecast.direction_probability_up >= policy.min_direction_probability
-        || forecast.direction_probability_up <= 1.0 - policy.min_direction_probability;
-    let barrier_ok = forecast.barrier_probability >= policy.min_barrier_probability;
+    let direction_ok = direction_probability >= policy.min_direction_probability;
+    let barrier_ok = barrier_probability >= policy.min_barrier_probability;
 
     if expected_edge <= 0.0 {
         reasons.push("EDGE_TOO_SMALL_AFTER_COST".to_owned());
@@ -339,15 +404,12 @@ pub fn decide(
     if !barrier_ok {
         reasons.push("BARRIER_PROBABILITY_TOO_LOW".to_owned());
     }
+    if !forecast.excursion_modelled {
+        reasons.push("EXCURSION_MODEL_UNAVAILABLE".to_owned());
+    }
 
     let action = if reasons.is_empty() {
-        if horizon.q50 > 0.0 {
-            DecisionAction::Long
-        } else if horizon.q50 < 0.0 {
-            DecisionAction::Short
-        } else {
-            DecisionAction::Wait
-        }
+        selected_side
     } else {
         DecisionAction::Wait
     };
@@ -358,10 +420,8 @@ pub fn decide(
     warnings.push("MANUAL_CONFIRMATION_REQUIRED".to_owned());
 
     let invalidation = match action {
-        DecisionAction::Long => Some(snapshot.bid - forecast.expected_mae_usd.max(all_in_cost_usd)),
-        DecisionAction::Short => {
-            Some(snapshot.ask + forecast.expected_mae_usd.max(all_in_cost_usd))
-        }
+        DecisionAction::Long => Some(snapshot.bid - expected_mae.max(all_in_cost_usd)),
+        DecisionAction::Short => Some(snapshot.ask + expected_mae.max(all_in_cost_usd)),
         _ => None,
     };
 
@@ -418,6 +478,10 @@ pub enum ContractError {
     InvalidQuantiles(u32),
     #[error("probability must be between zero and one")]
     InvalidProbability,
+    #[error("prediction origin must be an exact completed M5 candle")]
+    InvalidPredictionOrigin,
+    #[error("forecast excursions must be finite non-negative values")]
+    InvalidExcursion,
     #[error("forecast points are required")]
     MissingForecastPoints,
 }
@@ -486,11 +550,21 @@ mod tests {
             prediction_id: Uuid::new_v4(),
             model_id: "baseline-v1".to_owned(),
             feature_version: "m5-v1".to_owned(),
+            origin_bar_timestamp: sample_snapshot().bars[0].timestamp,
+            origin_close: 3330.5,
+            origin_bar_index: sample_snapshot().bars[0]
+                .timestamp
+                .timestamp()
+                .div_euclid(300),
             generated_at: Utc::now(),
             direction_probability_up: 0.67,
-            barrier_probability: 0.63,
-            expected_mfe_usd: 2.4,
-            expected_mae_usd: 1.1,
+            barrier_probability_long: 0.63,
+            barrier_probability_short: 0.37,
+            expected_mfe_long: 2.4,
+            expected_mae_long: 1.1,
+            expected_mfe_short: 1.8,
+            expected_mae_short: 1.4,
+            excursion_modelled: true,
             calibration: CalibrationStatus {
                 target_coverage: 0.8,
                 observed_coverage: 0.79,
@@ -560,5 +634,19 @@ mod tests {
             snapshot.validate(),
             Err(ContractError::MisalignedMarketBar)
         ));
+    }
+
+    #[test]
+    fn side_conflict_forces_wait() {
+        let mut forecast = sample_forecast();
+        forecast.barrier_probability_long = 0.40;
+        forecast.barrier_probability_short = 0.68;
+        let decision = decide(&sample_snapshot(), &forecast, &DecisionPolicy::scalper());
+        assert_eq!(decision.action, DecisionAction::Wait);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"FORECAST_SIDE_CONFLICT".to_owned())
+        );
     }
 }

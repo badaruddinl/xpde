@@ -78,12 +78,32 @@ struct ModelRegistration {
     metrics: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum BarrierOutcome {
+    TpFirst,
+    SlFirst,
+    NoHitBeforeExpiry,
+    AmbiguousSameBar,
+}
+
+impl BarrierOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TpFirst => "TP_FIRST",
+            Self::SlFirst => "SL_FIRST",
+            Self::NoHitBeforeExpiry => "NO_HIT_BEFORE_EXPIRY",
+            Self::AmbiguousSameBar => "AMBIGUOUS_SAME_BAR",
+        }
+    }
+}
+
 fn barrier_outcome(
     start_price: f64,
     expected_mfe_usd: f64,
     proposals: &[DecisionProposal],
     bars: &[(f64, f64, f64)],
-) -> Option<i64> {
+) -> Option<BarrierOutcome> {
     if !expected_mfe_usd.is_finite() || expected_mfe_usd <= 0.0 {
         return None;
     }
@@ -106,13 +126,13 @@ fn barrier_outcome(
             _ => return None,
         };
         match (tp_hit, sl_hit) {
-            (true, false) => return Some(1),
-            (false, true) => return Some(0),
-            (true, true) => return None,
+            (true, false) => return Some(BarrierOutcome::TpFirst),
+            (false, true) => return Some(BarrierOutcome::SlFirst),
+            (true, true) => return Some(BarrierOutcome::AmbiguousSameBar),
             (false, false) => {}
         }
     }
-    None
+    Some(BarrierOutcome::NoHitBeforeExpiry)
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +151,24 @@ struct Store {
     connection: Mutex<Connection>,
 }
 
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
+    Ok(())
+}
+
 impl Store {
     fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent()
@@ -143,6 +181,9 @@ impl Store {
         }
         let connection = Connection::open(path)?;
         connection.execute_batch(MIGRATION)?;
+        ensure_column(&connection, "predictions", "origin_bar_timestamp", "TEXT")?;
+        ensure_column(&connection, "predictions", "origin_close", "REAL")?;
+        ensure_column(&connection, "predictions", "origin_bar_index", "INTEGER")?;
         connection.execute(
             "DELETE FROM market_bars
              WHERE timeframe='M5'
@@ -160,7 +201,14 @@ impl Store {
         transaction.execute(
             "INSERT INTO account_profiles
              (login, server, currency, leverage, balance, equity, free_margin, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE NOT EXISTS (
+               SELECT 1 FROM account_profiles
+               WHERE id=(SELECT MAX(id) FROM account_profiles)
+                 AND login=?1 AND server=?2 AND currency=?3 AND leverage=?4
+                 AND balance=?5 AND equity=?6 AND free_margin=?7
+                 AND (julianday(?8)-julianday(captured_at))*86400.0 < 30.0
+             )",
             params![
                 snapshot.account.login,
                 snapshot.account.server,
@@ -187,7 +235,16 @@ impl Store {
                tick_value=excluded.tick_value,
                stops_level_points=excluded.stops_level_points,
                digits=excluded.digits,
-               captured_at=excluded.captured_at",
+               captured_at=excluded.captured_at
+             WHERE description IS NOT excluded.description
+                OR contract_size IS NOT excluded.contract_size
+                OR volume_min IS NOT excluded.volume_min
+                OR volume_max IS NOT excluded.volume_max
+                OR volume_step IS NOT excluded.volume_step
+                OR tick_size IS NOT excluded.tick_size
+                OR tick_value IS NOT excluded.tick_value
+                OR stops_level_points IS NOT excluded.stops_level_points
+                OR digits IS NOT excluded.digits",
             params![
                 snapshot.symbol,
                 snapshot.symbol_spec.description,
@@ -202,14 +259,12 @@ impl Store {
                 snapshot.timestamp.to_rfc3339(),
             ],
         )?;
-        {
-            let mut statement = transaction.prepare(
-                "INSERT OR REPLACE INTO market_bars
+        if let Some(bar) = snapshot.bars.iter().max_by_key(|bar| bar.timestamp) {
+            transaction.execute(
+                "INSERT OR IGNORE INTO market_bars
                  (symbol, timeframe, timestamp, open, high, low, close, tick_volume)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for bar in &snapshot.bars {
-                statement.execute(params![
+                params![
                     snapshot.symbol,
                     snapshot.timeframe,
                     bar.timestamp.to_rfc3339(),
@@ -218,15 +273,29 @@ impl Store {
                     bar.low,
                     bar.close,
                     bar.tick_volume,
-                ])?;
-            }
+                ],
+            )?;
         }
         transaction.execute(
             "INSERT INTO audit_events(event_type, entity_id, payload_json, created_at)
              VALUES ('MARKET_SNAPSHOT_ACCEPTED', ?1, ?2, ?3)",
             params![
                 snapshot.symbol,
-                serde_json::to_string(snapshot).unwrap_or_else(|_| "{}".to_owned()),
+                serde_json::json!({
+                    "provider": snapshot.provider,
+                    "timestamp": snapshot.timestamp,
+                    "timeframe": snapshot.timeframe,
+                    "bid": snapshot.bid,
+                    "ask": snapshot.ask,
+                    "completed_bar_count_received": snapshot.bars.len(),
+                    "latest_completed_bar_timestamp": snapshot
+                        .bars
+                        .iter()
+                        .max_by_key(|bar| bar.timestamp)
+                        .map(|bar| bar.timestamp),
+                    "data_quality": snapshot.data_quality,
+                })
+                .to_string(),
                 Utc::now().to_rfc3339(),
             ],
         )?;
@@ -289,6 +358,19 @@ impl Store {
         Ok(inserted)
     }
 
+    fn latest_bar_timestamp(&self) -> Result<Option<String>, rusqlite::Error> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        connection.query_row(
+            "SELECT MAX(timestamp) FROM market_bars
+             WHERE symbol=?1 AND timeframe=?2",
+            params![
+                xpde_domain::SUPPORTED_SYMBOL,
+                xpde_domain::SUPPORTED_TIMEFRAME
+            ],
+            |row| row.get(0),
+        )
+    }
+
     fn save_prediction(
         &self,
         snapshot: &MarketSnapshot,
@@ -302,14 +384,18 @@ impl Store {
             .unwrap_or(forecast.generated_at);
         connection.execute(
             "INSERT OR REPLACE INTO predictions
-             (prediction_id, model_id, symbol, timeframe, generated_at, expires_at,
+             (prediction_id, model_id, symbol, timeframe, origin_bar_timestamp,
+              origin_close, origin_bar_index, generated_at, expires_at,
               forecast_json, proposal_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 forecast.prediction_id.to_string(),
                 forecast.model_id,
                 snapshot.symbol,
                 snapshot.timeframe,
+                forecast.origin_bar_timestamp.to_rfc3339(),
+                forecast.origin_close,
+                forecast.origin_bar_index,
                 forecast.generated_at.to_rfc3339(),
                 expiry.to_rfc3339(),
                 serde_json::to_string(forecast).unwrap_or_else(|_| "{}".to_owned()),
@@ -401,21 +487,28 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let pending = {
             let mut statement = connection.prepare(
-                "SELECT p.prediction_id, p.symbol, p.timeframe, p.generated_at,
-                        p.expires_at, p.forecast_json, p.proposal_json
+                "SELECT p.prediction_id, p.symbol, p.timeframe,
+                        p.origin_bar_timestamp, p.origin_close,
+                        p.forecast_json, p.proposal_json
                  FROM predictions p
-                 LEFT JOIN prediction_outcomes o ON o.prediction_id=p.prediction_id
-                 WHERE o.prediction_id IS NULL AND p.expires_at <= ?1
-                 ORDER BY p.generated_at",
+                 WHERE p.origin_bar_timestamp IS NOT NULL
+                   AND p.origin_close IS NOT NULL
+                   AND EXISTS (
+                     SELECT 1 FROM market_bars b
+                     WHERE b.symbol=p.symbol
+                       AND b.timeframe=p.timeframe
+                       AND b.timestamp>p.origin_bar_timestamp
+                   )
+                 ORDER BY p.origin_bar_timestamp",
             )?;
             statement
-                .query_map([&now], |row| {
+                .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, f64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                     ))
@@ -428,103 +521,129 @@ impl Store {
             prediction_id,
             symbol,
             timeframe,
-            generated_at,
-            expires_at,
+            origin_bar_timestamp,
+            origin_close,
             forecast_json,
             proposal_json,
         ) in pending
         {
-            let start = transaction
-                .query_row(
-                    "SELECT close FROM market_bars
-                     WHERE symbol=?1 AND timeframe=?2 AND timestamp<=?3
-                     ORDER BY timestamp DESC LIMIT 1",
-                    params![symbol, timeframe, generated_at],
-                    |row| row.get::<_, f64>(0),
-                )
-                .ok();
-            let Some(start_price) = start else {
-                continue;
-            };
             let outcome_bars = {
                 let mut statement = transaction.prepare(
-                    "SELECT high, low, close FROM market_bars
-                     WHERE symbol=?1 AND timeframe=?2 AND timestamp>?3 AND timestamp<=?4
-                     ORDER BY timestamp",
+                    "SELECT timestamp, high, low, close FROM market_bars
+                     WHERE symbol=?1 AND timeframe=?2 AND timestamp>?3
+                     ORDER BY timestamp LIMIT 12",
                 )?;
                 statement
-                    .query_map(
-                        params![symbol, timeframe, generated_at, expires_at],
-                        |row| {
-                            Ok((
-                                row.get::<_, f64>(0)?,
-                                row.get::<_, f64>(1)?,
-                                row.get::<_, f64>(2)?,
-                            ))
-                        },
-                    )?
+                    .query_map(params![symbol, timeframe, origin_bar_timestamp], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, f64>(1)?,
+                            row.get::<_, f64>(2)?,
+                            row.get::<_, f64>(3)?,
+                        ))
+                    })?
                     .collect::<Result<Vec<_>, _>>()?
             };
-            if outcome_bars.is_empty() || start_price <= 0.0 {
+            if outcome_bars.is_empty() || origin_close <= 0.0 {
                 continue;
             }
             let Ok(forecast) = serde_json::from_str::<ForecastEnvelope>(&forecast_json) else {
                 continue;
             };
-            let Some(target) = forecast
-                .points
-                .iter()
-                .find(|point| point.horizon_bars == 3)
-                .or_else(|| forecast.points.first())
-            else {
+            if forecast.origin_bar_timestamp.to_rfc3339() != origin_bar_timestamp
+                || (forecast.origin_close - origin_close).abs() > 1e-8
+            {
                 continue;
-            };
-            let final_price = outcome_bars.last().map(|bar| bar.2).unwrap_or(start_price);
-            let actual_return = (final_price / start_price).ln();
-            let actual_high = outcome_bars
-                .iter()
-                .map(|bar| bar.0)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let actual_low = outcome_bars
-                .iter()
-                .map(|bar| bar.1)
-                .fold(f64::INFINITY, f64::min);
-            let interval_hit =
-                i64::from(actual_return >= target.q10 && actual_return <= target.q90);
-            let direction_hit = i64::from((target.q50 >= 0.0) == (actual_return >= 0.0));
+            }
             let proposals =
                 serde_json::from_str::<Vec<DecisionProposal>>(&proposal_json).unwrap_or_default();
-            let tp_before_sl = barrier_outcome(
-                start_price,
-                forecast.expected_mfe_usd,
-                &proposals,
-                &outcome_bars,
-            );
-            let metrics = serde_json::json!({
-                "median_error": (actual_return - target.q50).abs(),
-                "interval_miss": interval_hit == 0,
-                "direction_error": direction_hit == 0,
-                "mfe_error_usd": forecast.expected_mfe_usd - (actual_high - start_price).max(start_price - actual_low),
-                "mae_error_usd": forecast.expected_mae_usd - (start_price - actual_low).max(actual_high - start_price),
-            });
-            transaction.execute(
-                "INSERT OR IGNORE INTO prediction_outcomes
-                 (prediction_id, actual_return, actual_high, actual_low, interval_hit,
-                  direction_hit, tp_before_sl, error_metrics_json, settled_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    prediction_id,
-                    actual_return,
-                    actual_high,
-                    actual_low,
-                    interval_hit,
-                    direction_hit,
-                    tp_before_sl,
-                    metrics.to_string(),
-                    now,
-                ],
-            )?;
-            settled += 1;
+            for target in &forecast.points {
+                let horizon = target.horizon_bars as usize;
+                if horizon == 0 || outcome_bars.len() < horizon {
+                    continue;
+                }
+                let already_settled: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM prediction_horizon_outcomes
+                       WHERE prediction_id=?1 AND horizon_bars=?2
+                     )",
+                    params![prediction_id, target.horizon_bars],
+                    |row| row.get(0),
+                )?;
+                if already_settled {
+                    continue;
+                }
+
+                let horizon_bars = &outcome_bars[..horizon];
+                let final_price = horizon_bars.last().map(|bar| bar.3).unwrap_or(origin_close);
+                let actual_return = (final_price / origin_close).ln();
+                let actual_high = horizon_bars
+                    .iter()
+                    .map(|bar| bar.1)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let actual_low = horizon_bars
+                    .iter()
+                    .map(|bar| bar.2)
+                    .fold(f64::INFINITY, f64::min);
+                let interval_hit =
+                    i64::from(actual_return >= target.q10 && actual_return <= target.q90);
+                let direction_hit = i64::from((target.q50 >= 0.0) == (actual_return >= 0.0));
+                let (expected_mfe, expected_mae, actual_mfe, actual_mae) = if target.q50 >= 0.0 {
+                    (
+                        forecast.expected_mfe_long,
+                        forecast.expected_mae_long,
+                        (actual_high - origin_close).max(0.0),
+                        (origin_close - actual_low).max(0.0),
+                    )
+                } else {
+                    (
+                        forecast.expected_mfe_short,
+                        forecast.expected_mae_short,
+                        (origin_close - actual_low).max(0.0),
+                        (actual_high - origin_close).max(0.0),
+                    )
+                };
+                let barrier = if target.horizon_bars == 3 {
+                    let barrier_bars = horizon_bars
+                        .iter()
+                        .map(|bar| (bar.1, bar.2, bar.3))
+                        .collect::<Vec<_>>();
+                    barrier_outcome(origin_close, expected_mfe, &proposals, &barrier_bars)
+                        .map(BarrierOutcome::as_str)
+                } else {
+                    None
+                };
+                let metrics = serde_json::json!({
+                    "median_error": (actual_return - target.q50).abs(),
+                    "interval_miss": interval_hit == 0,
+                    "direction_error": direction_hit == 0,
+                    "mfe_error_usd": expected_mfe - actual_mfe,
+                    "mae_error_usd": expected_mae - actual_mae,
+                });
+                transaction.execute(
+                    "INSERT INTO prediction_horizon_outcomes
+                     (prediction_id, horizon_bars, origin_bar_timestamp,
+                      outcome_bar_timestamp, actual_return, actual_high, actual_low,
+                      interval_hit, direction_hit, barrier_outcome,
+                      error_metrics_json, settled_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        prediction_id,
+                        target.horizon_bars,
+                        origin_bar_timestamp,
+                        horizon_bars.last().map(|bar| &bar.0),
+                        actual_return,
+                        actual_high,
+                        actual_low,
+                        interval_hit,
+                        direction_hit,
+                        barrier,
+                        metrics.to_string(),
+                        now,
+                    ],
+                )?;
+                settled += 1;
+            }
         }
         transaction.commit()?;
         Ok(settled)
@@ -536,11 +655,15 @@ impl Store {
             "SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
                     COALESCE(AVG(o.direction_hit), 0.0),
-                    COUNT(o.tp_before_sl),
-                    AVG(CASE WHEN o.tp_before_sl IS NOT NULL THEN o.tp_before_sl END)
-             FROM prediction_outcomes o
+                    COUNT(o.barrier_outcome),
+                    AVG(CASE
+                          WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                          WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                        END)
+             FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
-             WHERE p.model_id != 'baseline-demo-v1'",
+             WHERE p.model_id != 'baseline-demo-v1'
+               AND o.horizon_bars=3",
             [],
             |row| {
                 Ok(serde_json::json!({
@@ -555,10 +678,14 @@ impl Store {
         let by_model = {
             let mut statement = connection.prepare(
                 "SELECT p.model_id, COUNT(*), AVG(o.interval_hit), AVG(o.direction_hit),
-                        COUNT(o.tp_before_sl),
-                        AVG(CASE WHEN o.tp_before_sl IS NOT NULL THEN o.tp_before_sl END)
-                 FROM prediction_outcomes o
+                        COUNT(o.barrier_outcome),
+                        AVG(CASE
+                              WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                              WHEN o.barrier_outcome IS NOT NULL THEN 0.0
+                            END)
+                 FROM prediction_horizon_outcomes o
                  JOIN predictions p ON p.prediction_id=o.prediction_id
+                 WHERE o.horizon_bars=3
                  GROUP BY p.model_id ORDER BY MAX(o.settled_at) DESC",
             )?;
             statement
@@ -653,6 +780,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/state", get(get_state))
+        .route("/api/v1/market/cursor", get(get_market_cursor))
         .route("/api/v1/market/snapshot", post(post_snapshot))
         .route("/api/v1/market/backfill", post(post_backfill))
         .route("/api/v1/forecast", post(post_forecast))
@@ -690,6 +818,20 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn get_state(State(state): State<AppState>) -> Json<RuntimeState> {
     Json(public_runtime_state(&state).await)
+}
+
+async fn get_market_cursor(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let last_completed_bar_timestamp = state
+        .store
+        .latest_bar_timestamp()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "symbol": xpde_domain::SUPPORTED_SYMBOL,
+        "timeframe": xpde_domain::SUPPORTED_TIMEFRAME,
+        "last_completed_bar_timestamp": last_completed_bar_timestamp,
+    })))
 }
 
 async fn post_backfill(
@@ -775,6 +917,19 @@ async fn post_forecast(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let mut runtime = state.runtime.write().await;
+    let latest_completed = runtime
+        .snapshot
+        .bars
+        .iter()
+        .max_by_key(|bar| bar.timestamp)
+        .ok_or_else(|| ApiError::bad_request("snapshot has no completed origin bar"))?;
+    if forecast.origin_bar_timestamp != latest_completed.timestamp
+        || (forecast.origin_close - latest_completed.close).abs() > 1e-8
+    {
+        return Err(ApiError::bad_request(
+            "forecast origin does not match the latest completed M5 candle",
+        ));
+    }
     let proposals = vec![
         decide(&runtime.snapshot, &forecast, &DecisionPolicy::scalper()),
         decide(&runtime.snapshot, &forecast, &DecisionPolicy::sniper()),
@@ -981,15 +1136,27 @@ fn demo_state() -> RuntimeState {
         },
     };
 
+    let origin = snapshot
+        .bars
+        .iter()
+        .max_by_key(|bar| bar.timestamp)
+        .expect("demo snapshot has completed bars");
     let forecast = ForecastEnvelope {
         prediction_id: Uuid::new_v4(),
         model_id: "baseline-demo-v1".to_owned(),
         feature_version: "goldm-m5-v1".to_owned(),
+        origin_bar_timestamp: origin.timestamp,
+        origin_close: origin.close,
+        origin_bar_index: origin.timestamp.timestamp().div_euclid(300),
         generated_at: now,
         direction_probability_up: 0.57,
-        barrier_probability: 0.54,
-        expected_mfe_usd: 1.42,
-        expected_mae_usd: 0.91,
+        barrier_probability_long: 0.54,
+        barrier_probability_short: 0.46,
+        expected_mfe_long: 1.42,
+        expected_mae_long: 0.91,
+        expected_mfe_short: 1.31,
+        expected_mae_short: 0.98,
+        excursion_modelled: false,
         calibration: CalibrationStatus {
             target_coverage: 0.80,
             observed_coverage: 0.786,
@@ -1080,7 +1247,10 @@ mod tests {
         ];
         let bars = vec![(101.2, 99.5, 101.0)];
 
-        assert_eq!(barrier_outcome(100.0, 1.0, &proposals, &bars), Some(1));
+        assert_eq!(
+            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            Some(BarrierOutcome::TpFirst)
+        );
     }
 
     #[test]
@@ -1088,14 +1258,31 @@ mod tests {
         let proposals = vec![proposal(DecisionAction::Short, Some(101.0))];
         let bars = vec![(101.2, 99.5, 100.8)];
 
-        assert_eq!(barrier_outcome(100.0, 1.0, &proposals, &bars), Some(0));
+        assert_eq!(
+            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            Some(BarrierOutcome::SlFirst)
+        );
     }
 
     #[test]
-    fn barrier_outcome_keeps_same_bar_ambiguity_unresolved() {
+    fn barrier_outcome_keeps_same_bar_ambiguity_explicit() {
         let proposals = vec![proposal(DecisionAction::Long, Some(99.0))];
         let bars = vec![(101.2, 98.8, 100.2)];
 
-        assert_eq!(barrier_outcome(100.0, 1.0, &proposals, &bars), None);
+        assert_eq!(
+            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            Some(BarrierOutcome::AmbiguousSameBar)
+        );
+    }
+
+    #[test]
+    fn barrier_outcome_keeps_no_hit_before_expiry() {
+        let proposals = vec![proposal(DecisionAction::Long, Some(99.0))];
+        let bars = vec![(100.8, 99.4, 100.2)];
+
+        assert_eq!(
+            barrier_outcome(100.0, 1.0, &proposals, &bars),
+            Some(BarrierOutcome::NoHitBeforeExpiry)
+        );
     }
 }

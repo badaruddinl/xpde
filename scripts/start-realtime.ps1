@@ -9,6 +9,14 @@ $workDir = Join-Path $repoRoot "work"
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
 $xuva = Join-Path $env:USERPROFILE ".local\bin\xuva.exe"
 $candidateDir = Join-Path $repoRoot "artifacts\catboost\latest"
+$requiredCandidateFiles = @(
+    "barrier_long_h3.cbm",
+    "barrier_short_h3.cbm",
+    "mfe_long_h3.cbm",
+    "mae_long_h3.cbm",
+    "mfe_short_h3.cbm",
+    "mae_short_h3.cbm"
+)
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Python environment is missing. Run .\scripts\setup.ps1 first."
@@ -101,7 +109,15 @@ if ($existingBridge) {
     if (Test-Path -LiteralPath (Join-Path $candidateDir "manifest.json")) {
         $manifest = Get-Content -Raw -LiteralPath (Join-Path $candidateDir "manifest.json") |
             ConvertFrom-Json
-        if ($manifest.eligible_for_shadow -eq $true) {
+        $hasRequiredFiles = @(
+            $requiredCandidateFiles |
+                Where-Object { -not (Test-Path -LiteralPath (Join-Path $candidateDir $_)) }
+        ).Count -eq 0
+        if (
+            $manifest.eligible_for_shadow -eq $true -and
+            [int]$manifest.schema_version -ge 2 -and
+            $hasRequiredFiles
+        ) {
             $bridgeArguments += @("--model-dir", $candidateDir)
         }
     }

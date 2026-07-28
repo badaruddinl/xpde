@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import HORIZONS, QUANTILES
-from .dataset import FEATURE_COLUMNS, FEATURE_VERSION, METADATA, build_training_frame
+from .dataset import (
+    BARRIER_HORIZON,
+    FEATURE_COLUMNS,
+    FEATURE_VERSION,
+    METADATA,
+    build_training_frame,
+)
 
 
 def _calibrator_payload(model) -> dict[str, list[float]]:
@@ -45,6 +51,42 @@ def _fit_classifier(CatBoostClassifier, x, y, iterations: int):
         allow_writing_files=False,
     )
     model.fit(x, y.astype(int))
+    return model
+
+
+def _fit_barrier_classifier(CatBoostClassifier, x, y, iterations: int):
+    model = CatBoostClassifier(
+        loss_function="MultiClass",
+        eval_metric="MultiClass",
+        iterations=iterations,
+        depth=6,
+        learning_rate=0.04,
+        random_seed=42,
+        verbose=False,
+        allow_writing_files=False,
+    )
+    model.fit(x, y.astype(int))
+    return model
+
+
+def _fit_excursion_model(
+    CatBoostRegressor,
+    x,
+    y,
+    *,
+    alpha: float,
+    iterations: int,
+):
+    model = CatBoostRegressor(
+        loss_function=f"Quantile:alpha={alpha}",
+        iterations=iterations,
+        depth=6,
+        learning_rate=0.04,
+        random_seed=42,
+        verbose=False,
+        allow_writing_files=False,
+    )
+    model.fit(x, y)
     return model
 
 
@@ -97,10 +139,10 @@ def train(args) -> dict[str, Any]:
     required = list(FEATURE_COLUMNS) + [
         *(f"target_{horizon}" for horizon in HORIZONS),
         "direction_3",
-        "mfe_up_usd",
-        "mae_up_usd",
-        "mfe_down_usd",
-        "mae_down_usd",
+        "mfe_long_usd",
+        "mae_long_usd",
+        "mfe_short_usd",
+        "mae_short_usd",
     ]
     dataset = frame.dropna(subset=required).reset_index(drop=True)
     train_slice, calibration_slice, holdout_slice = _temporal_partitions(
@@ -245,35 +287,84 @@ def train(args) -> dict[str, Any]:
     barrier_models: dict[str, Any] = {}
     barrier_calibration: dict[str, dict[str, list[float]]] = {}
     barrier_metrics: dict[str, dict[str, float]] = {}
-    for side in ("up", "down"):
-        label = f"barrier_{side}"
+    for side in ("long", "short"):
+        label = f"barrier_{side}_class"
+        outcome_label = f"barrier_{side}_outcome"
         side_train = dataset.iloc[train_slice].dropna(subset=[label])
         side_calibration = dataset.iloc[calibration_slice].dropna(subset=[label])
         side_holdout = dataset.iloc[holdout_slice].dropna(subset=[label])
         if min(len(side_train), len(side_calibration), len(side_holdout)) < 50:
             raise ValueError(f"not enough resolved {side} barrier labels")
-        side_model = _fit_classifier(
+        side_model = _fit_barrier_classifier(
             CatBoostClassifier,
             side_train[list(FEATURE_COLUMNS)],
             side_train[label],
             args.iterations,
         )
+        classes = [int(value) for value in side_model.classes_]
+        tp_index = classes.index(0)
         raw_calibration = side_model.predict_proba(
             side_calibration[list(FEATURE_COLUMNS)]
-        )[:, 1]
+        )[:, tp_index]
+        calibration_tp_truth = (side_calibration[label].to_numpy() == 0).astype(int)
         calibrator = IsotonicRegression(out_of_bounds="clip").fit(
             raw_calibration,
-            side_calibration[label],
+            calibration_tp_truth,
         )
-        raw_holdout = side_model.predict_proba(side_holdout[list(FEATURE_COLUMNS)])[:, 1]
+        raw_holdout = side_model.predict_proba(
+            side_holdout[list(FEATURE_COLUMNS)]
+        )[:, tp_index]
         calibrated_holdout = calibrator.predict(raw_holdout)
+        holdout_tp_truth = (side_holdout[label].to_numpy() == 0).astype(int)
+        holdout_outcomes = dataset.iloc[holdout_slice][outcome_label]
+        outcome_counts = holdout_outcomes.value_counts()
+        labelled_count = max(1, int(holdout_outcomes.notna().sum()))
         barrier_metrics[side] = {
-            "brier": _brier(side_holdout[label].to_numpy(), calibrated_holdout),
-            "sample_size": float(len(side_holdout)),
+            "tp_first_brier": _brier(holdout_tp_truth, calibrated_holdout),
+            "resolved_sample_size": float(len(side_holdout)),
+            "labelled_sample_size": float(labelled_count),
+            "tp_first": float(outcome_counts.get("TP_FIRST", 0)),
+            "sl_first": float(outcome_counts.get("SL_FIRST", 0)),
+            "no_hit_before_expiry": float(
+                outcome_counts.get("NO_HIT_BEFORE_EXPIRY", 0)
+            ),
+            "ambiguous_same_bar": float(
+                outcome_counts.get("AMBIGUOUS_SAME_BAR", 0)
+            ),
+            "no_hit_rate": float(
+                outcome_counts.get("NO_HIT_BEFORE_EXPIRY", 0) / labelled_count
+            ),
+            "ambiguity_rate": float(
+                outcome_counts.get("AMBIGUOUS_SAME_BAR", 0) / labelled_count
+            ),
         }
         barrier_calibration[side] = _calibrator_payload(calibrator)
-        side_model.save_model(args.output / f"barrier_{side}.cbm")
+        side_model.save_model(args.output / f"barrier_{side}_h3.cbm")
         barrier_models[side] = side_model
+
+    excursion_metrics: dict[str, dict[str, float]] = {}
+    for side in ("long", "short"):
+        excursion_metrics[side] = {}
+        for excursion, alpha in (("mfe", 0.50), ("mae", 0.90)):
+            label = f"{excursion}_{side}_usd"
+            excursion_model = _fit_excursion_model(
+                CatBoostRegressor,
+                x_train,
+                dataset[label].iloc[train_slice],
+                alpha=alpha,
+                iterations=args.iterations,
+            )
+            holdout_prediction = excursion_model.predict(x_holdout)
+            excursion_metrics[side][f"{excursion}_q{int(alpha * 100)}_pinball"] = (
+                _pinball(
+                    dataset[label].iloc[holdout_slice].to_numpy(),
+                    holdout_prediction,
+                    alpha,
+                )
+            )
+            excursion_model.save_model(
+                args.output / f"{excursion}_{side}_h3.cbm"
+            )
 
     median_pinball_model = float(
         np.mean([holdout_metrics[str(h)]["pinball_q50"] for h in HORIZONS])
@@ -308,13 +399,14 @@ def train(args) -> dict[str, Any]:
     )
     train_frame = dataset.iloc[train_slice]
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_id": model_id,
         "status": "candidate",
         "eligible_for_shadow": eligible,
         "feature_version": FEATURE_VERSION,
         "feature_columns": list(FEATURE_COLUMNS),
         "horizons": list(HORIZONS),
+        "barrier_horizon": BARRIER_HORIZON,
         "quantiles": list(QUANTILES),
         "purge_gap": METADATA.purge_gap,
         "created_at": datetime.now(UTC).isoformat(),
@@ -335,13 +427,6 @@ def train(args) -> dict[str, Any]:
             "direction": _calibrator_payload(direction_calibrator),
             "barrier": barrier_calibration,
         },
-        "excursion_usd": {
-            side: {
-                "mfe": float(train_frame[f"mfe_{side}_usd"].median()),
-                "mae": float(train_frame[f"mae_{side}_usd"].median()),
-            }
-            for side in ("up", "down")
-        },
         "feature_stats": {
             column: {
                 "mean": float(train_frame[column].mean()),
@@ -360,6 +445,7 @@ def train(args) -> dict[str, Any]:
             "baseline": baseline_metrics,
             "direction": direction_metrics,
             "barrier": barrier_metrics,
+            "excursion": excursion_metrics,
             "median_pinball_model": median_pinball_model,
             "median_pinball_baseline": median_pinball_baseline,
             "mean_pinball_model": mean_pinball_model,

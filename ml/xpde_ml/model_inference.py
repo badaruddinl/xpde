@@ -27,6 +27,10 @@ class CandidateModel:
         self.manifest = json.loads(
             (artifact_dir / "manifest.json").read_text(encoding="utf-8")
         )
+        if int(self.manifest.get("schema_version", 0)) < 2:
+            raise ValueError(
+                "artifact schema is incompatible; train an XPDE schema v2 candidate"
+            )
         if self.manifest["feature_version"] != FEATURE_VERSION:
             raise ValueError("artifact feature version is incompatible")
         if tuple(self.manifest["feature_columns"]) != FEATURE_COLUMNS:
@@ -39,10 +43,16 @@ class CandidateModel:
         self.direction_model = catboost.CatBoostClassifier()
         self.direction_model.load_model(artifact_dir / "direction.cbm")
         self.barrier_models = {}
-        for side in ("up", "down"):
+        for side in ("long", "short"):
             model = catboost.CatBoostClassifier()
-            model.load_model(artifact_dir / f"barrier_{side}.cbm")
+            model.load_model(artifact_dir / f"barrier_{side}_h3.cbm")
             self.barrier_models[side] = model
+        self.excursion_models = {}
+        for side in ("long", "short"):
+            for excursion in ("mfe", "mae"):
+                model = catboost.CatBoostRegressor()
+                model.load_model(artifact_dir / f"{excursion}_{side}_h3.cbm")
+                self.excursion_models[(side, excursion)] = model
 
     @property
     def model_id(self) -> str:
@@ -98,13 +108,29 @@ class CandidateModel:
             direction_raw,
             probability_calibration["direction"],
         )
-        side = "up" if direction >= 0.5 else "down"
-        barrier_raw = float(self.barrier_models[side].predict_proba(row)[0, 1])
-        barrier = _calibrate_probability(
-            barrier_raw,
-            probability_calibration["barrier"][side],
-        )
-        excursion = self.manifest["excursion_usd"][side]
+        barrier_probabilities = {}
+        excursions = {}
+        for side in ("long", "short"):
+            raw_probabilities = self.barrier_models[side].predict_proba(row)[0]
+            classes = [
+                int(value)
+                for value in self.barrier_models[side].classes_
+            ]
+            tp_index = classes.index(0)
+            barrier_probabilities[side] = _calibrate_probability(
+                float(raw_probabilities[tp_index]),
+                probability_calibration["barrier"][side],
+            )
+            excursions[side] = {
+                excursion: max(
+                    0.0,
+                    float(
+                        self.excursion_models[(side, excursion)]
+                        .predict(row)[0]
+                    ),
+                )
+                for excursion in ("mfe", "mae")
+            }
         drift_count = 0
         for column in FEATURE_COLUMNS:
             stats = self.manifest["feature_stats"][column]
@@ -113,15 +139,27 @@ class CandidateModel:
                 drift_count += 1
 
         calibration = self.manifest["calibration_status"]
+        origin = bars[-1]
         return {
             "prediction_id": str(uuid.uuid4()),
             "model_id": self.model_id,
             "feature_version": FEATURE_VERSION,
+            "origin_bar_timestamp": origin.timestamp.isoformat().replace("+00:00", "Z"),
+            "origin_close": origin.close,
+            "origin_bar_index": int(origin.timestamp.timestamp() // 300),
             "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "direction_probability_up": min(1.0, max(0.0, direction)),
-            "barrier_probability": min(1.0, max(0.0, barrier)),
-            "expected_mfe_usd": float(excursion["mfe"]),
-            "expected_mae_usd": float(excursion["mae"]),
+            "barrier_probability_long": min(
+                1.0, max(0.0, barrier_probabilities["long"])
+            ),
+            "barrier_probability_short": min(
+                1.0, max(0.0, barrier_probabilities["short"])
+            ),
+            "expected_mfe_long": excursions["long"]["mfe"],
+            "expected_mae_long": excursions["long"]["mae"],
+            "expected_mfe_short": excursions["short"]["mfe"],
+            "expected_mae_short": excursions["short"]["mae"],
+            "excursion_modelled": True,
             "calibration": calibration,
             "drift_detected": drift_count > max(2, len(FEATURE_COLUMNS) // 5),
             "points": points,

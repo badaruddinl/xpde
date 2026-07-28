@@ -66,11 +66,37 @@ CREATE TABLE IF NOT EXISTS predictions (
     model_id TEXT NOT NULL,
     symbol TEXT NOT NULL,
     timeframe TEXT NOT NULL,
+    origin_bar_timestamp TEXT,
+    origin_close REAL,
+    origin_bar_index INTEGER,
     generated_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     forecast_json TEXT NOT NULL,
     proposal_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS prediction_horizon_outcomes (
+    prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+    horizon_bars INTEGER NOT NULL,
+    origin_bar_timestamp TEXT NOT NULL,
+    outcome_bar_timestamp TEXT NOT NULL,
+    actual_return REAL NOT NULL,
+    actual_high REAL NOT NULL,
+    actual_low REAL NOT NULL,
+    interval_hit INTEGER NOT NULL,
+    direction_hit INTEGER NOT NULL,
+    barrier_outcome TEXT CHECK(
+        barrier_outcome IS NULL OR barrier_outcome IN (
+            'TP_FIRST',
+            'SL_FIRST',
+            'NO_HIT_BEFORE_EXPIRY',
+            'AMBIGUOUS_SAME_BAR'
+        )
+    ),
+    error_metrics_json TEXT NOT NULL,
+    settled_at TEXT NOT NULL,
+    PRIMARY KEY(prediction_id, horizon_bars)
 );
 
 CREATE TABLE IF NOT EXISTS prediction_outcomes (
@@ -123,5 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_market_bars_time
     ON market_bars(symbol, timeframe, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_predictions_time
     ON predictions(generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prediction_horizon_outcomes_time
+    ON prediction_horizon_outcomes(settled_at DESC, horizon_bars);
 CREATE INDEX IF NOT EXISTS idx_feedback_prediction
     ON human_feedback(prediction_id, created_at DESC);

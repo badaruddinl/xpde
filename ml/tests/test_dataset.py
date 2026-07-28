@@ -6,7 +6,13 @@ import pytest
 
 pytest.importorskip("pandas")
 
-from xpde_ml.dataset import FEATURE_COLUMNS, build_training_frame
+from xpde_ml.dataset import (
+    BARRIER_CLASS,
+    BARRIER_HORIZON,
+    FEATURE_COLUMNS,
+    add_objective_labels,
+    build_training_frame,
+)
 
 
 def test_training_features_are_causal_and_labels_use_future_bars() -> None:
@@ -34,3 +40,34 @@ def test_training_features_are_causal_and_labels_use_future_bars() -> None:
     assert set(FEATURE_COLUMNS).issubset(result.columns)
     assert result.loc[40, "target_3"] > 0
     assert result.tail(12)["target_12"].isna().all()
+    assert BARRIER_HORIZON == 3
+    assert {
+        "barrier_long_outcome",
+        "barrier_short_outcome",
+        "mfe_long_usd",
+        "mae_short_usd",
+    }.issubset(result.columns)
+
+
+def test_barrier_labels_keep_no_hit_and_report_same_bar_ambiguity() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        [
+            {"close": 100.0, "high": 100.1, "low": 99.9, "atr_24": 1.0},
+            {"close": 100.0, "high": 100.2, "low": 99.8, "atr_24": 1.0},
+            {"close": 100.0, "high": 100.3, "low": 99.7, "atr_24": 1.0},
+            {"close": 100.0, "high": 100.4, "low": 99.6, "atr_24": 1.0},
+        ]
+    )
+    no_hit = add_objective_labels(frame)
+    assert no_hit.loc[0, "barrier_long_outcome"] == "NO_HIT_BEFORE_EXPIRY"
+    assert (
+        no_hit.loc[0, "barrier_long_class"]
+        == BARRIER_CLASS["NO_HIT_BEFORE_EXPIRY"]
+    )
+
+    frame.loc[1, ["high", "low"]] = [101.5, 98.8]
+    ambiguous = add_objective_labels(frame)
+    assert ambiguous.loc[0, "barrier_long_outcome"] == "AMBIGUOUS_SAME_BAR"
+    assert ambiguous.loc[0, "barrier_long_class"] != ambiguous.loc[0, "barrier_long_class"]

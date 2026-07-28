@@ -11,9 +11,12 @@ records outcomes and feedback, then leaves the final decision to a human.
 - MetaTrader 5 read-only bridge for `GOLDm#`.
 - M5 direct horizons: 1, 3, 6 and 12 bars.
 - Empirical quantile baseline plus CatBoost MultiQuantile trainer.
-- Historical MT5 backfill with broker-clock normalization to UTC.
+- MT5 epoch timestamps stored as UTC, with an explicit provider override only.
+- Explicit completed-bar catch-up after downtime without retroactive live forecasts.
 - Purged walk-forward evaluation, conformal interval calibration, calibrated
-  direction and TP-before-SL classifiers.
+  direction and symmetric LONG/SHORT barrier classifiers.
+- Exact prediction origin plus objective settlement for every 1/3/6/12-bar horizon.
+- Condition-dependent MFE/MAE models; lot preview remains disabled for the baseline.
 - Scalper and strict Sniper decision policies.
 - Dynamic MT5 account and symbol specifications.
 - SQLite WAL audit trail, prediction registry and outcome settlement.
@@ -71,24 +74,34 @@ with capped exponential backoff. The dashboard's **Retry realtime** button
 restarts only the local read-only MT5 bridge, prevents duplicate bridge roots,
 and waits until a fresh MT5 snapshot reaches the core.
 
+On startup or reconnect, the bridge asks the core for the latest locally stored
+completed M5 candle and uses `copy_rates_range()` to append the missing range.
+Backfilled bars can settle earlier forecasts, but the bridge deliberately waits
+for a genuinely new completed candle before emitting another live forecast.
+
 Alternatively, keep the bridge visible in terminal three:
 
 ```powershell
 .\scripts\run-mt5-bridge.ps1
 ```
 
-Use `-Once` for a single snapshot and forecast:
+Use `-Once` for a single connectivity snapshot and catch-up check:
 
 ```powershell
 .\scripts\run-mt5-bridge.ps1 -Once
 ```
 
-`-Once` is intended only for diagnostics. After it exits, the core deliberately
-marks the feed `MT5_STALE` and returns `NO_PREDICTION`.
+`-Once` is intended only for diagnostics and deliberately does not manufacture
+a live forecast from the last candle seen during startup. After it exits, the
+core marks the feed `MT5_STALE` and returns `NO_PREDICTION`.
 
 If multiple MT5 terminals are installed, copy `.env.example` to a local ignored
 `.env` or set `MT5_PATH`. Credentials are optional when the selected terminal is
 already logged in; never commit them.
+
+MetaTrader 5 Python timestamps are treated as UTC. Only set
+`MT5_UTC_OFFSET_OVERRIDE_HOURS` when a provider has been independently verified
+to encode a fixed non-UTC offset.
 
 ## Verification
 
@@ -124,6 +137,7 @@ an intentional incremental import is required.
 Useful read-only endpoints:
 
 ```text
+GET /api/v1/market/cursor
 GET /api/v1/models
 GET /api/v1/evaluation/summary
 ```
