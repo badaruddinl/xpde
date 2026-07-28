@@ -35,6 +35,17 @@ minimum `0.1` lot and minimum price fluctuation `$0.01`. Runtime values from
 - Rust stable.
 - Node.js 22.13 or newer.
 
+## One-click Windows launchers
+
+Double-click the launcher required from the repository root:
+
+- `XPDE-Install.cmd` installs or refreshes local dependencies.
+- `XPDE-Start.cmd` starts the core, dashboard and MT5 bridge, then opens the dashboard.
+- `XPDE-Retry-MT5.cmd` restarts only the MT5 bridge.
+- `XPDE-Stop.cmd` stops all XPDE processes tracked by the realtime launcher.
+
+Open and log in to MetaTrader 5 before starting or retrying the bridge.
+
 ## Setup
 
 ```powershell
