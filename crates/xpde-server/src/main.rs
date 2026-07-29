@@ -28,7 +28,7 @@ use uuid::Uuid;
 use xpde_domain::{
     AccountSnapshot, BARRIER_HORIZON_BARS, BARRIER_SPEC_ID, CalibrationStatus, DataQuality,
     DecisionAction, DecisionPolicy, DecisionProposal, ForecastEnvelope, ForecastPoint,
-    HumanFeedback, MarketBar, MarketSnapshot, SymbolSpec, decide,
+    HumanFeedback, MarketBar, MarketSnapshot, SymbolSpec, decide, decide_at,
 };
 
 const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
@@ -139,22 +139,18 @@ impl BarrierOutcome {
 }
 
 fn barrier_outcome(
-    proposals: &[DecisionProposal],
+    action: DecisionAction,
+    target: f64,
+    stop: f64,
     bars: &[(f64, f64, f64)],
 ) -> Option<BarrierOutcome> {
-    let proposal = proposals.iter().find(|proposal| {
-        matches!(
-            proposal.action,
-            DecisionAction::Long | DecisionAction::Short
-        ) && proposal.invalidation_price.is_some()
-            && proposal.target_price.is_some()
-    })?;
-    let invalidation = proposal.invalidation_price?;
-    let target = proposal.target_price?;
+    if !target.is_finite() || !stop.is_finite() {
+        return None;
+    }
     for &(high, low, _) in bars {
-        let (tp_hit, sl_hit) = match proposal.action {
-            DecisionAction::Long => (high >= target, low <= invalidation),
-            DecisionAction::Short => (low <= target, high >= invalidation),
+        let (tp_hit, sl_hit) = match action {
+            DecisionAction::Long => (high >= target, low <= stop),
+            DecisionAction::Short => (low <= target, high >= stop),
             _ => return None,
         };
         match (tp_hit, sl_hit) {
@@ -219,6 +215,23 @@ impl Store {
         ensure_column(&connection, "predictions", "barrier_spec_id", "TEXT")?;
         ensure_column(&connection, "predictions", "decision_valid_until", "TEXT")?;
         ensure_column(&connection, "predictions", "outcome_matures_at", "TEXT")?;
+        ensure_column(
+            &connection,
+            "prediction_horizon_outcomes",
+            "barrier_long_outcome",
+            "TEXT",
+        )?;
+        ensure_column(&connection, "human_feedback", "profile", "TEXT")?;
+        ensure_column(&connection, "human_feedback", "proposal_action", "TEXT")?;
+        ensure_column(&connection, "human_feedback", "model_id", "TEXT")?;
+        ensure_column(&connection, "human_feedback", "forecast_side", "TEXT")?;
+        ensure_column(&connection, "human_feedback", "selected_reason", "TEXT")?;
+        ensure_column(
+            &connection,
+            "prediction_horizon_outcomes",
+            "barrier_short_outcome",
+            "TEXT",
+        )?;
         connection.execute(
             "DELETE FROM market_bars
              WHERE timeframe='M5'
@@ -453,10 +466,16 @@ impl Store {
         let connection = self.connection.lock().expect("database mutex poisoned");
         connection.execute(
             "INSERT INTO human_feedback
-             (prediction_id, verdict, reason_codes_json, note, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (prediction_id, profile, proposal_action, model_id, forecast_side,
+              selected_reason, verdict, reason_codes_json, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 feedback.prediction_id.to_string(),
+                format!("{:?}", feedback.profile).to_uppercase(),
+                format!("{:?}", feedback.proposal_action).to_uppercase(),
+                feedback.model_id,
+                format!("{:?}", feedback.forecast_side).to_uppercase(),
+                feedback.selected_reason,
                 format!("{:?}", feedback.verdict).to_uppercase(),
                 serde_json::to_string(&feedback.reason_codes).unwrap_or_else(|_| "[]".to_owned()),
                 feedback.note,
@@ -613,11 +632,84 @@ impl Store {
                     params![prediction_id, target.horizon_bars],
                     |row| row.get(0),
                 )?;
+
+                let horizon_bars = &outcome_bars[..horizon];
+                let (barrier_long, barrier_short) = if target.horizon_bars == BARRIER_HORIZON_BARS {
+                    let barrier_bars = horizon_bars
+                        .iter()
+                        .map(|bar| (bar.1, bar.2, bar.3))
+                        .collect::<Vec<_>>();
+                    let long = barrier_outcome(
+                        DecisionAction::Long,
+                        forecast.target_price_long,
+                        forecast.stop_price_long,
+                        &barrier_bars,
+                    );
+                    let short = barrier_outcome(
+                        DecisionAction::Short,
+                        forecast.target_price_short,
+                        forecast.stop_price_short,
+                        &barrier_bars,
+                    );
+                    for proposal in &proposals {
+                        if !matches!(
+                            proposal.action,
+                            DecisionAction::Long | DecisionAction::Short
+                        ) {
+                            continue;
+                        }
+                        let (Some(proposal_target), Some(proposal_stop)) =
+                            (proposal.target_price, proposal.invalidation_price)
+                        else {
+                            continue;
+                        };
+                        let Some(proposal_outcome) = barrier_outcome(
+                            proposal.action,
+                            proposal_target,
+                            proposal_stop,
+                            &barrier_bars,
+                        ) else {
+                            continue;
+                        };
+                        transaction.execute(
+                            "INSERT OR IGNORE INTO prediction_proposal_outcomes
+                                 (prediction_id, profile, horizon_bars, action,
+                                  target_price, stop_price, barrier_outcome, settled_at)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![
+                                prediction_id,
+                                format!("{:?}", proposal.profile).to_uppercase(),
+                                target.horizon_bars,
+                                format!("{:?}", proposal.action).to_uppercase(),
+                                proposal_target,
+                                proposal_stop,
+                                proposal_outcome.as_str(),
+                                now,
+                            ],
+                        )?;
+                    }
+                    (long, short)
+                } else {
+                    (None, None)
+                };
                 if already_settled {
+                    if target.horizon_bars == BARRIER_HORIZON_BARS {
+                        transaction.execute(
+                            "UPDATE prediction_horizon_outcomes
+                             SET barrier_long_outcome=COALESCE(barrier_long_outcome, ?3),
+                                 barrier_short_outcome=COALESCE(barrier_short_outcome, ?4)
+                             WHERE prediction_id=?1 AND horizon_bars=?2",
+                            params![
+                                prediction_id,
+                                target.horizon_bars,
+                                barrier_long.map(BarrierOutcome::as_str),
+                                barrier_short.map(BarrierOutcome::as_str),
+                            ],
+                        )?;
+                    }
                     continue;
                 }
 
-                let horizon_bars = &outcome_bars[..horizon];
                 let final_price = horizon_bars.last().map(|bar| bar.3).unwrap_or(origin_close);
                 let actual_return = (final_price / origin_close).ln();
                 let actual_high = horizon_bars
@@ -646,14 +738,10 @@ impl Store {
                         (actual_high - origin_close).max(0.0),
                     )
                 };
-                let barrier = if target.horizon_bars == 3 {
-                    let barrier_bars = horizon_bars
-                        .iter()
-                        .map(|bar| (bar.1, bar.2, bar.3))
-                        .collect::<Vec<_>>();
-                    barrier_outcome(&proposals, &barrier_bars).map(BarrierOutcome::as_str)
+                let barrier = if target.q50 >= 0.0 {
+                    barrier_long
                 } else {
-                    None
+                    barrier_short
                 };
                 let metrics = serde_json::json!({
                     "median_error": (actual_return - target.q50).abs(),
@@ -675,8 +763,9 @@ impl Store {
                      (prediction_id, horizon_bars, origin_bar_timestamp,
                       outcome_bar_timestamp, actual_return, actual_high, actual_low,
                       interval_hit, direction_hit, barrier_outcome,
+                      barrier_long_outcome, barrier_short_outcome,
                       error_metrics_json, settled_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         prediction_id,
                         target.horizon_bars,
@@ -687,7 +776,9 @@ impl Store {
                         actual_low,
                         interval_hit,
                         direction_hit,
-                        barrier,
+                        barrier.map(BarrierOutcome::as_str),
+                        barrier_long.map(BarrierOutcome::as_str),
+                        barrier_short.map(BarrierOutcome::as_str),
                         metrics.to_string(),
                         now,
                     ],
@@ -713,7 +804,9 @@ impl Store {
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
-                        END)
+                        END),
+                    COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
              WHERE p.model_id != 'baseline-demo-v1'
@@ -727,6 +820,8 @@ impl Store {
                     "direction_accuracy": row.get::<_, f64>(2)?,
                     "tp_before_sl_samples": row.get::<_, i64>(3)?,
                     "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
+                    "no_hit_samples": row.get::<_, i64>(5)?,
+                    "ambiguous_samples": row.get::<_, i64>(6)?,
                 }))
             },
         )?;
@@ -737,7 +832,9 @@ impl Store {
                         AVG(CASE
                               WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
                               WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
-                            END)
+                            END),
+                        COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
+                        COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
                  FROM prediction_horizon_outcomes o
                  JOIN predictions p ON p.prediction_id=o.prediction_id
                  WHERE o.horizon_bars=3 AND p.barrier_spec_id=?1
@@ -752,6 +849,8 @@ impl Store {
                         "direction_accuracy": row.get::<_, f64>(3)?,
                         "tp_before_sl_samples": row.get::<_, i64>(4)?,
                         "tp_before_sl_rate": row.get::<_, Option<f64>>(5)?,
+                        "no_hit_samples": row.get::<_, i64>(6)?,
+                        "ambiguous_samples": row.get::<_, i64>(7)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -774,7 +873,9 @@ impl Store {
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
-                        END)
+                        END),
+                    COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
              FROM recent o",
             params![current_model_id, BARRIER_SPEC_ID],
             |row| {
@@ -785,6 +886,8 @@ impl Store {
                     "direction_accuracy": row.get::<_, f64>(2)?,
                     "tp_before_sl_samples": row.get::<_, i64>(3)?,
                     "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
+                    "no_hit_samples": row.get::<_, i64>(5)?,
+                    "ambiguous_samples": row.get::<_, i64>(6)?,
                 }))
             },
         )?;
@@ -797,7 +900,9 @@ impl Store {
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
-                        END)
+                        END),
+                    COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
              WHERE o.horizon_bars=3
@@ -814,14 +919,95 @@ impl Store {
                     "direction_accuracy": row.get::<_, f64>(2)?,
                     "tp_before_sl_samples": row.get::<_, i64>(3)?,
                     "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
+                    "no_hit_samples": row.get::<_, i64>(5)?,
+                    "ambiguous_samples": row.get::<_, i64>(6)?,
                 }))
             },
         )?;
+        let forecast_barrier_by_side = {
+            let mut statement = connection.prepare(
+                "WITH recent AS (
+                   SELECT o.barrier_long_outcome, o.barrier_short_outcome
+                   FROM prediction_horizon_outcomes o
+                   JOIN predictions p ON p.prediction_id=o.prediction_id
+                   WHERE o.horizon_bars=3
+                     AND p.model_id=?1
+                     AND p.barrier_spec_id=?2
+                   ORDER BY o.origin_bar_timestamp DESC
+                   LIMIT 200
+                 ),
+                 sides AS (
+                   SELECT 'LONG' AS side, barrier_long_outcome AS outcome FROM recent
+                   UNION ALL
+                   SELECT 'SHORT' AS side, barrier_short_outcome AS outcome FROM recent
+                 )
+                 SELECT side,
+                        COUNT(outcome),
+                        COUNT(CASE WHEN outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
+                        AVG(CASE
+                              WHEN outcome='TP_FIRST' THEN 1.0
+                              WHEN outcome='SL_FIRST' THEN 0.0
+                            END),
+                        COUNT(CASE WHEN outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
+                        COUNT(CASE WHEN outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                 FROM sides GROUP BY side ORDER BY side",
+            )?;
+            statement
+                .query_map(params![current_model_id, BARRIER_SPEC_ID], |row| {
+                    Ok(serde_json::json!({
+                        "side": row.get::<_, String>(0)?,
+                        "settled_predictions": row.get::<_, i64>(1)?,
+                        "tp_before_sl_samples": row.get::<_, i64>(2)?,
+                        "tp_before_sl_rate": row.get::<_, Option<f64>>(3)?,
+                        "no_hit_samples": row.get::<_, i64>(4)?,
+                        "ambiguous_samples": row.get::<_, i64>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let proposal_outcomes_by_profile = {
+            let mut statement = connection.prepare(
+                "WITH recent_predictions AS (
+                   SELECT p.prediction_id
+                   FROM predictions p
+                   WHERE p.model_id=?1 AND p.barrier_spec_id=?2
+                   ORDER BY p.origin_bar_timestamp DESC
+                   LIMIT 200
+                 )
+                 SELECT po.profile,
+                        COUNT(*),
+                        COUNT(CASE WHEN po.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
+                        AVG(CASE
+                              WHEN po.barrier_outcome='TP_FIRST' THEN 1.0
+                              WHEN po.barrier_outcome='SL_FIRST' THEN 0.0
+                            END),
+                        COUNT(CASE WHEN po.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
+                        COUNT(CASE WHEN po.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                 FROM prediction_proposal_outcomes po
+                 JOIN recent_predictions rp ON rp.prediction_id=po.prediction_id
+                 WHERE po.horizon_bars=3
+                 GROUP BY po.profile ORDER BY po.profile",
+            )?;
+            statement
+                .query_map(params![current_model_id, BARRIER_SPEC_ID], |row| {
+                    Ok(serde_json::json!({
+                        "profile": row.get::<_, String>(0)?,
+                        "settled_proposals": row.get::<_, i64>(1)?,
+                        "tp_before_sl_samples": row.get::<_, i64>(2)?,
+                        "tp_before_sl_rate": row.get::<_, Option<f64>>(3)?,
+                        "no_hit_samples": row.get::<_, i64>(4)?,
+                        "ambiguous_samples": row.get::<_, i64>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         Ok(serde_json::json!({
             "scope": "LIVE_SHADOW_H3",
             "overall": overall,
             "current_model": current_model,
             "current_session": current_session,
+            "forecast_barrier_by_side": forecast_barrier_by_side,
+            "proposal_outcomes_by_profile": proposal_outcomes_by_profile,
             "by_model": by_model,
             "target_coverage": 0.80,
             "current_model_window": 200,
@@ -1086,6 +1272,33 @@ async fn post_feedback(
             "feedback note exceeds 500 characters",
         ));
     }
+    if feedback.model_id.trim().is_empty()
+        || !matches!(
+            feedback.forecast_side,
+            DecisionAction::Long | DecisionAction::Short
+        )
+    {
+        return Err(ApiError::bad_request("feedback context is invalid"));
+    }
+    let runtime = state.runtime.read().await;
+    if runtime.safety.feed_is_demo
+        || runtime.forecast_status != ForecastStatus::Current
+        || runtime.forecast.prediction_id != feedback.prediction_id
+        || runtime.forecast.model_id != feedback.model_id
+    {
+        return Err(ApiError::bad_request(
+            "feedback is only accepted for the current live forecast",
+        ));
+    }
+    let proposal_matches = runtime.proposals.iter().any(|proposal| {
+        proposal.profile == feedback.profile && proposal.action == feedback.proposal_action
+    });
+    if !proposal_matches {
+        return Err(ApiError::bad_request(
+            "feedback proposal context does not match runtime state",
+        ));
+    }
+    drop(runtime);
     state
         .store
         .save_feedback(&feedback)
@@ -1165,11 +1378,12 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 
 async fn public_runtime_state(state: &AppState) -> RuntimeState {
     let mut runtime = state.runtime.read().await.clone();
+    let now = Utc::now();
     runtime.forecast_status = forecast_status(
         &runtime.snapshot,
         &runtime.forecast,
         runtime.safety.feed_is_demo,
-        Utc::now(),
+        now,
     );
     if !runtime.safety.feed_is_demo {
         let bridge_age_ms = Utc::now()
@@ -1180,19 +1394,21 @@ async fn public_runtime_state(state: &AppState) -> RuntimeState {
             runtime.snapshot.data_quality.tick_age_ms.max(bridge_age_ms);
         if runtime.snapshot.data_quality.tick_age_ms > DecisionPolicy::scalper().max_tick_age_ms {
             runtime.connection_status = "MT5_STALE";
-            runtime.proposals = vec![
-                decide(
-                    &runtime.snapshot,
-                    &runtime.forecast,
-                    &DecisionPolicy::scalper(),
-                ),
-                decide(
-                    &runtime.snapshot,
-                    &runtime.forecast,
-                    &DecisionPolicy::sniper(),
-                ),
-            ];
         }
+        runtime.proposals = vec![
+            decide_at(
+                &runtime.snapshot,
+                &runtime.forecast,
+                &DecisionPolicy::scalper(),
+                now,
+            ),
+            decide_at(
+                &runtime.snapshot,
+                &runtime.forecast,
+                &DecisionPolicy::sniper(),
+                now,
+            ),
+        ];
     }
     runtime
 }
@@ -1368,73 +1584,43 @@ fn demo_state() -> RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xpde_domain::TradingProfile;
-
-    fn proposal(
-        action: DecisionAction,
-        target_price: Option<f64>,
-        invalidation_price: Option<f64>,
-    ) -> DecisionProposal {
-        let generated_at = Utc::now();
-        DecisionProposal {
-            prediction_id: Uuid::new_v4(),
-            profile: TradingProfile::Scalper,
-            action,
-            generated_at,
-            decision_valid_until: generated_at + chrono::Duration::minutes(5),
-            outcome_matures_at: generated_at + chrono::Duration::minutes(20),
-            expected_edge_after_cost_usd: 1.0,
-            reference_lot: 0.1,
-            invalidation_price,
-            target_price,
-            reason_codes: Vec::new(),
-            risk_warnings: Vec::new(),
-        }
-    }
 
     #[test]
-    fn barrier_outcome_uses_first_actionable_proposal() {
-        let proposals = vec![
-            proposal(DecisionAction::Wait, None, None),
-            proposal(DecisionAction::Long, Some(101.0), Some(99.0)),
-        ];
+    fn barrier_outcome_uses_exact_long_contract() {
         let bars = vec![(101.2, 99.5, 101.0)];
 
         assert_eq!(
-            barrier_outcome(&proposals, &bars),
+            barrier_outcome(DecisionAction::Long, 101.0, 99.0, &bars),
             Some(BarrierOutcome::TpFirst)
         );
     }
 
     #[test]
     fn barrier_outcome_detects_short_stop_first() {
-        let proposals = vec![proposal(DecisionAction::Short, Some(99.0), Some(101.0))];
         let bars = vec![(101.2, 99.5, 100.8)];
 
         assert_eq!(
-            barrier_outcome(&proposals, &bars),
+            barrier_outcome(DecisionAction::Short, 99.0, 101.0, &bars),
             Some(BarrierOutcome::SlFirst)
         );
     }
 
     #[test]
     fn barrier_outcome_keeps_same_bar_ambiguity_explicit() {
-        let proposals = vec![proposal(DecisionAction::Long, Some(101.0), Some(99.0))];
         let bars = vec![(101.2, 98.8, 100.2)];
 
         assert_eq!(
-            barrier_outcome(&proposals, &bars),
+            barrier_outcome(DecisionAction::Long, 101.0, 99.0, &bars),
             Some(BarrierOutcome::AmbiguousSameBar)
         );
     }
 
     #[test]
     fn barrier_outcome_keeps_no_hit_before_expiry() {
-        let proposals = vec![proposal(DecisionAction::Long, Some(101.0), Some(99.0))];
         let bars = vec![(100.8, 99.4, 100.2)];
 
         assert_eq!(
-            barrier_outcome(&proposals, &bars),
+            barrier_outcome(DecisionAction::Long, 101.0, 99.0, &bars),
             Some(BarrierOutcome::NoHitBeforeExpiry)
         );
     }

@@ -97,9 +97,44 @@ CREATE TABLE IF NOT EXISTS prediction_horizon_outcomes (
             'AMBIGUOUS_SAME_BAR'
         )
     ),
+    barrier_long_outcome TEXT CHECK(
+        barrier_long_outcome IS NULL OR barrier_long_outcome IN (
+            'TP_FIRST',
+            'SL_FIRST',
+            'NO_HIT_BEFORE_EXPIRY',
+            'AMBIGUOUS_SAME_BAR'
+        )
+    ),
+    barrier_short_outcome TEXT CHECK(
+        barrier_short_outcome IS NULL OR barrier_short_outcome IN (
+            'TP_FIRST',
+            'SL_FIRST',
+            'NO_HIT_BEFORE_EXPIRY',
+            'AMBIGUOUS_SAME_BAR'
+        )
+    ),
     error_metrics_json TEXT NOT NULL,
     settled_at TEXT NOT NULL,
     PRIMARY KEY(prediction_id, horizon_bars)
+);
+
+CREATE TABLE IF NOT EXISTS prediction_proposal_outcomes (
+    prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+    profile TEXT NOT NULL CHECK(profile IN ('SCALPER', 'SNIPER')),
+    horizon_bars INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('LONG', 'SHORT')),
+    target_price REAL NOT NULL,
+    stop_price REAL NOT NULL,
+    barrier_outcome TEXT NOT NULL CHECK(
+        barrier_outcome IN (
+            'TP_FIRST',
+            'SL_FIRST',
+            'NO_HIT_BEFORE_EXPIRY',
+            'AMBIGUOUS_SAME_BAR'
+        )
+    ),
+    settled_at TEXT NOT NULL,
+    PRIMARY KEY(prediction_id, profile, horizon_bars)
 );
 
 CREATE TABLE IF NOT EXISTS prediction_outcomes (
@@ -117,6 +152,11 @@ CREATE TABLE IF NOT EXISTS prediction_outcomes (
 CREATE TABLE IF NOT EXISTS human_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prediction_id TEXT NOT NULL,
+    profile TEXT,
+    proposal_action TEXT,
+    model_id TEXT,
+    forecast_side TEXT,
+    selected_reason TEXT,
     verdict TEXT NOT NULL,
     reason_codes_json TEXT NOT NULL,
     note TEXT,
@@ -154,5 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_predictions_time
     ON predictions(generated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_prediction_horizon_outcomes_time
     ON prediction_horizon_outcomes(settled_at DESC, horizon_bars);
+CREATE INDEX IF NOT EXISTS idx_prediction_proposal_outcomes_time
+    ON prediction_proposal_outcomes(settled_at DESC, profile, horizon_bars);
 CREATE INDEX IF NOT EXISTS idx_feedback_prediction
     ON human_feedback(prediction_id, created_at DESC);

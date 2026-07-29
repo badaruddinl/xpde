@@ -123,6 +123,7 @@ cargo test --workspace
 .\.venv\Scripts\python.exe -m pytest -q ml\tests
 npm run lint
 npm test
+npm run test:ui
 ```
 
 ## Model workflow
@@ -148,15 +149,39 @@ an intentional incremental import is required. Every export also creates a
 sanitized `.manifest.json` containing timestamps, row count, gap summary,
 Git commit and SHA-256.
 
+Candidate training is the promotion path and requires at least 20,000 rows by
+default. For a quick pipeline check that cannot be promoted, use
+`--training-mode smoke`. Direction and barrier probabilities are calibrated on
+a temporal holdout with Platt scaling (or isotonic when enough samples improve
+the Brier score), and all CatBoost families use temporal early stopping.
+
 For CPU training in Google Colab, open
 `notebooks/xpde_colab_training.ipynb`, set the exact commit and Drive paths,
 then run the cells in order. The notebook copies the dataset to `/content`,
-verifies its manifest, runs tests, trains the candidate, verifies artifact
-checksums and copies an immutable candidate folder plus ZIP back to Drive.
+installs the exact versions in `ml/requirements-training.lock.txt`, verifies its
+manifest, runs Rust/Python/Next.js tests, trains the candidate, verifies artifact
+checksums and copies an immutable candidate folder plus ZIP back to Drive. The
+artifact records the Git commit, dirty state, runtime and dependency versions.
 
-Candidate schema v2 contains `evaluation.json`, `model_card.md`,
+Candidate schema v3 contains `evaluation.json`, `model_card.md`,
 `checksums.sha256`, quantile/direction/barrier models and dynamic MFE/MAE
-models. The local bridge verifies every checksum before loading a candidate.
+models. Import a downloaded Colab ZIP through the checked and immutable importer:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\import-colab-artifact.py `
+  .\downloads\xpde-candidate.zip
+```
+
+The importer validates the schema, feature and barrier contracts, verifies every
+checksum, refuses duplicate run IDs and only promotes eligible candidates to the
+local `latest` shadow slot. The bridge repeats checksum and contract validation
+before loading a candidate.
+
+Forecast barrier evaluation and actionable proposal evaluation are intentionally
+separate. Every settled H3 forecast records counterfactual LONG and SHORT
+TP-before-SL outcomes using the exact forecast target/stop. SCALPER and SNIPER
+proposal outcomes are stored independently, so a `WAIT` decision does not erase
+forecast quality and a proposal metric never masquerades as model coverage.
 
 Useful read-only endpoints:
 

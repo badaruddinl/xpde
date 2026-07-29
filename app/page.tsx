@@ -124,6 +124,20 @@ interface EvaluationMetrics {
   direction_accuracy: number;
   tp_before_sl_samples: number;
   tp_before_sl_rate: number | null;
+  no_hit_samples: number;
+  ambiguous_samples: number;
+}
+
+interface BarrierOutcomeMetrics {
+  tp_before_sl_samples: number;
+  tp_before_sl_rate: number | null;
+  no_hit_samples: number;
+  ambiguous_samples: number;
+}
+
+interface ProposalOutcomeMetrics extends BarrierOutcomeMetrics {
+  profile: Profile;
+  settled_proposals: number;
 }
 
 interface EvaluationSummary {
@@ -135,6 +149,13 @@ interface EvaluationSummary {
     started_at: string;
   };
   by_model: Array<EvaluationMetrics & { model_id: string }>;
+  forecast_barrier_by_side: Array<
+    BarrierOutcomeMetrics & {
+      side: "LONG" | "SHORT";
+      settled_predictions: number;
+    }
+  >;
+  proposal_outcomes_by_profile: ProposalOutcomeMetrics[];
   target_coverage: number;
   current_model_window: number;
   updated_at: string;
@@ -281,10 +302,10 @@ function buildDemoState(): DashboardState {
   };
 }
 
-function money(value: number, digits = 2) {
+function money(value: number, digits = 2, currency = "USD") {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
-    currency: "USD",
+    currency,
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   }).format(value);
@@ -393,6 +414,10 @@ export default function Home() {
   const proposal = state.proposals.find((item) => item.profile === profile) ?? state.proposals[0];
   const activeEvaluation = evaluation?.current_model ?? null;
   const sessionEvaluation = evaluation?.current_session ?? null;
+  const activeProposalEvaluation =
+    evaluation?.proposal_outcomes_by_profile.find(
+      (item) => item.profile === profile,
+    ) ?? null;
   const liveCoverage =
     activeEvaluation &&
     activeEvaluation.settled_predictions >= MIN_LIVE_EVIDENCE
@@ -404,9 +429,9 @@ export default function Home() {
       ? sessionEvaluation.direction_accuracy
       : null;
   const realizedTpRate =
-    activeEvaluation &&
-    activeEvaluation.tp_before_sl_samples >= MIN_LIVE_EVIDENCE
-      ? activeEvaluation.tp_before_sl_rate
+    activeProposalEvaluation &&
+    activeProposalEvaluation.tp_before_sl_samples >= MIN_LIVE_EVIDENCE
+      ? activeProposalEvaluation.tp_before_sl_rate
       : null;
   const horizonThree =
     state.forecast.points.find((point) => point.horizon_bars === 3) ??
@@ -521,6 +546,11 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prediction_id: state.forecast.prediction_id,
+          profile,
+          proposal_action: proposal.action,
+          model_id: state.forecast.model_id,
+          forecast_side: forecastSide,
+          selected_reason: proposal.reason_codes[0] ?? null,
           verdict,
           reason_codes: verdict === "REJECTED" ? ["MANUAL_REVIEW_REJECTED"] : [],
           note: null,
@@ -579,6 +609,32 @@ export default function Home() {
     }
   }
 
+  const renderDecisionCard = () => (
+    <section className={`panel decision-card action-${proposal.action.toLowerCase()}`}>
+      <div className="decision-head"><span>Decision proposal</span><i>{profile}</i></div>
+      <strong className="decision-action">{proposal.action.replace("_", " ")}</strong>
+      <p>{proposal.reason_codes.length ? reasonLabel(proposal.reason_codes[0]) : "Semua gate profil terpenuhi."}</p>
+      <div className="decision-numbers">
+        <div><span>Net edge · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.expected_edge_after_cost_usd)}</strong></div>
+        <div>
+          <span>Model MFE / MAE · {forecastSide}</span>
+          <strong>
+            {state.forecast.excursion_modelled
+              ? `${expectedMfe.toFixed(2)} / ${expectedMae.toFixed(2)}`
+              : "Belum tersedia"}
+          </strong>
+        </div>
+        <div>
+          <span>Barrier TP / SL · {forecastSide}</span>
+          <strong>{barrierTarget.toFixed(2)} / {barrierStop.toFixed(2)}</strong>
+        </div>
+      </div>
+      <ul className="reason-list">
+        {proposal.reason_codes.map((reason) => <li key={reason}>{reasonLabel(reason)}</li>)}
+      </ul>
+    </section>
+  );
+
   return (
     <main className="terminal-shell">
       <header className="topbar">
@@ -630,6 +686,7 @@ export default function Home() {
       </section>
 
       <div className="workspace">
+        <div className="mobile-decision">{renderDecisionCard()}</div>
         <section className="primary-column">
           <div className="panel chart-panel">
             <div className="panel-heading">
@@ -810,16 +867,16 @@ export default function Home() {
               </small>
             </article>
             <article className="panel metric">
-              <span>Live realized TP before SL · current model</span>
+              <span>Proposal TP before SL · {profile} · 200 prediksi</span>
               <strong>{realizedTpRate === null ? "—" : percent(realizedTpRate)}</strong>
               <div className="meter realized">
                 <i style={{ width: realizedTpRate === null ? "0%" : percent(realizedTpRate) }} />
               </div>
               <small>
-                {activeEvaluation
+                {activeProposalEvaluation
                   ? realizedTpRate === null
-                    ? `Mengumpulkan outcome valid · ${activeEvaluation.tp_before_sl_samples}/${MIN_LIVE_EVIDENCE}`
-                    : `Outcome TP/SL valid n=${activeEvaluation.tp_before_sl_samples}`
+                    ? `Mengumpulkan outcome valid · ${activeProposalEvaluation.tp_before_sl_samples}/${MIN_LIVE_EVIDENCE}`
+                    : `TP/SL n=${activeProposalEvaluation.tp_before_sl_samples} · no-hit=${activeProposalEvaluation.no_hit_samples} · ambigu=${activeProposalEvaluation.ambiguous_samples}`
                   : "Menunggu evaluation API"}
               </small>
             </article>
@@ -827,29 +884,7 @@ export default function Home() {
         </section>
 
         <aside className="side-column">
-          <section className={`panel decision-card action-${proposal.action.toLowerCase()}`}>
-            <div className="decision-head"><span>Decision proposal</span><i>{profile}</i></div>
-            <strong className="decision-action">{proposal.action.replace("_", " ")}</strong>
-            <p>{proposal.reason_codes.length ? reasonLabel(proposal.reason_codes[0]) : "Semua gate profil terpenuhi."}</p>
-            <div className="decision-numbers">
-              <div><span>Net edge · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.expected_edge_after_cost_usd)}</strong></div>
-              <div>
-                <span>Model MFE / MAE · {forecastSide}</span>
-                <strong>
-                  {state.forecast.excursion_modelled
-                    ? `${expectedMfe.toFixed(2)} / ${expectedMae.toFixed(2)}`
-                    : "Belum tersedia"}
-                </strong>
-              </div>
-              <div>
-                <span>Barrier TP / SL · {forecastSide}</span>
-                <strong>{barrierTarget.toFixed(2)} / {barrierStop.toFixed(2)}</strong>
-              </div>
-            </div>
-            <ul className="reason-list">
-              {proposal.reason_codes.map((reason) => <li key={reason}>{reasonLabel(reason)}</li>)}
-            </ul>
-          </section>
+          <div className="desktop-decision">{renderDecisionCard()}</div>
 
           <section className="panel account-panel">
             <div className="section-title">
@@ -857,9 +892,9 @@ export default function Home() {
               <span className="leverage">1:{state.snapshot.account.leverage}</span>
             </div>
             <div className="account-values">
-              <div><span>Balance</span><strong>{money(state.snapshot.account.balance)}</strong></div>
-              <div><span>Equity</span><strong>{money(state.snapshot.account.equity)}</strong></div>
-              <div><span>Free margin</span><strong>{money(state.snapshot.account.free_margin)}</strong></div>
+              <div><span>Balance</span><strong>{money(state.snapshot.account.balance, 2, state.snapshot.account.currency)}</strong></div>
+              <div><span>Equity</span><strong>{money(state.snapshot.account.equity, 2, state.snapshot.account.currency)}</strong></div>
+              <div><span>Free margin</span><strong>{money(state.snapshot.account.free_margin, 2, state.snapshot.account.currency)}</strong></div>
             </div>
             <label className="risk-input">
               <span>Risk budget <strong>{riskPercent.toFixed(1)}%</strong></span>

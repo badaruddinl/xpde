@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import math
+import os
+import platform
+import subprocess
 import urllib.request
 import uuid
 from datetime import UTC, datetime
@@ -24,11 +28,122 @@ from .dataset import (
 )
 
 
-def _calibrator_payload(model) -> dict[str, list[float]]:
+def _training_environment() -> dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        git_dirty = bool(
+            subprocess.check_output(
+                ["git", "-C", str(repo_root), "status", "--porcelain"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        git_commit = None
+        git_dirty = None
+    packages = {}
+    for distribution in ("catboost", "numpy", "pandas", "scikit-learn"):
+        try:
+            packages[distribution.replace("-", "_")] = importlib.metadata.version(
+                distribution
+            )
+        except importlib.metadata.PackageNotFoundError:
+            packages[distribution.replace("-", "_")] = None
+    runtime = os.getenv("XPDE_TRAINING_RUNTIME")
+    if not runtime:
+        runtime = (
+            "google-colab-cpu"
+            if os.getenv("COLAB_RELEASE_TAG")
+            else f"local-{platform.system().lower()}"
+        )
     return {
-        "x": [float(value) for value in model.X_thresholds_],
-        "y": [float(value) for value in model.y_thresholds_],
+        "training_git_commit": git_commit,
+        "training_git_dirty": git_dirty,
+        "python_version": platform.python_version(),
+        **packages,
+        "training_runtime": runtime,
     }
+
+
+def _apply_probability_calibrator(values, payload):
+    import numpy as np
+
+    array = np.asarray(values, dtype=float)
+    method = payload["method"]
+    if method == "isotonic":
+        return np.interp(array, payload["x"], payload["y"])
+    if method == "platt":
+        logits = array * float(payload["coefficient"]) + float(payload["intercept"])
+        return 1.0 / (1.0 + np.exp(-logits))
+    if method == "constant":
+        return np.repeat(float(payload["value"]), len(array))
+    raise ValueError(f"unsupported probability calibrator: {method}")
+
+
+def _select_probability_calibrator(
+    raw_probabilities,
+    truth,
+    *,
+    IsotonicRegression,
+    LogisticRegression,
+):
+    import numpy as np
+
+    raw = np.asarray(raw_probabilities, dtype=float)
+    labels = np.asarray(truth, dtype=int)
+    if len(raw) != len(labels) or len(raw) < 20:
+        raise ValueError("probability calibration requires at least 20 aligned samples")
+    if len(np.unique(labels)) < 2:
+        return {
+            "method": "constant",
+            "value": float(labels.mean()),
+            "selection_brier": 0.0,
+            "selection_samples": len(labels),
+        }
+
+    split = max(10, int(len(raw) * 0.70))
+    split = min(split, len(raw) - 10)
+    fit_raw, select_raw = raw[:split], raw[split:]
+    fit_truth, select_truth = labels[:split], labels[split:]
+    candidates: list[tuple[str, float]] = []
+
+    platt = LogisticRegression(random_state=42)
+    platt.fit(fit_raw.reshape(-1, 1), fit_truth)
+    platt_probability = platt.predict_proba(select_raw.reshape(-1, 1))[:, 1]
+    candidates.append(("platt", _brier(select_truth, platt_probability)))
+
+    if len(fit_raw) >= 500:
+        isotonic = IsotonicRegression(out_of_bounds="clip")
+        isotonic.fit(fit_raw, fit_truth)
+        candidates.append(
+            ("isotonic", _brier(select_truth, isotonic.predict(select_raw)))
+        )
+
+    selected_method, selection_brier = min(candidates, key=lambda item: item[1])
+    if selected_method == "isotonic":
+        selected = IsotonicRegression(out_of_bounds="clip").fit(raw, labels)
+        payload = {
+            "method": "isotonic",
+            "x": [float(value) for value in selected.X_thresholds_],
+            "y": [float(value) for value in selected.y_thresholds_],
+        }
+    else:
+        selected = LogisticRegression(random_state=42).fit(
+            raw.reshape(-1, 1), labels
+        )
+        payload = {
+            "method": "platt",
+            "coefficient": float(selected.coef_[0, 0]),
+            "intercept": float(selected.intercept_[0]),
+        }
+    payload["selection_brier"] = float(selection_brier)
+    payload["selection_samples"] = len(select_truth)
+    return payload
 
 
 def _pinball(y_true, y_pred, alpha: float) -> float:
@@ -44,6 +159,20 @@ def _brier(y_true, probabilities) -> float:
     return float(np.mean((probabilities - y_true) ** 2))
 
 
+def _fit_with_temporal_early_stopping(model, x, y):
+    split = int(len(x) * 0.90)
+    if split < 100 or len(x) - split < 50:
+        model.fit(x, y)
+        return model
+    model.fit(
+        x.iloc[:split],
+        y.iloc[:split],
+        eval_set=(x.iloc[split:], y.iloc[split:]),
+        use_best_model=True,
+    )
+    return model
+
+
 def _fit_classifier(CatBoostClassifier, x, y, iterations: int):
     model = CatBoostClassifier(
         loss_function="Logloss",
@@ -54,9 +183,10 @@ def _fit_classifier(CatBoostClassifier, x, y, iterations: int):
         random_seed=42,
         verbose=False,
         allow_writing_files=False,
+        od_type="Iter",
+        od_wait=max(10, min(50, iterations // 5)),
     )
-    model.fit(x, y.astype(int))
-    return model
+    return _fit_with_temporal_early_stopping(model, x, y.astype(int))
 
 
 def _fit_barrier_classifier(CatBoostClassifier, x, y, iterations: int):
@@ -69,9 +199,10 @@ def _fit_barrier_classifier(CatBoostClassifier, x, y, iterations: int):
         random_seed=42,
         verbose=False,
         allow_writing_files=False,
+        od_type="Iter",
+        od_wait=max(10, min(50, iterations // 5)),
     )
-    model.fit(x, y.astype(int))
-    return model
+    return _fit_with_temporal_early_stopping(model, x, y.astype(int))
 
 
 def _fit_excursion_model(
@@ -90,9 +221,10 @@ def _fit_excursion_model(
         random_seed=42,
         verbose=False,
         allow_writing_files=False,
+        od_type="Iter",
+        od_wait=max(10, min(50, iterations // 5)),
     )
-    model.fit(x, y)
-    return model
+    return _fit_with_temporal_early_stopping(model, x, y)
 
 
 def _temporal_partitions(size: int, purge_gap: int):
@@ -132,6 +264,7 @@ def train(args) -> dict[str, Any]:
         import pandas as pd
         from catboost import CatBoostClassifier, CatBoostRegressor
         from sklearn.isotonic import IsotonicRegression
+        from sklearn.linear_model import LogisticRegression
         from sklearn.model_selection import TimeSeriesSplit
     except ImportError as error:
         raise SystemExit("Install training extras: py -m pip install -e .[train]") from error
@@ -169,6 +302,15 @@ def train(args) -> dict[str, Any]:
         "mae_short_usd",
     ]
     dataset = frame.dropna(subset=required).reset_index(drop=True)
+    training_mode = getattr(args, "training_mode", "candidate")
+    minimum_candidate_rows = int(getattr(args, "minimum_candidate_rows", 20_000))
+    candidate_sample_ok = len(dataset) >= minimum_candidate_rows
+    if training_mode == "candidate" and not candidate_sample_ok:
+        raise ValueError(
+            f"candidate training requires at least {minimum_candidate_rows:,} "
+            f"fully labelled bars; got {len(dataset):,}. Use --training-mode smoke "
+            "only for pipeline verification."
+        )
     train_slice, calibration_slice, holdout_slice = _temporal_partitions(
         len(dataset),
         METADATA.purge_gap,
@@ -202,8 +344,14 @@ def train(args) -> dict[str, Any]:
                 random_seed=42 + fold,
                 verbose=False,
                 allow_writing_files=False,
+                od_type="Iter",
+                od_wait=max(10, min(50, args.iterations // 5)),
             )
-            fold_model.fit(evaluation_x.iloc[fit_indices], fold_target.iloc[fit_indices])
+            _fit_with_temporal_early_stopping(
+                fold_model,
+                evaluation_x.iloc[fit_indices],
+                fold_target.iloc[fit_indices],
+            )
             fold_prediction = np.asarray(
                 fold_model.predict(evaluation_x.iloc[validation_indices])
             )
@@ -243,8 +391,10 @@ def train(args) -> dict[str, Any]:
             random_seed=42,
             verbose=False,
             allow_writing_files=False,
+            od_type="Iter",
+            od_wait=max(10, min(50, args.iterations // 5)),
         )
-        model.fit(x_train, target.iloc[train_slice])
+        _fit_with_temporal_early_stopping(model, x_train, target.iloc[train_slice])
         calibration_prediction = postprocess_quantiles(
             np.asarray(model.predict(x_calibration))
         )
@@ -303,12 +453,16 @@ def train(args) -> dict[str, Any]:
         args.iterations,
     )
     direction_calibration_raw = direction_model.predict_proba(x_calibration)[:, 1]
-    direction_calibrator = IsotonicRegression(out_of_bounds="clip").fit(
+    direction_calibration = _select_probability_calibrator(
         direction_calibration_raw,
         dataset["direction_3"].iloc[calibration_slice],
+        IsotonicRegression=IsotonicRegression,
+        LogisticRegression=LogisticRegression,
     )
     direction_holdout_raw = direction_model.predict_proba(x_holdout)[:, 1]
-    direction_holdout = direction_calibrator.predict(direction_holdout_raw)
+    direction_holdout = _apply_probability_calibrator(
+        direction_holdout_raw, direction_calibration
+    )
     direction_truth = dataset["direction_3"].iloc[holdout_slice].to_numpy()
     direction_metrics = {
         "brier": _brier(direction_truth, direction_holdout),
@@ -343,14 +497,18 @@ def train(args) -> dict[str, Any]:
             side_calibration[list(FEATURE_COLUMNS)]
         )[:, tp_index]
         calibration_tp_truth = (side_calibration[label].to_numpy() == 0).astype(int)
-        calibrator = IsotonicRegression(out_of_bounds="clip").fit(
+        calibrator_payload = _select_probability_calibrator(
             raw_calibration,
             calibration_tp_truth,
+            IsotonicRegression=IsotonicRegression,
+            LogisticRegression=LogisticRegression,
         )
         raw_holdout = side_model.predict_proba(
             side_holdout[list(FEATURE_COLUMNS)]
         )[:, tp_index]
-        calibrated_holdout = calibrator.predict(raw_holdout)
+        calibrated_holdout = _apply_probability_calibrator(
+            raw_holdout, calibrator_payload
+        )
         holdout_tp_truth = (side_holdout[label].to_numpy() == 0).astype(int)
         train_tp_rate = float((side_train[label].to_numpy() == 0).mean())
         holdout_outcomes = dataset.iloc[holdout_slice][outcome_label]
@@ -379,7 +537,7 @@ def train(args) -> dict[str, Any]:
                 outcome_counts.get("AMBIGUOUS_SAME_BAR", 0) / labelled_count
             ),
         }
-        barrier_calibration[side] = _calibrator_payload(calibrator)
+        barrier_calibration[side] = calibrator_payload
         side_model.save_model(args.output / f"barrier_{side}_h3.cbm")
         barrier_models[side] = side_model
 
@@ -473,6 +631,8 @@ def train(args) -> dict[str, Any]:
     )
     calibration_sample_ok = len(x_calibration) >= 500 and len(x_holdout) >= 500
     eligibility_gates = {
+        "candidate_training_mode": training_mode == "candidate",
+        "minimum_candidate_rows": candidate_sample_ok,
         "dataset_integrity": dataset_integrity_ok,
         "mean_pinball_improvement": pinball_improvement >= 0.01,
         "h3_coverage": 0.74 <= coverage_h3 <= 0.86,
@@ -490,12 +650,14 @@ def train(args) -> dict[str, Any]:
     eligible = all(eligibility_gates.values())
     train_frame = dataset.iloc[train_slice]
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model_id": model_id,
         "status": "candidate",
         "eligible_for_shadow": eligible,
         "eligibility_gate_version": 2,
         "eligibility_gates": eligibility_gates,
+        "training_mode": training_mode,
+        "minimum_candidate_rows": minimum_candidate_rows,
         "feature_version": FEATURE_VERSION,
         "feature_columns": list(FEATURE_COLUMNS),
         "horizons": list(HORIZONS),
@@ -509,6 +671,7 @@ def train(args) -> dict[str, Any]:
         "quantiles": list(QUANTILES),
         "purge_gap": METADATA.purge_gap,
         "created_at": datetime.now(UTC).isoformat(),
+        "training_environment": _training_environment(),
         "source": str(args.bars_csv.resolve()),
         "source_dataset": {
             "sha256": source_sha256,
@@ -538,7 +701,7 @@ def train(args) -> dict[str, Any]:
         },
         "conformal_correction": conformal,
         "probability_calibration": {
-            "direction": _calibrator_payload(direction_calibrator),
+            "direction": direction_calibration,
             "barrier": barrier_calibration,
         },
         "feature_stats": {
@@ -647,6 +810,13 @@ def main() -> None:
     )
     parser.add_argument("--iterations", type=int, default=250)
     parser.add_argument("--folds", type=int, default=4)
+    parser.add_argument(
+        "--training-mode",
+        choices=("candidate", "smoke"),
+        default="candidate",
+        help="candidate enforces production sample gates; smoke only verifies the pipeline",
+    )
+    parser.add_argument("--minimum-candidate-rows", type=int, default=20_000)
     parser.add_argument(
         "--register-url",
         default="http://127.0.0.1:8787/api/v1/models/register",

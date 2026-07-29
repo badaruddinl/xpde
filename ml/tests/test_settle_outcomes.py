@@ -16,6 +16,7 @@ def proposal(
     invalidation_price: float | None,
 ) -> dict:
     return {
+        "profile": "SCALPER",
         "action": action,
         "target_price": target_price,
         "invalidation_price": invalidation_price,
@@ -29,28 +30,31 @@ def test_barrier_outcome_uses_first_actionable_proposal() -> None:
     ]
     bars = [{"high": 101.2, "low": 99.5, "close": 101.0}]
 
-    assert barrier_outcome(proposals, bars) == "TP_FIRST"
+    assert barrier_outcome("LONG", 101.0, 99.0, bars) == "TP_FIRST"
 
 
 def test_barrier_outcome_detects_short_stop_first() -> None:
     proposals = [proposal("SHORT", 99.0, 101.0)]
     bars = [{"high": 101.2, "low": 99.5, "close": 100.8}]
 
-    assert barrier_outcome(proposals, bars) == "SL_FIRST"
+    assert barrier_outcome("SHORT", 99.0, 101.0, bars) == "SL_FIRST"
 
 
 def test_barrier_outcome_keeps_same_bar_ambiguity_explicit() -> None:
     proposals = [proposal("LONG", 101.0, 99.0)]
     bars = [{"high": 101.2, "low": 98.8, "close": 100.2}]
 
-    assert barrier_outcome(proposals, bars) == "AMBIGUOUS_SAME_BAR"
+    assert (
+        barrier_outcome("LONG", 101.0, 99.0, bars)
+        == "AMBIGUOUS_SAME_BAR"
+    )
 
 
 def test_barrier_outcome_requires_directional_proposal() -> None:
     proposals = [proposal("NO_PREDICTION", None, None)]
     bars = [{"high": 102.0, "low": 98.0, "close": 101.0}]
 
-    assert barrier_outcome(proposals, bars) is None
+    assert barrier_outcome("WAIT", 101.0, 99.0, bars) is None
 
 
 def test_barrier_outcome_keeps_no_hit_before_expiry() -> None:
@@ -58,7 +62,7 @@ def test_barrier_outcome_keeps_no_hit_before_expiry() -> None:
     bars = [{"high": 100.8, "low": 99.4, "close": 100.2}]
 
     assert (
-        barrier_outcome(proposals, bars)
+        barrier_outcome("LONG", 101.0, 99.0, bars)
         == "NO_HIT_BEFORE_EXPIRY"
     )
 
@@ -104,6 +108,10 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
         "expected_mae_long": 1.0,
         "expected_mfe_short": 1.0,
         "expected_mae_short": 1.0,
+        "target_price_long": 101.0,
+        "stop_price_long": 99.0,
+        "target_price_short": 99.0,
+        "stop_price_short": 101.0,
         "points": [
             {
                 "horizon_bars": horizon,
@@ -170,10 +178,18 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
     ).isoformat()
     assert float(rows[1]["actual_return"]) == pytest.approx(math.log(103.0 / 100.0))
     assert rows[1]["barrier_outcome"] == "TP_FIRST"
+    assert rows[1]["barrier_long_outcome"] == "TP_FIRST"
+    assert rows[1]["barrier_short_outcome"] == "SL_FIRST"
     h1_metrics = json.loads(rows[0]["error_metrics_json"])
     h3_metrics = json.loads(rows[1]["error_metrics_json"])
     assert h1_metrics["mfe_error_usd"] is None
     assert h1_metrics["mae_error_usd"] is None
     assert h3_metrics["mfe_error_usd"] is not None
     assert h3_metrics["mae_error_usd"] is not None
+    proposal_rows = connection.execute(
+        "SELECT profile, action, barrier_outcome FROM prediction_proposal_outcomes"
+    ).fetchall()
+    assert [tuple(row) for row in proposal_rows] == [
+        ("SCALPER", "LONG", "TP_FIRST")
+    ]
     connection.close()

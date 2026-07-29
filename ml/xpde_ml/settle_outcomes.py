@@ -16,34 +16,22 @@ BARRIER_OUTCOMES = {
 
 
 def barrier_outcome(
-    proposals: list[dict],
+    action: str,
+    target: float,
+    stop: float,
     bars: list[sqlite3.Row | dict],
 ) -> str | None:
-    proposal = next(
-        (
-            item
-            for item in proposals
-            if item.get("action") in {"LONG", "SHORT"}
-            and item.get("invalidation_price") is not None
-            and item.get("target_price") is not None
-        ),
-        None,
-    )
-    if proposal is None:
+    if action not in {"LONG", "SHORT"}:
         return None
-
-    action = proposal["action"]
-    invalidation = float(proposal["invalidation_price"])
-    target = float(proposal["target_price"])
-    if not math.isfinite(invalidation) or not math.isfinite(target):
+    if not math.isfinite(stop) or not math.isfinite(target):
         return None
     for bar in bars:
         high = float(bar["high"])
         low = float(bar["low"])
         if action == "LONG":
-            tp_hit, sl_hit = high >= target, low <= invalidation
+            tp_hit, sl_hit = high >= target, low <= stop
         else:
-            tp_hit, sl_hit = low <= target, high >= invalidation
+            tp_hit, sl_hit = low <= target, high >= stop
         if tp_hit and sl_hit:
             return "AMBIGUOUS_SAME_BAR"
         if tp_hit:
@@ -67,6 +55,17 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE predictions ADD COLUMN {column} {definition}"
             )
+    outcome_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(prediction_horizon_outcomes)"
+        ).fetchall()
+    }
+    for column in ("barrier_long_outcome", "barrier_short_outcome"):
+        if outcome_columns and column not in outcome_columns:
+            connection.execute(
+                f"ALTER TABLE prediction_horizon_outcomes ADD COLUMN {column} TEXT"
+            )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS prediction_horizon_outcomes (
@@ -80,9 +79,26 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             interval_hit INTEGER NOT NULL,
             direction_hit INTEGER NOT NULL,
             barrier_outcome TEXT,
+            barrier_long_outcome TEXT,
+            barrier_short_outcome TEXT,
             error_metrics_json TEXT NOT NULL,
             settled_at TEXT NOT NULL,
             PRIMARY KEY(prediction_id, horizon_bars)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_proposal_outcomes (
+            prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+            profile TEXT NOT NULL,
+            horizon_bars INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            target_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            barrier_outcome TEXT NOT NULL,
+            settled_at TEXT NOT NULL,
+            PRIMARY KEY(prediction_id, profile, horizon_bars)
         )
         """
     )
@@ -157,11 +173,59 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 expected_mae = float(forecast["expected_mae_short"])
                 actual_mfe = max(0.0, origin_close - actual_low)
                 actual_mae = max(0.0, actual_high - origin_close)
-            barrier = (
-                barrier_outcome(proposals, bars)
-                if horizon == 3
-                else None
-            )
+            barrier_long = None
+            barrier_short = None
+            barrier = None
+            if horizon == 3:
+                barrier_long = barrier_outcome(
+                    "LONG",
+                    float(forecast["target_price_long"]),
+                    float(forecast["stop_price_long"]),
+                    bars,
+                )
+                barrier_short = barrier_outcome(
+                    "SHORT",
+                    float(forecast["target_price_short"]),
+                    float(forecast["stop_price_short"]),
+                    bars,
+                )
+                barrier = barrier_long if point["q50"] >= 0 else barrier_short
+                for proposal in proposals:
+                    action = str(proposal.get("action", ""))
+                    target_price = proposal.get("target_price")
+                    stop_price = proposal.get("invalidation_price")
+                    if (
+                        action not in {"LONG", "SHORT"}
+                        or target_price is None
+                        or stop_price is None
+                    ):
+                        continue
+                    proposal_outcome = barrier_outcome(
+                        action,
+                        float(target_price),
+                        float(stop_price),
+                        bars,
+                    )
+                    if proposal_outcome is None:
+                        continue
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO prediction_proposal_outcomes
+                        (prediction_id, profile, horizon_bars, action,
+                         target_price, stop_price, barrier_outcome, settled_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            prediction["prediction_id"],
+                            proposal["profile"],
+                            horizon,
+                            action,
+                            float(target_price),
+                            float(stop_price),
+                            proposal_outcome,
+                            now,
+                        ),
+                    )
             metrics = {
                 "median_error": abs(actual_return - point["q50"]),
                 "interval_miss": not bool(interval_hit),
@@ -175,8 +239,9 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 (prediction_id, horizon_bars, origin_bar_timestamp,
                  outcome_bar_timestamp, actual_return, actual_high, actual_low,
                  interval_hit, direction_hit, barrier_outcome,
+                 barrier_long_outcome, barrier_short_outcome,
                  error_metrics_json, settled_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     prediction["prediction_id"],
@@ -189,6 +254,8 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                     interval_hit,
                     direction_hit,
                     barrier,
+                    barrier_long,
+                    barrier_short,
                     json.dumps(metrics),
                     now,
                 ),

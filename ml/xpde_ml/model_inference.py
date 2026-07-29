@@ -37,10 +37,21 @@ def verify_artifact_checksums(artifact_dir: Path) -> None:
             raise ValueError(f"artifact checksum mismatch: {filename}")
 
 
-def _calibrate_probability(value: float, calibration: dict[str, list[float]]) -> float:
+def _calibrate_probability(value: float, calibration: dict[str, Any]) -> float:
     import numpy as np
 
-    return float(np.interp(value, calibration["x"], calibration["y"]))
+    method = calibration.get("method", "isotonic")
+    if method == "isotonic":
+        return float(np.interp(value, calibration["x"], calibration["y"]))
+    if method == "platt":
+        logit = (
+            value * float(calibration["coefficient"])
+            + float(calibration["intercept"])
+        )
+        return float(1.0 / (1.0 + np.exp(-logit)))
+    if method == "constant":
+        return float(calibration["value"])
+    raise ValueError(f"unsupported probability calibrator: {method}")
 
 
 class CandidateModel:
@@ -63,6 +74,13 @@ class CandidateModel:
             raise ValueError("artifact feature version is incompatible")
         if tuple(self.manifest["feature_columns"]) != FEATURE_COLUMNS:
             raise ValueError("artifact feature columns are incompatible")
+        if int(self.manifest["schema_version"]) >= 3:
+            barrier_spec = self.manifest.get("barrier_spec", {})
+            if (
+                barrier_spec.get("id") != BARRIER_SPEC_ID
+                or int(barrier_spec.get("horizon_bars", 0)) != BARRIER_HORIZON
+            ):
+                raise ValueError("artifact barrier contract is incompatible")
         self.quantile_models = {}
         for horizon in HORIZONS:
             model = catboost.CatBoostRegressor()

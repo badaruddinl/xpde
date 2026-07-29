@@ -321,6 +321,15 @@ pub fn decide(
     forecast: &ForecastEnvelope,
     policy: &DecisionPolicy,
 ) -> DecisionProposal {
+    decide_at(snapshot, forecast, policy, snapshot.timestamp)
+}
+
+pub fn decide_at(
+    snapshot: &MarketSnapshot,
+    forecast: &ForecastEnvelope,
+    policy: &DecisionPolicy,
+    decision_time: DateTime<Utc>,
+) -> DecisionProposal {
     let generated_at = forecast.generated_at;
     let fallback_valid_until = generated_at + chrono::Duration::minutes(M5_BAR_MINUTES);
     let fallback_matures_at = generated_at
@@ -372,7 +381,7 @@ pub fn decide(
             outcome_matures_at,
         );
     }
-    if Utc::now() > decision_valid_until {
+    if decision_time > decision_valid_until {
         return no_prediction("FORECAST_EXPIRED", decision_valid_until, outcome_matures_at);
     }
     let horizon = forecast
@@ -510,6 +519,11 @@ pub fn decide(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HumanFeedback {
     pub prediction_id: Uuid,
+    pub profile: TradingProfile,
+    pub proposal_action: DecisionAction,
+    pub model_id: String,
+    pub forecast_side: DecisionAction,
+    pub selected_reason: Option<String>,
     pub verdict: FeedbackVerdict,
     pub reason_codes: Vec<String>,
     pub note: Option<String>,
@@ -751,5 +765,27 @@ mod tests {
                 .reason_codes
                 .contains(&"FORECAST_SIDE_CONFLICT".to_owned())
         );
+    }
+
+    #[test]
+    fn python_v3_forecast_fixture_deserializes_and_matches_golden_decision() {
+        let forecast: ForecastEnvelope =
+            serde_json::from_str(include_str!("../../../tests/fixtures/forecast-v3.json"))
+                .expect("Python golden forecast must deserialize");
+        forecast.validate().expect("golden forecast must validate");
+        let mut snapshot = sample_snapshot();
+        snapshot.timestamp = forecast.origin_bar_timestamp + chrono::Duration::minutes(6);
+        for (index, bar) in snapshot.bars.iter_mut().enumerate() {
+            bar.timestamp =
+                forecast.origin_bar_timestamp - chrono::Duration::minutes(index as i64 * 5);
+            bar.close = forecast.origin_close;
+            bar.open = forecast.origin_close;
+            bar.high = forecast.origin_close + 1.0;
+            bar.low = forecast.origin_close - 1.0;
+        }
+        let proposal = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+        assert_eq!(proposal.action, DecisionAction::Long);
+        assert_eq!(proposal.target_price, Some(forecast.target_price_long));
+        assert_eq!(proposal.invalidation_price, Some(forecast.stop_price_long));
     }
 }
