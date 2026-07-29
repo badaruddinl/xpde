@@ -5,11 +5,22 @@ use uuid::Uuid;
 
 pub const SUPPORTED_SYMBOL: &str = "GOLDm#";
 pub const SUPPORTED_TIMEFRAME: &str = "M5";
-pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v5";
+pub const FEATURE_VERSION_ID: &str = "goldm-m5-v5";
+pub const LABEL_CONTRACT_ID: &str = "exact-contiguous-m5-horizons-v1";
+pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-tick-aligned-v6";
 pub const EXECUTABLE_SIDE_CONTRACT_ID: &str =
-    "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4";
+    "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5";
+pub const MINIMUM_EXECUTABLE_TICK_COVERAGE: f64 = 0.95;
 pub const BARRIER_HORIZON_BARS: u32 = 3;
 pub const M5_BAR_MINUTES: i64 = 5;
+
+pub fn is_price_tick_aligned(price: f64, tick_size: f64) -> bool {
+    if !price.is_finite() || !tick_size.is_finite() || price <= 0.0 || tick_size <= 0.0 {
+        return false;
+    }
+    let ticks = price / tick_size;
+    (ticks - ticks.round()).abs() <= 1e-7
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketBar {
@@ -476,6 +487,9 @@ pub struct ForecastEnvelope {
     pub prediction_id: Uuid,
     pub model_id: String,
     pub feature_version: String,
+    pub label_contract_id: String,
+    pub probability_reference: String,
+    pub entry_conditioned_probability: bool,
     pub origin_bar_timestamp: DateTime<Utc>,
     pub origin_close: f64,
     pub origin_bar_index: i64,
@@ -529,7 +543,11 @@ impl ForecastEnvelope {
         {
             return Err(ContractError::InvalidExcursion);
         }
-        if self.barrier_spec_id != BARRIER_SPEC_ID
+        if self.feature_version != FEATURE_VERSION_ID
+            || self.label_contract_id != LABEL_CONTRACT_ID
+            || self.probability_reference != "FORECAST_ORIGIN"
+            || self.entry_conditioned_probability
+            || self.barrier_spec_id != BARRIER_SPEC_ID
             || self.barrier_horizon_bars != BARRIER_HORIZON_BARS
             || self.stop_price_long >= self.origin_close
             || self.target_price_long <= self.origin_close
@@ -1360,7 +1378,10 @@ mod tests {
         ForecastEnvelope {
             prediction_id: Uuid::new_v4(),
             model_id: "baseline-v1".to_owned(),
-            feature_version: "m5-v1".to_owned(),
+            feature_version: FEATURE_VERSION_ID.to_owned(),
+            label_contract_id: LABEL_CONTRACT_ID.to_owned(),
+            probability_reference: "FORECAST_ORIGIN".to_owned(),
+            entry_conditioned_probability: false,
             origin_bar_timestamp: sample_snapshot().bars[0].timestamp,
             origin_close: 3330.5,
             origin_bar_index: sample_snapshot().bars[0]
@@ -1643,6 +1664,30 @@ mod tests {
         bar.executable_tick_count = 95;
         assert!(bar.has_complete_tick_coverage(0.95));
         assert!(!bar.has_complete_tick_coverage(f64::NAN));
+    }
+
+    #[test]
+    fn broker_tick_alignment_rejects_fractional_ticks() {
+        assert!(is_price_tick_aligned(3330.50, 0.01));
+        assert!(is_price_tick_aligned(3330.505, 0.001));
+        assert!(!is_price_tick_aligned(3330.505, 0.01));
+        assert!(!is_price_tick_aligned(3330.50, 0.0));
+    }
+
+    #[test]
+    fn forecast_contract_rejects_entry_conditioned_probability_claim() {
+        let mut forecast = sample_forecast();
+        forecast.entry_conditioned_probability = true;
+        assert!(matches!(
+            forecast.validate(),
+            Err(ContractError::InvalidBarrierContract)
+        ));
+        forecast.entry_conditioned_probability = false;
+        forecast.probability_reference = "CURRENT_ENTRY".to_owned();
+        assert!(matches!(
+            forecast.validate(),
+            Err(ContractError::InvalidBarrierContract)
+        ));
     }
 
     #[test]

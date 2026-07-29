@@ -25,6 +25,7 @@ expected_exit_spread_usd = 0.34
 
 [model_health]
 minimum_settled_predictions = 100
+minimum_settlement_completeness_rate = 0.98
 minimum_interval_coverage = 0.70
 maximum_interval_coverage = 0.90
 maximum_direction_brier = 0.26

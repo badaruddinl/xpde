@@ -198,6 +198,21 @@ spread features use exact `ask_close - bid_close` plus rolling median/q75/q90
 and spread/ATR. Existing artifacts from the previous feature or barrier
 contract must be retired and retrained.
 
+The active model contract is `goldm-m5-v5` with
+`exact-contiguous-m5-horizons-v1`. Labels for H1/H3/H6/H12 are masked unless
+every intervening timestamp is exactly five minutes apart, so weekend and
+maintenance gaps cannot become synthetic short-horizon returns. H3 barrier and
+MFE/MAE labels use the same continuity rule. TP/SL levels are snapped outward
+to the broker tick size, and the artifact records the immutable tick size used
+for training.
+
+Live health reports both fully-settled metrics and the completeness of the most
+recent 200 predictions whose H12 horizon is due. A model cannot become healthy
+unless at least 98% of that due cohort has all four price outcomes and both H3
+barrier outcomes. Completed and current live bars must meet the same 95% tick
+coverage contract; a valid-looking partial path remains incomplete and can
+never become `NO_HIT_BEFORE_EXPIRY`.
+
 The backfill command treats the fetched MT5 window as authoritative and replaces
 the local `GOLDm#`/M5 bar cache before importing chunks. Use `--append` only when
 an intentional incremental import is required. Every export also creates a

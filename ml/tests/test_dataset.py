@@ -44,6 +44,7 @@ def test_training_features_are_causal_and_labels_use_future_bars() -> None:
                 "ask_low": price - 0.06,
                 "ask_close": close + 0.24,
                 "chart_mode": "BID",
+                "tick_size": 0.01,
             }
         )
         price = close
@@ -56,8 +57,8 @@ def test_training_features_are_causal_and_labels_use_future_bars() -> None:
     assert {
         "barrier_long_outcome",
         "barrier_short_outcome",
-        "mfe_long_usd",
-        "mae_short_usd",
+        "mfe_long_price_distance",
+        "mae_short_price_distance",
     }.issubset(result.columns)
 
 
@@ -70,7 +71,10 @@ def test_barrier_labels_keep_no_hit_and_report_same_bar_ambiguity() -> None:
         {"close": 100.0, "high": 100.3, "low": 99.7, "atr_24": 1.0},
         {"close": 100.0, "high": 100.4, "low": 99.6, "atr_24": 1.0},
     ]
-    for row in rows:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    for index, row in enumerate(rows):
+        row["timestamp"] = start + timedelta(minutes=5 * index)
+        row["tick_size"] = 0.01
         for field in ("open", "high", "low", "close"):
             value = row.get(field, row["close"])
             row[f"bid_{field}"] = value
@@ -92,7 +96,7 @@ def test_barrier_labels_keep_no_hit_and_report_same_bar_ambiguity() -> None:
 
 
 def test_barrier_contract_and_quantile_postprocessing_are_explicit() -> None:
-    prices = barrier_prices(100.0, 2.0)
+    prices = barrier_prices(100.0, 2.0, 0.01)
     assert prices == {
         "target_price_long": 102.5,
         "stop_price_long": 98.0,
@@ -112,7 +116,10 @@ def test_tick_sequence_resolves_same_bar_first_touch() -> None:
         {"close": 100.0, "high": 100.2, "low": 99.8, "atr_24": 1.0},
         {"close": 100.0, "high": 100.2, "low": 99.8, "atr_24": 1.0},
     ]
+    start = datetime(2026, 1, 1, tzinfo=UTC)
     for index, row in enumerate(rows):
+        row["timestamp"] = start + timedelta(minutes=5 * index)
+        row["tick_size"] = 0.01
         for field in ("open", "high", "low", "close"):
             value = row.get(field, row["close"])
             row[f"bid_{field}"] = value
@@ -128,3 +135,63 @@ def test_tick_sequence_resolves_same_bar_first_touch() -> None:
     labelled = add_objective_labels(pd.DataFrame(rows))
     assert labelled.loc[0, "barrier_long_outcome"] == "TP_FIRST"
     assert labelled.loc[0, "barrier_long_first_touch_time_msc"] == 302_000
+
+
+@pytest.mark.parametrize(
+    "gap_after_minutes",
+    [15, 60 * 48],
+)
+def test_labels_do_not_cross_maintenance_or_weekend_gap(
+    gap_after_minutes: int,
+) -> None:
+    import pandas as pd
+
+    start = datetime(2026, 1, 2, 22, 50, tzinfo=UTC)
+    timestamps = [
+        start,
+        start + timedelta(minutes=5),
+        start + timedelta(minutes=gap_after_minutes),
+        start + timedelta(minutes=gap_after_minutes + 5),
+        start + timedelta(minutes=gap_after_minutes + 10),
+    ]
+    rows = []
+    for index, timestamp in enumerate(timestamps):
+        price = 100.0 + index * 0.1
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "open": price,
+                "high": price + 0.2,
+                "low": price - 0.2,
+                "close": price,
+                "tick_volume": 100,
+                "atr_24": 1.0,
+                "bid_open": price,
+                "bid_high": price + 0.2,
+                "bid_low": price - 0.2,
+                "bid_close": price,
+                "ask_open": price + 0.24,
+                "ask_high": price + 0.44,
+                "ask_low": price + 0.04,
+                "ask_close": price + 0.24,
+                "chart_mode": "BID",
+                "tick_size": 0.01,
+            }
+        )
+
+    labelled = add_objective_labels(pd.DataFrame(rows))
+
+    assert pd.isna(labelled.loc[0, "target_3"])
+    assert pd.isna(labelled.loc[1, "target_1"])
+    assert pd.isna(labelled.loc[0, "barrier_long_class"])
+    assert pd.isna(labelled.loc[0, "mfe_long_price_distance"])
+
+
+def test_barrier_prices_snap_outward_to_broker_tick() -> None:
+    prices = barrier_prices(100.003, 0.017, 0.01)
+    assert prices == {
+        "target_price_long": 100.03,
+        "stop_price_long": 99.98,
+        "target_price_short": 99.98,
+        "stop_price_short": 100.02,
+    }

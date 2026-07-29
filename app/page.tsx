@@ -112,6 +112,7 @@ interface DashboardState {
       volume_step: number;
       tick_size: number;
       tick_value: number;
+      digits: number;
       margin_per_lot_buy?: number | null;
       margin_per_lot_sell?: number | null;
       chart_mode: "BID" | "LAST" | "UNKNOWN";
@@ -142,6 +143,9 @@ interface DashboardState {
     prediction_id: string;
     model_id: string;
     feature_version: string;
+    label_contract_id: string;
+    probability_reference: "FORECAST_ORIGIN";
+    entry_conditioned_probability: false;
     origin_bar_timestamp: string;
     origin_close: number;
     origin_bar_index: number;
@@ -180,6 +184,12 @@ interface DashboardState {
     barrier_baseline_brier: number | null;
     barrier_ece: number | null;
     mae_q90_coverage: number | null;
+    generated_predictions: number;
+    price_outcomes_settled: number;
+    barrier_outcomes_settled: number;
+    tick_path_incomplete: number;
+    session_interrupted: number;
+    settlement_completeness_rate: number | null;
     reason_codes: string[];
     checks?: {
       code: string;
@@ -253,6 +263,15 @@ interface EvaluationSummary {
     brier_score: number;
   }>;
   barrier_expected_calibration_error: number | null;
+  settlement_completeness: {
+    generated_predictions: number;
+    price_outcomes_settled: number;
+    barrier_outcomes_settled: number;
+    tick_path_incomplete: number;
+    session_interrupted: number;
+    fully_settled: number;
+    settlement_completeness_rate: number | null;
+  };
   target_coverage: number;
   current_model_window: number;
   updated_at: string;
@@ -325,6 +344,7 @@ function buildDemoState(): DashboardState {
         volume_step: 0.1,
         tick_size: 0.01,
         tick_value: 0.01,
+        digits: 2,
         margin_per_lot_buy: 3.34,
         margin_per_lot_sell: 3.34,
         chart_mode: "BID",
@@ -343,7 +363,10 @@ function buildDemoState(): DashboardState {
     forecast: {
       prediction_id: predictionId,
       model_id: "baseline-demo-v1",
-      feature_version: "goldm-m5-v4",
+      feature_version: "goldm-m5-v5",
+      label_contract_id: "exact-contiguous-m5-horizons-v1",
+      probability_reference: "FORECAST_ORIGIN",
+      entry_conditioned_probability: false,
       origin_bar_timestamp: bars[bars.length - 1].timestamp,
       origin_close: bars[bars.length - 1].close,
       origin_bar_index: Math.floor(
@@ -353,7 +376,7 @@ function buildDemoState(): DashboardState {
       direction_probability_up: 0.57,
       barrier_probability_long: 0.54,
       barrier_probability_short: 0.46,
-      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v5",
+      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-tick-aligned-v6",
       barrier_horizon_bars: 3,
       target_price_long: bars[bars.length - 1].close + 1.25,
       stop_price_long: bars[bars.length - 1].close - 1,
@@ -448,6 +471,12 @@ function buildDemoState(): DashboardState {
       barrier_baseline_brier: null,
       barrier_ece: null,
       mae_q90_coverage: null,
+      generated_predictions: 0,
+      price_outcomes_settled: 0,
+      barrier_outcomes_settled: 0,
+      tick_path_incomplete: 0,
+      session_interrupted: 0,
+      settlement_completeness_rate: null,
       reason_codes: ["MODEL_LIVE_HEALTH_WARMING_UP"],
     },
     safety: {
@@ -469,6 +498,10 @@ function money(value: number, digits = 2, currency = "USD") {
 
 function percent(value: number, digits = 1) {
   return `${(value * 100).toFixed(digits)}%`;
+}
+
+function formatPrice(value: number, digits: number) {
+  return value.toFixed(Math.max(0, Math.min(8, digits)));
 }
 
 function time(value: string | null | undefined) {
@@ -523,6 +556,9 @@ function reasonLabel(reason: string) {
     HORIZON_CROSSES_MARKET_CLOSE: "Horizon melewati penutupan atau maintenance market",
     TICK_PATH_INCOMPLETE: "Urutan tick horizon belum lengkap",
     SESSION_INTERRUPTED: "Sesi market terputus sebelum horizon selesai",
+    EXECUTABLE_TICK_COVERAGE_INCOMPLETE: "Coverage tick executable completed bar di bawah 95%",
+    CURRENT_EXECUTABLE_TICK_COVERAGE_INCOMPLETE: "Coverage tick executable current bar di bawah 95%",
+    LIVE_SETTLEMENT_COMPLETENESS_OUTSIDE_GATE: "Settlement completeness di bawah batas 98%",
     BROKER_STOPS_LEVEL_VIOLATION: "Target atau stop melanggar minimum stops broker",
     BROKER_LONG_ONLY: "Broker hanya mengizinkan entry LONG",
     BROKER_SHORT_ONLY: "Broker hanya mengizinkan entry SHORT",
@@ -629,6 +665,7 @@ export default function Home() {
   }, []);
 
   const proposal = state.proposals.find((item) => item.profile === profile) ?? state.proposals[0];
+  const priceDigits = state.snapshot.symbol_spec.digits;
   const activeEvaluation = evaluation?.current_model ?? null;
   const sessionEvaluation = evaluation?.current_session ?? null;
   const activeProposalEvaluation =
@@ -922,27 +959,27 @@ export default function Home() {
           <strong>
             {proposal.reference_entry_price === null
               ? "—"
-              : `${proposal.reference_entry_price.toFixed(2)} · ${money(proposal.remaining_reward_account, 2, proposal.account_currency || state.snapshot.account.currency)} / ${money(proposal.remaining_risk_account, 2, proposal.account_currency || state.snapshot.account.currency)}`}
+              : `${formatPrice(proposal.reference_entry_price, priceDigits)} · ${money(proposal.remaining_reward_account, 2, proposal.account_currency || state.snapshot.account.currency)} / ${money(proposal.remaining_risk_account, 2, proposal.account_currency || state.snapshot.account.currency)}`}
           </strong>
         </div>
         <div><span>Reward / risk tersisa</span><strong>{proposal.reward_risk_ratio.toFixed(2)}×</strong></div>
         <div>
-          <span>Model MFE / MAE · {forecastSide}</span>
+          <span>Origin-horizon MFE / MAE · price distance · {forecastSide}</span>
           <strong>
             {state.forecast.excursion_modelled
-              ? `${expectedMfe.toFixed(2)} / ${expectedMae.toFixed(2)}`
+              ? `${formatPrice(expectedMfe, priceDigits)} / ${formatPrice(expectedMae, priceDigits)}`
               : "Belum tersedia"}
           </strong>
         </div>
         <div>
           <span>Barrier TP / SL · {forecastSide}</span>
-          <strong>{barrierTarget.toFixed(2)} / {barrierStop.toFixed(2)}</strong>
+          <strong>{formatPrice(barrierTarget, priceDigits)} / {formatPrice(barrierStop, priceDigits)}</strong>
         </div>
         <div>
           <span>Cost model · {proposal.cost_model_id}</span>
           <strong>
-            spread {proposal.entry_spread.toFixed(2)} → {proposal.expected_exit_spread.toFixed(2)}
-            {" · "}slip {proposal.slippage_assumption.toFixed(2)}
+            spread {formatPrice(proposal.entry_spread, priceDigits)} → {formatPrice(proposal.expected_exit_spread, priceDigits)}
+            {" · "}slip {formatPrice(proposal.slippage_assumption, priceDigits)}
           </strong>
         </div>
         <div>
@@ -1008,9 +1045,9 @@ export default function Home() {
           <span className="symbol">{state.snapshot.symbol}</span>
           <span className="timeframe">{state.snapshot.timeframe}</span>
           <span className="quote">
-            {state.snapshot.bid.toFixed(2)}
+            {formatPrice(state.snapshot.bid, priceDigits)}
             <i />
-            {state.snapshot.ask.toFixed(2)}
+            {formatPrice(state.snapshot.ask, priceDigits)}
           </span>
         </div>
         <div className="connection">
@@ -1074,8 +1111,8 @@ export default function Home() {
             </div>
 
             <div className="chart-meta">
-              <div><span>Last live</span><strong>{lastPrice.toFixed(2)}</strong></div>
-              <div><span>Spread aktual</span><strong>{spread.toFixed(2)} {state.snapshot.symbol_spec.quote_currency}</strong></div>
+              <div><span>Last live</span><strong>{formatPrice(lastPrice, priceDigits)}</strong></div>
+              <div><span>Spread aktual</span><strong>{formatPrice(spread, priceDigits)} {state.snapshot.symbol_spec.quote_currency}</strong></div>
               <div><span>Keputusan valid</span><strong>{time(proposal.decision_valid_until)} UTC</strong></div>
               <div><span>Outcome matang</span><strong>{time(proposal.outcome_matures_at)} UTC</strong></div>
               <div><span>Model</span><strong>{state.forecast.model_id}</strong></div>
@@ -1101,9 +1138,9 @@ export default function Home() {
                 </div>
               ) : null}
               <div className="price-axis">
-                <span>{maxPrice.toFixed(2)}</span>
-                <span>{((maxPrice + minPrice) / 2).toFixed(2)}</span>
-                <span>{minPrice.toFixed(2)}</span>
+                <span>{formatPrice(maxPrice, priceDigits)}</span>
+                <span>{formatPrice((maxPrice + minPrice) / 2, priceDigits)}</span>
+                <span>{formatPrice(minPrice, priceDigits)}</span>
               </div>
               <div className="grid-lines" aria-hidden="true"><i /><i /><i /><i /></div>
               <div className="candles">
@@ -1133,13 +1170,13 @@ export default function Home() {
                   className="barrier-reference target"
                   style={{ top: `${((maxPrice - barrierTarget) / range) * 100}%` }}
                 >
-                  <span>TP {barrierTarget.toFixed(2)}</span>
+                  <span>TP {formatPrice(barrierTarget, priceDigits)}</span>
                 </div>
                 <div
                   className="barrier-reference stop"
                   style={{ top: `${((maxPrice - barrierStop) / range) * 100}%` }}
                 >
-                  <span>SL {barrierStop.toFixed(2)}</span>
+                  <span>SL {formatPrice(barrierStop, priceDigits)}</span>
                 </div>
                 {state.forecast.points.map((point) => {
                   const upper = state.forecast.origin_close * Math.exp(point.q90);
@@ -1205,10 +1242,10 @@ export default function Home() {
               <small className="direction-summary">{forecastIsStale ? "Forecast stale — bukan sinyal" : directionSummary}</small>
             </article>
             <article className="panel metric">
-              <span>TP before invalidation · {forecastSide} · 3 bar</span>
+              <span>Origin forecast P(TP-first) · {forecastSide} · H3</span>
               <strong>{forecastIsStale ? "—" : percent(barrierProbability)}</strong>
               <div className="meter amber"><i style={{ width: forecastIsStale ? "0%" : percent(barrierProbability) }} /></div>
-              <small>{forecastIsStale ? "Forecast stale — bukan sinyal" : "Gate Sniper 60% · sisi harus konsisten"}</small>
+              <small>{forecastIsStale ? "Forecast stale — bukan sinyal" : "Tidak dikondisikan ulang terhadap current entry · gate Sniper 60%"}</small>
             </article>
             <article className="panel metric">
               <span>Offline holdout coverage</span>
@@ -1219,7 +1256,7 @@ export default function Home() {
               </small>
             </article>
             <article className="panel metric">
-              <span>Live coverage · 200 prediksi terakhir</span>
+              <span>Live coverage · fully-settled predictions</span>
               <strong>{liveCoverage === null ? "—" : percent(liveCoverage)}</strong>
               <div className="meter coverage">
                 <i style={{ width: liveCoverage === null ? "0%" : percent(liveCoverage) }} />
@@ -1311,6 +1348,18 @@ export default function Home() {
             <div className="gate-row"><span><i className={state.forecast.drift_detected ? "bad" : "ok"} /> Drift detector</span><strong>{state.forecast.drift_detected ? "Detected" : "Clear"}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Live direction Brier</span><strong>{activeEvaluation?.direction_brier?.toFixed(4) ?? "—"}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Barrier calibration ECE</span><strong>{evaluation?.barrier_expected_calibration_error === null || evaluation?.barrier_expected_calibration_error === undefined ? "—" : percent(evaluation.barrier_expected_calibration_error)}</strong></div>
+            <div className="gate-row">
+              <span><i className={state.model_health.settlement_completeness_rate === null ? "warn" : state.model_health.settlement_completeness_rate >= 0.98 ? "ok" : "bad"} /> Settlement completeness</span>
+              <strong>
+                {state.model_health.settlement_completeness_rate === null
+                  ? "—"
+                  : `${percent(state.model_health.settlement_completeness_rate)} · ${state.model_health.barrier_outcomes_settled}/${state.model_health.generated_predictions}`}
+              </strong>
+            </div>
+            <div className="gate-row health-detail">
+              <span><i className="warn" /> Incomplete / interrupted</span>
+              <strong>{state.model_health.tick_path_incomplete} / {state.model_health.session_interrupted}</strong>
+            </div>
             <div className="gate-row">
               <span>
                 <i className={state.model_health.status === "HEALTHY" ? "ok" : state.model_health.status === "WARMING_UP" ? "warn" : "bad"} />

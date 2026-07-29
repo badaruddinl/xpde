@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import fmean
 from typing import Any
@@ -21,6 +21,7 @@ from .dataset import (
     BARRIER_HORIZON,
     BARRIER_SPEC_ID,
     FEATURE_VERSION,
+    LABEL_CONTRACT_ID,
     barrier_prices,
 )
 from .features import log_returns, true_ranges
@@ -44,6 +45,11 @@ def forward_returns(bars: list[Bar], horizon: int) -> list[float]:
         math.log(bars[index + horizon].close / bars[index].close)
         for index in range(len(bars) - horizon)
         if bars[index].close > 0 and bars[index + horizon].close > 0
+        and all(
+            bars[index + step].timestamp
+            == bars[index].timestamp + timedelta(minutes=5 * step)
+            for step in range(1, horizon + 1)
+        )
     ]
 
 
@@ -91,7 +97,11 @@ def forecast_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     ranges = true_ranges(bars)[-48:]
     expected_range = fmean(ranges)
     atr_24 = fmean(true_ranges(bars)[-24:])
-    barriers = barrier_prices(bars[-1].close, atr_24)
+    barriers = barrier_prices(
+        bars[-1].close,
+        atr_24,
+        float(snapshot["symbol_spec"]["tick_size"]),
+    )
     previous_returns = returns[: max(1, len(returns) - 48)][-96:]
     recent_returns = returns[-48:]
     previous_mean_abs = fmean(abs(value) for value in previous_returns)
@@ -110,9 +120,13 @@ def forecast_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             origin_bar_timestamp=origin.timestamp.isoformat().replace("+00:00", "Z"),
             feature_version=FEATURE_VERSION,
             barrier_spec_id=BARRIER_SPEC_ID,
+            label_contract_id=LABEL_CONTRACT_ID,
         ),
         "model_id": "empirical-direct-baseline-v1",
         "feature_version": FEATURE_VERSION,
+        "label_contract_id": LABEL_CONTRACT_ID,
+        "probability_reference": "FORECAST_ORIGIN",
+        "entry_conditioned_probability": False,
         "origin_bar_timestamp": origin.timestamp.isoformat().replace("+00:00", "Z"),
         "origin_close": origin.close,
         "origin_bar_index": origin_bar_index,

@@ -132,8 +132,12 @@ if ($existingBridge) {
             [int]$manifest.schema_version -eq 3 -and
             [int]$manifest.eligibility_gate_version -ge 3 -and
             $manifest.training_mode -eq "candidate" -and
-            $manifest.barrier_spec.id -eq "atr-1.25tp-1.00sl-h3-executable-v5" -and
-            $manifest.executable_side_contract.id -eq "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4" -and
+            $manifest.feature_version -eq "goldm-m5-v5" -and
+            $manifest.label_contract_id -eq "exact-contiguous-m5-horizons-v1" -and
+            $manifest.barrier_spec.id -eq "atr-1.25tp-1.00sl-h3-executable-tick-aligned-v6" -and
+            $manifest.barrier_spec.price_alignment -eq "BROKER_TICK_SIZE_OUTWARD" -and
+            [double]$manifest.barrier_spec.tick_size -gt 0 -and
+            $manifest.executable_side_contract.id -eq "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5" -and
             [int]$manifest.barrier_spec.horizon_bars -eq 3 -and
             $allGatesPassed -and
             $hasRequiredFiles

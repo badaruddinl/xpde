@@ -28,6 +28,20 @@ from .time_utils import BrokerClock, environment_integer
 SYMBOL = "GOLDm#"
 TIMEFRAME = "M5"
 MAX_TICK_AGE_MS = 10_000
+MINIMUM_EXECUTABLE_TICK_COVERAGE = 0.95
+
+
+def has_complete_tick_coverage(
+    bar: dict[str, Any], minimum_ratio: float = MINIMUM_EXECUTABLE_TICK_COVERAGE
+) -> bool:
+    tick_volume = float(bar.get("tick_volume", 0.0))
+    executable_count = int(bar.get("executable_tick_count", 0))
+    return (
+        0.0 <= minimum_ratio <= 1.0
+        and tick_volume > 0.0
+        and executable_count > 0
+        and executable_count / tick_volume >= minimum_ratio
+    )
 MAX_FORECAST_GENERATION_DELAY_MS = 10_000
 
 
@@ -357,6 +371,8 @@ def build_snapshot(
         or not bars[-1].get("executable_tick_path")
     ):
         missing_flags.append("EXECUTABLE_TICK_PATH_MISSING")
+    if bars and not has_complete_tick_coverage(bars[-1]):
+        missing_flags.append("EXECUTABLE_TICK_COVERAGE_INCOMPLETE")
     current_bar = None
     if current_rates is not None and len(current_rates) == 1:
         rate = current_rates[0]
@@ -377,6 +393,8 @@ def build_snapshot(
         or not current_bar.get("executable_tick_path")
     ):
         missing_flags.append("CURRENT_EXECUTABLE_TICK_PATH_MISSING")
+    if current_bar is not None and not has_complete_tick_coverage(current_bar):
+        missing_flags.append("CURRENT_EXECUTABLE_TICK_COVERAGE_INCOMPLETE")
 
     return {
         "symbol": SYMBOL,

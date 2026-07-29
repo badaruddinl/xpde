@@ -14,6 +14,7 @@ from typing import Any
 from .mt5_bridge import SYMBOL, TIMEFRAME, initialize_mt5, load_local_env
 from .backfill_transport import post_backfill_payloads
 from .dataset_files import dataset_manifest_path
+from .dataset import LABEL_CONTRACT_ID
 from .executable_bars import (
     collect_executable_bars,
     overlay_executable_bars,
@@ -45,7 +46,12 @@ def validate_export_bars(
     tick_coverages: list[float] = []
     parity_mismatches = 0
     valid_tick_paths = 0
+    tick_sizes: set[float] = set()
     for bar in bars:
+        tick_size = float(bar.get("tick_size", 0.0))
+        if tick_size <= 0.0:
+            raise ValueError("dataset broker tick size must be positive")
+        tick_sizes.add(tick_size)
         if (
             float(bar["high"]) < max(float(bar["open"]), float(bar["close"]))
             or float(bar["low"]) > min(float(bar["open"]), float(bar["close"]))
@@ -125,7 +131,7 @@ def validate_export_bars(
         ):
             raise ValueError("dataset tick path does not reconstruct executable OHLC")
         valid_tick_paths += 1
-        tolerance = max(float(bar.get("tick_size", 0.0)), 1e-12)
+        tolerance = tick_size
         row_mismatch = False
         for field in parity_errors:
             error = abs(float(bar[field]) - float(bar[f"bid_{field}"]))
@@ -140,6 +146,8 @@ def validate_export_bars(
         if abs(float(bar.get("spread_usd", exact_spread)) - exact_spread) > 1e-12:
             raise ValueError("dataset spread feature is not the exact executable close spread")
 
+    if len(tick_sizes) != 1:
+        raise ValueError("dataset contains more than one broker tick size")
     reference = now_utc or datetime.now(UTC)
     latest_completed_start = int(reference.timestamp() // 300) * 300 - 300
     if timestamps[-1].timestamp() > latest_completed_start:
@@ -167,6 +175,7 @@ def validate_export_bars(
             coverage < 0.95 for coverage in tick_coverages
         ),
         "tick_path_valid_rate": valid_tick_paths / len(bars),
+        "tick_size": next(iter(tick_sizes)),
     }
 
 
@@ -201,7 +210,8 @@ def write_dataset_manifest(
     digest = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
     manifest_path = dataset_manifest_path(dataset_path)
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "label_contract_id": LABEL_CONTRACT_ID,
         "symbol": SYMBOL,
         "timeframe": TIMEFRAME,
         "provider": "MetaTrader5",

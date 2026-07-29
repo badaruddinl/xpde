@@ -31,8 +31,9 @@ use uuid::Uuid;
 use xpde_domain::{
     AccountSnapshot, BARRIER_HORIZON_BARS, BARRIER_SPEC_ID, CalibrationStatus, ChartMode,
     DataQuality, DecisionAction, DecisionPolicy, DecisionProposal, EXECUTABLE_SIDE_CONTRACT_ID,
-    ForecastEnvelope, ForecastPoint, HumanFeedback, MarketBar, MarketSnapshot, MarketStatus,
-    SymbolSpec, TradeMode, TradingProfile, decide, decide_at,
+    FEATURE_VERSION_ID, ForecastEnvelope, ForecastPoint, HumanFeedback, LABEL_CONTRACT_ID,
+    MINIMUM_EXECUTABLE_TICK_COVERAGE, MarketBar, MarketSnapshot, MarketStatus, SymbolSpec,
+    TradeMode, TradingProfile, decide, decide_at, is_price_tick_aligned,
 };
 
 const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
@@ -196,6 +197,8 @@ impl MarketSessionPolicy {
 #[derive(Debug, Clone, Deserialize)]
 struct ModelHealthPolicy {
     minimum_settled_predictions: usize,
+    #[serde(default = "default_minimum_settlement_completeness_rate")]
+    minimum_settlement_completeness_rate: f64,
     minimum_interval_coverage: f64,
     maximum_interval_coverage: f64,
     maximum_direction_brier: f64,
@@ -208,6 +211,10 @@ struct ModelHealthPolicy {
     suspend_after_severe_windows: usize,
     recover_after_healthy_windows: usize,
     warming_up_forces_wait: bool,
+}
+
+const fn default_minimum_settlement_completeness_rate() -> f64 {
+    0.98
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,6 +246,11 @@ fn load_policy_set() -> Result<PolicySet, String> {
         .map_err(|error| format!("failed to read policy config {path}: {error}"))?;
     let config: PolicyFile = toml::from_str(&contents)
         .map_err(|error| format!("failed to parse policy config {path}: {error}"))?;
+    if !(0.0..=1.0).contains(&config.model_health.minimum_settlement_completeness_rate) {
+        return Err(
+            "model_health.minimum_settlement_completeness_rate must be between 0 and 1".to_owned(),
+        );
+    }
     let apply = |mut policy: DecisionPolicy, values: &ProfilePolicyFile| {
         policy.broker_policy_id = config.broker_profile.broker_policy_id.clone();
         policy.cost_model_id = config.broker_profile.cost_model_id.clone();
@@ -334,6 +346,12 @@ struct ModelHealth {
     barrier_baseline_brier: Option<f64>,
     barrier_ece: Option<f64>,
     mae_q90_coverage: Option<f64>,
+    generated_predictions: usize,
+    price_outcomes_settled: usize,
+    barrier_outcomes_settled: usize,
+    tick_path_incomplete: usize,
+    session_interrupted: usize,
+    settlement_completeness_rate: Option<f64>,
     reason_codes: Vec<String>,
     checks: Vec<ModelHealthCheck>,
     consecutive_failures: usize,
@@ -361,6 +379,12 @@ impl ModelHealth {
             barrier_baseline_brier: None,
             barrier_ece: None,
             mae_q90_coverage: None,
+            generated_predictions: 0,
+            price_outcomes_settled: 0,
+            barrier_outcomes_settled: 0,
+            tick_path_incomplete: 0,
+            session_interrupted: 0,
+            settlement_completeness_rate: None,
             reason_codes: vec!["MODEL_LIVE_HEALTH_WARMING_UP".to_owned()],
             checks: Vec::new(),
             consecutive_failures: 0,
@@ -436,6 +460,7 @@ struct ModelRegistration {
     model_type: String,
     status: String,
     feature_version: String,
+    label_contract_id: String,
     schema_version: i64,
     eligibility_gate_version: i64,
     training_mode: String,
@@ -617,6 +642,7 @@ struct ModelRecord {
     model_type: String,
     status: String,
     feature_version: String,
+    label_contract_id: String,
     schema_version: i64,
     eligibility_gate_version: i64,
     training_mode: String,
@@ -631,6 +657,96 @@ struct ModelRecord {
 
 struct Store {
     connection: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct SettlementCompleteness {
+    generated_predictions: usize,
+    price_outcomes_settled: usize,
+    barrier_outcomes_settled: usize,
+    tick_path_incomplete: usize,
+    session_interrupted: usize,
+    fully_settled: usize,
+    settlement_completeness_rate: Option<f64>,
+}
+
+fn settlement_completeness(
+    connection: &Connection,
+    model_id: &str,
+) -> Result<SettlementCompleteness, rusqlite::Error> {
+    let cutoff = (Utc::now() - chrono::Duration::minutes(65)).to_rfc3339();
+    let values = connection.query_row(
+        "WITH due AS (
+           SELECT *
+           FROM predictions p
+           WHERE p.model_id=?1
+             AND p.feature_version=?2
+             AND p.label_contract_id=?3
+             AND p.barrier_spec_id=?4
+             AND p.is_duplicate=0
+             AND p.origin_bar_timestamp<=?5
+           ORDER BY p.origin_bar_timestamp DESC
+           LIMIT 200
+         )
+         SELECT COUNT(*),
+                SUM(CASE WHEN (
+                  SELECT COUNT(DISTINCT o.horizon_bars)
+                  FROM prediction_horizon_outcomes o
+                  WHERE o.prediction_id=due.prediction_id
+                    AND o.horizon_bars IN (1,3,6,12)
+                )=4 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN EXISTS (
+                  SELECT 1 FROM prediction_horizon_outcomes o
+                  WHERE o.prediction_id=due.prediction_id
+                    AND o.horizon_bars=3
+                    AND o.barrier_long_outcome IS NOT NULL
+                    AND o.barrier_short_outcome IS NOT NULL
+                ) THEN 1 ELSE 0 END),
+                SUM(CASE WHEN due.settlement_status='TICK_PATH_INCOMPLETE' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN due.settlement_status='SESSION_INTERRUPTED' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN due.settlement_status='SETTLED'
+                  AND (
+                    SELECT COUNT(DISTINCT o.horizon_bars)
+                    FROM prediction_horizon_outcomes o
+                    WHERE o.prediction_id=due.prediction_id
+                      AND o.horizon_bars IN (1,3,6,12)
+                  )=4
+                  AND EXISTS (
+                    SELECT 1 FROM prediction_horizon_outcomes o
+                    WHERE o.prediction_id=due.prediction_id
+                      AND o.horizon_bars=3
+                      AND o.barrier_long_outcome IS NOT NULL
+                      AND o.barrier_short_outcome IS NOT NULL
+                  )
+                THEN 1 ELSE 0 END)
+         FROM due",
+        params![
+            model_id,
+            FEATURE_VERSION_ID,
+            LABEL_CONTRACT_ID,
+            BARRIER_SPEC_ID,
+            cutoff
+        ],
+        |row| {
+            Ok((
+                row.get::<_, usize>(0)?,
+                row.get::<_, Option<usize>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<usize>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<usize>>(3)?.unwrap_or_default(),
+                row.get::<_, Option<usize>>(4)?.unwrap_or_default(),
+                row.get::<_, Option<usize>>(5)?.unwrap_or_default(),
+            ))
+        },
+    )?;
+    Ok(SettlementCompleteness {
+        generated_predictions: values.0,
+        price_outcomes_settled: values.1,
+        barrier_outcomes_settled: values.2,
+        tick_path_incomplete: values.3,
+        session_interrupted: values.4,
+        fully_settled: values.5,
+        settlement_completeness_rate: (values.0 > 0).then_some(values.5 as f64 / values.0 as f64),
+    })
 }
 
 fn ensure_column(
@@ -955,6 +1071,7 @@ impl Store {
         ensure_column(&connection, "predictions", "origin_ask", "REAL")?;
         ensure_column(&connection, "predictions", "origin_bar_index", "INTEGER")?;
         ensure_column(&connection, "predictions", "feature_version", "TEXT")?;
+        ensure_column(&connection, "predictions", "label_contract_id", "TEXT")?;
         ensure_column(&connection, "predictions", "barrier_spec_id", "TEXT")?;
         ensure_column(
             &connection,
@@ -1065,11 +1182,24 @@ impl Store {
         ] {
             ensure_column(&connection, "market_bars", column, definition)?;
         }
+        for (column, definition) in [
+            ("source_tick_volume", "REAL NOT NULL DEFAULT 0"),
+            ("executable_tick_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("coverage_ratio", "REAL NOT NULL DEFAULT 0"),
+        ] {
+            ensure_column(&connection, "market_tick_paths", column, definition)?;
+        }
         ensure_column(
             &connection,
             "model_registry",
             "eligible_for_shadow",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "model_registry",
+            "label_contract_id",
+            "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(
             &connection,
@@ -1169,6 +1299,11 @@ impl Store {
                json_extract(forecast_json, '$.feature_version'),
                'unknown'
              ),
+             label_contract_id=COALESCE(
+               label_contract_id,
+               json_extract(forecast_json, '$.label_contract_id'),
+               'legacy-unknown'
+             ),
              direction_probability_up=COALESCE(
                direction_probability_up,
                json_extract(forecast_json, '$.direction_probability_up')
@@ -1189,12 +1324,12 @@ impl Store {
                SELECT MIN(rowid)
                FROM predictions
                GROUP BY model_id, symbol, timeframe, origin_bar_timestamp,
-                        feature_version, barrier_spec_id
+                        feature_version, barrier_spec_id, label_contract_id
              );
              CREATE UNIQUE INDEX ux_predictions_model_origin_contract
              ON predictions(
                model_id, symbol, timeframe, origin_bar_timestamp,
-               feature_version, barrier_spec_id
+               feature_version, barrier_spec_id, label_contract_id
              )
              WHERE is_duplicate=0;",
         )?;
@@ -1205,8 +1340,26 @@ impl Store {
                AND (
                  origin_bid IS NULL OR origin_ask IS NULL
                  OR COALESCE(barrier_spec_id, '') != ?1
+                 OR COALESCE(label_contract_id, '') != ?2
                )",
-            [BARRIER_SPEC_ID],
+            params![BARRIER_SPEC_ID, LABEL_CONTRACT_ID],
+        )?;
+        connection.execute(
+            "UPDATE model_registry
+             SET status='retired', eligible_for_shadow=0
+             WHERE status!='retired'
+               AND (
+                 feature_version!=?1
+                 OR label_contract_id!=?2
+                 OR barrier_spec_id!=?3
+                 OR executable_side_contract_id!=?4
+               )",
+            params![
+                FEATURE_VERSION_ID,
+                LABEL_CONTRACT_ID,
+                BARRIER_SPEC_ID,
+                EXECUTABLE_SIDE_CONTRACT_ID,
+            ],
         )?;
         connection.execute(
             "DELETE FROM market_bars
@@ -1229,22 +1382,33 @@ impl Store {
         for bar in bars.filter(|bar| bar.has_valid_tick_path()) {
             let first = bar.first_tick_msc.expect("validated tick path start");
             let last = bar.last_tick_msc.expect("validated tick path end");
+            let coverage_ratio = if bar.tick_volume.is_finite() && bar.tick_volume > 0.0 {
+                bar.executable_tick_count as f64 / bar.tick_volume
+            } else {
+                0.0
+            };
             transaction.execute(
                 "INSERT INTO market_tick_paths
                  (symbol, timeframe, timestamp, tick_path_json, path_point_count,
-                  first_tick_msc, last_tick_msc, path_valid, source, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
+                  first_tick_msc, last_tick_msc, source_tick_volume,
+                  executable_tick_count, coverage_ratio, path_valid, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12)
                  ON CONFLICT(symbol, timeframe, timestamp) DO UPDATE SET
                    tick_path_json=excluded.tick_path_json,
                    path_point_count=excluded.path_point_count,
                    first_tick_msc=excluded.first_tick_msc,
                    last_tick_msc=excluded.last_tick_msc,
+                   source_tick_volume=excluded.source_tick_volume,
+                   executable_tick_count=excluded.executable_tick_count,
+                   coverage_ratio=excluded.coverage_ratio,
                    path_valid=excluded.path_valid,
                    source=excluded.source,
                    updated_at=excluded.updated_at
                  WHERE excluded.first_tick_msc<=market_tick_paths.first_tick_msc
                    AND excluded.last_tick_msc>=market_tick_paths.last_tick_msc
                    AND excluded.path_point_count>=market_tick_paths.path_point_count
+                   AND excluded.executable_tick_count>=market_tick_paths.executable_tick_count
+                   AND excluded.coverage_ratio>=market_tick_paths.coverage_ratio
                    AND (
                      excluded.source!='LIVE_CURRENT'
                      OR excluded.path_point_count>=market_tick_paths.path_point_count+5
@@ -1259,6 +1423,9 @@ impl Store {
                     bar.executable_tick_path.len(),
                     first,
                     last,
+                    bar.tick_volume,
+                    bar.executable_tick_count,
+                    coverage_ratio,
                     source,
                     Utc::now().to_rfc3339(),
                 ],
@@ -1282,7 +1449,8 @@ impl Store {
         }
         let mut statement = transaction.prepare(
             "SELECT timestamp, tick_path_json, path_point_count,
-                    first_tick_msc, last_tick_msc, source
+                    first_tick_msc, last_tick_msc, source,
+                    source_tick_volume, executable_tick_count, coverage_ratio
              FROM market_tick_paths
              WHERE symbol=?1 AND timeframe=?2
                AND timestamp>=?3 AND timestamp<?4 AND path_valid=1
@@ -1304,6 +1472,9 @@ impl Store {
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, f64>(6)?,
+                        row.get::<_, u64>(7)?,
+                        row.get::<_, f64>(8)?,
                     ))
                 },
             )?
@@ -1313,7 +1484,18 @@ impl Store {
             .map(DateTime::to_rfc3339)
             .collect::<BTreeSet<_>>();
         let mut valid_paths = BTreeMap::<String, Vec<ExecutableTick>>::new();
-        for (timestamp, path, path_point_count, first_tick_msc, last_tick_msc, source) in encoded {
+        for (
+            timestamp,
+            path,
+            path_point_count,
+            first_tick_msc,
+            last_tick_msc,
+            source,
+            source_tick_volume,
+            executable_tick_count,
+            coverage_ratio,
+        ) in encoded
+        {
             if !expected.contains(&timestamp) {
                 continue;
             }
@@ -1328,6 +1510,13 @@ impl Store {
             let valid = !parsed.is_empty()
                 && parsed.len() == path_point_count as usize
                 && source != "LIVE_CURRENT"
+                && source_tick_volume.is_finite()
+                && source_tick_volume > 0.0
+                && executable_tick_count > 0
+                && coverage_ratio.is_finite()
+                && coverage_ratio >= MINIMUM_EXECUTABLE_TICK_COVERAGE
+                && ((executable_tick_count as f64 / source_tick_volume) - coverage_ratio).abs()
+                    <= 1e-8
                 && parsed.first().map(|tick| tick.0) == Some(first_tick_msc)
                 && parsed.last().map(|tick| tick.0) == Some(last_tick_msc)
                 && parsed.windows(2).all(|pair| pair[0].0 <= pair[1].0)
@@ -1764,9 +1953,13 @@ impl Store {
                 transaction.execute(
                     "INSERT INTO market_tick_paths
                      (symbol, timeframe, timestamp, tick_path_json, path_point_count,
-                      first_tick_msc, last_tick_msc, path_valid, source, updated_at)
+                      first_tick_msc, last_tick_msc, source_tick_volume,
+                      executable_tick_count, coverage_ratio, path_valid, source, updated_at)
                      SELECT symbol, timeframe, timestamp, tick_path_json, path_point_count,
-                            first_tick_msc, last_tick_msc, 1, 'HISTORICAL_BACKFILL',
+                            first_tick_msc, last_tick_msc, tick_volume,
+                            executable_tick_count,
+                            CAST(executable_tick_count AS REAL) / tick_volume,
+                            1, 'HISTORICAL_BACKFILL',
                             ?4
                      FROM market_backfill_staging
                      WHERE import_id=?1 AND symbol=?2 AND timeframe=?3
@@ -1952,18 +2145,19 @@ impl Store {
         let origin_ask = origin_bar.and_then(|bar| bar.ask_close);
         let inserted = connection.execute(
             "INSERT OR IGNORE INTO predictions
-             (prediction_id, model_id, feature_version, barrier_spec_id,
+             (prediction_id, model_id, feature_version, label_contract_id, barrier_spec_id,
               direction_probability_up, barrier_probability_long,
               barrier_probability_short,
               symbol, timeframe, origin_bar_timestamp,
               origin_close, origin_bid, origin_ask, origin_bar_index, generated_at, expires_at,
               decision_valid_until, outcome_matures_at,
               forecast_json, proposal_json, is_duplicate, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 0, ?21)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 0, ?22)",
             params![
                 forecast.prediction_id.to_string(),
                 forecast.model_id,
                 forecast.feature_version,
+                forecast.label_contract_id,
                 forecast.barrier_spec_id,
                 forecast.direction_probability_up,
                 forecast.barrier_probability_long,
@@ -1998,7 +2192,7 @@ impl Store {
              FROM predictions
              WHERE model_id=?1 AND symbol=?2 AND timeframe=?3
                AND origin_bar_timestamp=?4 AND feature_version=?5
-               AND barrier_spec_id=?6 AND is_duplicate=0
+               AND label_contract_id=?6 AND barrier_spec_id=?7 AND is_duplicate=0
              LIMIT 1",
             params![
                 forecast.model_id,
@@ -2006,6 +2200,7 @@ impl Store {
                 snapshot.timeframe,
                 forecast.origin_bar_timestamp.to_rfc3339(),
                 forecast.feature_version,
+                forecast.label_contract_id,
                 forecast.barrier_spec_id,
             ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -2328,15 +2523,16 @@ impl Store {
         let connection = self.connection.lock().expect("database mutex poisoned");
         connection.execute(
             "INSERT INTO model_registry
-             (model_id, model_type, status, feature_version, schema_version,
+             (model_id, model_type, status, feature_version, label_contract_id, schema_version,
               eligibility_gate_version, training_mode, eligible_for_shadow,
               barrier_spec_id, executable_side_contract_id, artifact_path,
               metrics_json, created_at, promoted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL)
              ON CONFLICT(model_id) DO UPDATE SET
                model_type=excluded.model_type,
                status=excluded.status,
                feature_version=excluded.feature_version,
+               label_contract_id=excluded.label_contract_id,
                schema_version=excluded.schema_version,
                eligibility_gate_version=excluded.eligibility_gate_version,
                training_mode=excluded.training_mode,
@@ -2350,6 +2546,7 @@ impl Store {
                 model.model_type,
                 model.status,
                 model.feature_version,
+                model.label_contract_id,
                 model.schema_version,
                 model.eligibility_gate_version,
                 model.training_mode,
@@ -2376,7 +2573,7 @@ impl Store {
     fn list_models(&self) -> Result<Vec<ModelRecord>, rusqlite::Error> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT model_id, model_type, status, feature_version, schema_version,
+            "SELECT model_id, model_type, status, feature_version, label_contract_id, schema_version,
                     eligibility_gate_version, training_mode, eligible_for_shadow,
                     barrier_spec_id, executable_side_contract_id, artifact_path,
                     metrics_json, created_at, promoted_at
@@ -2384,22 +2581,23 @@ impl Store {
         )?;
         statement
             .query_map([], |row| {
-                let metrics_json: String = row.get(11)?;
+                let metrics_json: String = row.get(12)?;
                 Ok(ModelRecord {
                     model_id: row.get(0)?,
                     model_type: row.get(1)?,
                     status: row.get(2)?,
                     feature_version: row.get(3)?,
-                    schema_version: row.get(4)?,
-                    eligibility_gate_version: row.get(5)?,
-                    training_mode: row.get(6)?,
-                    eligible_for_shadow: row.get(7)?,
-                    barrier_spec_id: row.get(8)?,
-                    executable_side_contract_id: row.get(9)?,
-                    artifact_path: row.get(10)?,
+                    label_contract_id: row.get(4)?,
+                    schema_version: row.get(5)?,
+                    eligibility_gate_version: row.get(6)?,
+                    training_mode: row.get(7)?,
+                    eligible_for_shadow: row.get(8)?,
+                    barrier_spec_id: row.get(9)?,
+                    executable_side_contract_id: row.get(10)?,
+                    artifact_path: row.get(11)?,
                     metrics: serde_json::from_str(&metrics_json).unwrap_or(serde_json::Value::Null),
-                    created_at: row.get(12)?,
-                    promoted_at: row.get(13)?,
+                    created_at: row.get(13)?,
+                    promoted_at: row.get(14)?,
                 })
             })?
             .collect()
@@ -2680,12 +2878,12 @@ impl Store {
                     "median_error": (actual_return - target.q50).abs(),
                     "interval_miss": interval_hit == 0,
                     "direction_error": direction_hit == 0,
-                    "mfe_error_usd": if target.horizon_bars == BARRIER_HORIZON_BARS {
+                    "mfe_error_price_distance": if target.horizon_bars == BARRIER_HORIZON_BARS {
                         Some(expected_mfe - actual_mfe)
                     } else {
                         None
                     },
-                    "mae_error_usd": if target.horizon_bars == BARRIER_HORIZON_BARS {
+                    "mae_error_price_distance": if target.horizon_bars == BARRIER_HORIZON_BARS {
                         Some(expected_mae - actual_mae)
                     } else {
                         None
@@ -2907,6 +3105,7 @@ impl Store {
         policy: &ModelHealthPolicy,
     ) -> Result<ModelHealth, rusqlite::Error> {
         let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let settlement = settlement_completeness(&connection, model_id)?;
         let rows = {
             let mut statement = connection.prepare(
                 "SELECT o.interval_hit, o.actual_return, p.direction_probability_up,
@@ -2942,6 +3141,26 @@ impl Store {
         if rows.len() < policy.minimum_settled_predictions {
             let mut health = ModelHealth::warming_up(policy.minimum_settled_predictions);
             health.sample_size = rows.len();
+            health.generated_predictions = settlement.generated_predictions;
+            health.price_outcomes_settled = settlement.price_outcomes_settled;
+            health.barrier_outcomes_settled = settlement.barrier_outcomes_settled;
+            health.tick_path_incomplete = settlement.tick_path_incomplete;
+            health.session_interrupted = settlement.session_interrupted;
+            health.settlement_completeness_rate = settlement.settlement_completeness_rate;
+            if let Some(rate) = settlement.settlement_completeness_rate {
+                let passed = rate >= policy.minimum_settlement_completeness_rate;
+                health.checks.push(ModelHealthCheck {
+                    code: "LIVE_SETTLEMENT_COMPLETENESS_OUTSIDE_GATE".to_owned(),
+                    observed: Some(rate),
+                    threshold: format!(">={:.3}", policy.minimum_settlement_completeness_rate),
+                    passed,
+                });
+                if !passed {
+                    health
+                        .reason_codes
+                        .push("LIVE_SETTLEMENT_COMPLETENESS_OUTSIDE_GATE".to_owned());
+                }
+            }
             return Ok(health);
         }
 
@@ -2968,7 +3187,7 @@ impl Store {
                 }
             }
             if let Ok(metrics) = serde_json::from_str::<serde_json::Value>(&row.7)
-                && let Some(error) = metrics["mae_error_usd"].as_f64()
+                && let Some(error) = metrics["mae_error_price_distance"].as_f64()
             {
                 mae_covered.push(if error >= 0.0 { 1.0 } else { 0.0 });
             }
@@ -3011,6 +3230,14 @@ impl Store {
             _ => None,
         };
         let checks = vec![
+            ModelHealthCheck {
+                code: "LIVE_SETTLEMENT_COMPLETENESS_OUTSIDE_GATE".to_owned(),
+                observed: settlement.settlement_completeness_rate,
+                threshold: format!(">={:.3}", policy.minimum_settlement_completeness_rate),
+                passed: settlement
+                    .settlement_completeness_rate
+                    .is_some_and(|rate| rate >= policy.minimum_settlement_completeness_rate),
+            },
             ModelHealthCheck {
                 code: "LIVE_INTERVAL_COVERAGE_OUTSIDE_GATE".to_owned(),
                 observed: Some(interval_coverage),
@@ -3070,6 +3297,9 @@ impl Store {
             .map(|check| check.code.clone())
             .collect::<Vec<_>>();
         let severe = reasons.len() >= 2
+            || settlement
+                .settlement_completeness_rate
+                .is_some_and(|rate| rate < policy.minimum_settlement_completeness_rate * 0.90)
             || direction_brier.is_some_and(|score| score > policy.maximum_direction_brier * 1.25)
             || barrier_ratio
                 .is_some_and(|ratio| ratio > policy.maximum_barrier_brier_ratio_to_baseline * 1.25);
@@ -3081,8 +3311,14 @@ impl Store {
             ModelHealthStatus::Degraded
         };
         let evidence_fingerprint = format!(
-            "{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}",
             rows.len(),
+            settlement.generated_predictions,
+            settlement.fully_settled,
+            settlement.price_outcomes_settled,
+            settlement.barrier_outcomes_settled,
+            settlement.tick_path_incomplete,
+            settlement.session_interrupted,
             rows.iter()
                 .map(|row| row.8.as_str())
                 .max()
@@ -3193,6 +3429,7 @@ impl Store {
                             "barrier_baseline_brier": barrier_baseline_brier,
                             "barrier_ece": barrier_ece,
                             "mae_q90_coverage": mae_q90_coverage,
+                            "settlement_completeness": settlement,
                         })
                         .to_string(),
                         Utc::now().to_rfc3339(),
@@ -3215,6 +3452,12 @@ impl Store {
             barrier_baseline_brier,
             barrier_ece,
             mae_q90_coverage,
+            generated_predictions: settlement.generated_predictions,
+            price_outcomes_settled: settlement.price_outcomes_settled,
+            barrier_outcomes_settled: settlement.barrier_outcomes_settled,
+            tick_path_incomplete: settlement.tick_path_incomplete,
+            session_interrupted: settlement.session_interrupted,
+            settlement_completeness_rate: settlement.settlement_completeness_rate,
             reason_codes: reasons,
             checks,
             consecutive_failures: failures,
@@ -3228,6 +3471,7 @@ impl Store {
         session_started_at: DateTime<Utc>,
     ) -> Result<serde_json::Value, rusqlite::Error> {
         let connection = self.connection.lock().expect("database mutex poisoned");
+        let settlement_completeness = settlement_completeness(&connection, current_model_id)?;
         let overall = connection.query_row(
             "SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
@@ -3615,9 +3859,9 @@ impl Store {
                                  ELSE -0.10*(actual_return-q90) END),
                         AVG(CASE
                               WHEN horizon_bars!=3
-                                OR json_extract(error_metrics_json, '$.mae_error_usd') IS NULL
+                                OR json_extract(error_metrics_json, '$.mae_error_price_distance') IS NULL
                                 THEN NULL
-                              WHEN CAST(json_extract(error_metrics_json, '$.mae_error_usd') AS REAL)>=0
+                              WHEN CAST(json_extract(error_metrics_json, '$.mae_error_price_distance') AS REAL)>=0
                                 THEN 1.0
                               ELSE 0.0
                             END)
@@ -3702,6 +3946,7 @@ impl Store {
             "barrier_expected_calibration_error": barrier_expected_calibration_error,
             "forecast_quality_by_horizon": forecast_quality_by_horizon,
             "proposal_outcomes_by_profile": proposal_outcomes_by_profile,
+            "settlement_completeness": settlement_completeness,
             "by_model": by_model,
             "target_coverage": 0.80,
             "current_model_window": 200,
@@ -4091,14 +4336,29 @@ async fn post_forecast(
     if runtime.snapshot.symbol_spec.chart_mode != ChartMode::Bid
         || !latest_completed.has_executable_sides()
         || !latest_completed.has_valid_tick_path()
-        || !runtime
-            .snapshot
-            .current_bar
-            .as_ref()
-            .is_some_and(|bar| bar.has_executable_sides() && bar.has_valid_tick_path())
+        || !latest_completed.has_complete_tick_coverage(MINIMUM_EXECUTABLE_TICK_COVERAGE)
+        || !runtime.snapshot.current_bar.as_ref().is_some_and(|bar| {
+            bar.has_executable_sides()
+                && bar.has_valid_tick_path()
+                && bar.has_complete_tick_coverage(MINIMUM_EXECUTABLE_TICK_COVERAGE)
+        })
     {
         return Err(ApiError::bad_request(
-            "forecast rejected because exact Bid/Ask executable bars are unavailable",
+            "forecast rejected because complete Bid/Ask tick coverage is unavailable",
+        ));
+    }
+    let tick_size = runtime.snapshot.symbol_spec.tick_size;
+    if [
+        forecast.target_price_long,
+        forecast.stop_price_long,
+        forecast.target_price_short,
+        forecast.stop_price_short,
+    ]
+    .iter()
+    .any(|price| !is_price_tick_aligned(*price, tick_size))
+    {
+        return Err(ApiError::bad_request(
+            "forecast barrier prices are not aligned to the broker tick size",
         ));
     }
     let mut proposals = vec![
@@ -4267,6 +4527,8 @@ async fn post_model_registration(
         && (model.schema_version != 3
             || model.eligibility_gate_version < 3
             || model.training_mode != "candidate"
+            || model.feature_version != FEATURE_VERSION_ID
+            || model.label_contract_id != LABEL_CONTRACT_ID
             || model.barrier_spec_id != BARRIER_SPEC_ID
             || model.executable_side_contract_id != EXECUTABLE_SIDE_CONTRACT_ID
             || model.eligibility_gates.is_empty()
@@ -4597,7 +4859,10 @@ fn demo_state() -> RuntimeState {
     let forecast = ForecastEnvelope {
         prediction_id: Uuid::new_v4(),
         model_id: "baseline-demo-v1".to_owned(),
-        feature_version: "goldm-m5-v4".to_owned(),
+        feature_version: FEATURE_VERSION_ID.to_owned(),
+        label_contract_id: LABEL_CONTRACT_ID.to_owned(),
+        probability_reference: "FORECAST_ORIGIN".to_owned(),
+        entry_conditioned_probability: false,
         origin_bar_timestamp: origin.timestamp,
         origin_close: origin.close,
         origin_bar_index: origin.timestamp.timestamp().div_euclid(300),
@@ -4691,6 +4956,7 @@ mod tests {
             sniper: DecisionPolicy::sniper(),
             model_health: ModelHealthPolicy {
                 minimum_settled_predictions: 100,
+                minimum_settlement_completeness_rate: 0.98,
                 minimum_interval_coverage: 0.70,
                 maximum_interval_coverage: 0.90,
                 maximum_direction_brier: 0.26,
@@ -4949,8 +5215,9 @@ mod tests {
                 .execute(
                     "INSERT INTO market_tick_paths
                      (symbol,timeframe,timestamp,tick_path_json,path_point_count,
-                      first_tick_msc,last_tick_msc,path_valid,source,updated_at)
-                     VALUES ('GOLDm#','M5',?1,?2,1,?3,?3,1,'TEST',?4)",
+                      first_tick_msc,last_tick_msc,source_tick_volume,
+                      executable_tick_count,coverage_ratio,path_valid,source,updated_at)
+                     VALUES ('GOLDm#','M5',?1,?2,1,?3,?3,10,10,1.0,1,'TEST',?4)",
                     params![
                         bucket.to_rfc3339(),
                         serde_json::json!([[tick_msc, 100.0, 100.2]]).to_string(),
@@ -5019,8 +5286,9 @@ mod tests {
             .execute(
                 "INSERT INTO market_tick_paths
                  (symbol,timeframe,timestamp,tick_path_json,path_point_count,
-                  first_tick_msc,last_tick_msc,path_valid,source,updated_at)
-                 VALUES ('GOLDm#','M5',?1,?2,1,?3,?3,1,'LIVE_CURRENT',?4)",
+                  first_tick_msc,last_tick_msc,source_tick_volume,
+                  executable_tick_count,coverage_ratio,path_valid,source,updated_at)
+                 VALUES ('GOLDm#','M5',?1,?2,1,?3,?3,10,10,1.0,1,'LIVE_CURRENT',?4)",
                 params![
                     bucket.to_rfc3339(),
                     serde_json::json!([[tick_msc, 100.0, 100.2]]).to_string(),
@@ -5043,6 +5311,51 @@ mod tests {
         assert!(!window.complete);
         assert_eq!(window.missing_buckets, vec![bucket]);
         assert!(window.missing_market_buckets.is_empty());
+        assert_eq!(window.incomplete_reason(), "TICK_PATH_INCOMPLETE");
+    }
+
+    #[test]
+    fn tick_path_window_rejects_valid_but_undercovered_completed_path() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let bucket = DateTime::<Utc>::from_timestamp(1_700_000_100_i64.div_euclid(300) * 300, 0)
+            .expect("bucket");
+        let tick_msc = bucket.timestamp_millis() + 1_000;
+        connection
+            .execute(
+                "INSERT INTO market_bars
+                 (symbol,timeframe,timestamp,open,high,low,close,tick_volume)
+                 VALUES ('GOLDm#','M5',?1,100,101,99,100,100)",
+                [bucket.to_rfc3339()],
+            )
+            .expect("market bar");
+        connection
+            .execute(
+                "INSERT INTO market_tick_paths
+                 (symbol,timeframe,timestamp,tick_path_json,path_point_count,
+                  first_tick_msc,last_tick_msc,source_tick_volume,
+                  executable_tick_count,coverage_ratio,path_valid,source,updated_at)
+                 VALUES ('GOLDm#','M5',?1,?2,1,?3,?3,100,25,0.25,1,'LIVE_COMPLETED',?4)",
+                params![
+                    bucket.to_rfc3339(),
+                    serde_json::json!([[tick_msc, 100.0, 100.2]]).to_string(),
+                    tick_msc,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("undercovered path");
+        let transaction = connection.transaction().expect("transaction");
+        let window = Store::load_tick_path_window(
+            &transaction,
+            "GOLDm#",
+            "M5",
+            bucket,
+            bucket + chrono::Duration::minutes(5),
+        )
+        .expect("window");
+
+        assert!(!window.complete);
+        assert_eq!(window.missing_buckets, vec![bucket]);
         assert_eq!(window.incomplete_reason(), "TICK_PATH_INCOMPLETE");
     }
 
@@ -5108,6 +5421,12 @@ mod tests {
             barrier_baseline_brier: Some(0.24),
             barrier_ece: Some(0.14),
             mae_q90_coverage: Some(0.76),
+            generated_predictions: 200,
+            price_outcomes_settled: 200,
+            barrier_outcomes_settled: 200,
+            tick_path_incomplete: 0,
+            session_interrupted: 0,
+            settlement_completeness_rate: Some(1.0),
             reason_codes: vec!["LIVE_INTERVAL_COVERAGE_OUTSIDE_GATE".to_owned()],
             checks: Vec::new(),
             consecutive_failures: 2,
@@ -5926,6 +6245,55 @@ mod tests {
     }
 
     #[test]
+    fn lower_coverage_tick_path_cannot_overwrite_complete_path() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let timestamp = DateTime::parse_from_rfc3339("2026-07-29T01:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let complete = executable_backfill_bar(timestamp, 100.0);
+        {
+            let transaction = connection.transaction().expect("transaction");
+            Store::save_tick_paths(
+                &transaction,
+                "GOLDm#",
+                "M5",
+                std::iter::once(&complete),
+                "LIVE_COMPLETED",
+            )
+            .expect("complete path");
+            transaction.commit().expect("commit complete path");
+        }
+        let mut lower_coverage = complete.clone();
+        lower_coverage.executable_tick_count -= 1;
+        {
+            let transaction = connection.transaction().expect("transaction");
+            Store::save_tick_paths(
+                &transaction,
+                "GOLDm#",
+                "M5",
+                std::iter::once(&lower_coverage),
+                "LIVE_COMPLETED",
+            )
+            .expect("lower coverage path");
+            transaction.commit().expect("commit lower coverage path");
+        }
+        let persisted_path: (i64, f64) = connection
+            .query_row(
+                "SELECT executable_tick_count, coverage_ratio FROM market_tick_paths
+                 WHERE symbol=?1 AND timeframe=?2 AND timestamp=?3",
+                params!["GOLDm#", "M5", timestamp.to_rfc3339()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("persisted tick path");
+        assert_eq!(persisted_path.0, complete.executable_tick_count as i64);
+        assert!(
+            (persisted_path.1 - complete.executable_tick_count as f64 / complete.tick_volume).abs()
+                <= 1e-12
+        );
+    }
+
+    #[test]
     fn model_health_hysteresis_advances_only_on_new_evidence() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         connection.execute_batch(MIGRATION).expect("migration");
@@ -5934,6 +6302,7 @@ mod tests {
         };
         let policy = ModelHealthPolicy {
             minimum_settled_predictions: 3,
+            minimum_settlement_completeness_rate: 0.98,
             minimum_interval_coverage: 0.50,
             maximum_interval_coverage: 1.0,
             maximum_direction_brier: 0.30,
@@ -5959,17 +6328,19 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO predictions
-                     (prediction_id, model_id, feature_version, barrier_spec_id,
+                     (prediction_id, model_id, feature_version, label_contract_id, barrier_spec_id,
                       direction_probability_up, barrier_probability_long,
                       barrier_probability_short, symbol, timeframe,
                       origin_bar_timestamp, origin_close, origin_bid, origin_ask,
                       origin_bar_index, generated_at, expires_at, forecast_json,
                       proposal_json, settlement_status, created_at)
-                     VALUES (?1, 'health-model', 'goldm-m5-v4', ?2, ?3, ?3, ?3,
-                             'GOLDm#', 'M5', ?4, 100.0, 100.0, 100.2, ?5, ?4,
-                             ?4, '{}', '[]', 'SETTLED', ?4)",
+                     VALUES (?1, 'health-model', ?2, ?3, ?4, ?5, ?5, ?5,
+                             'GOLDm#', 'M5', ?6, 100.0, 100.0, 100.2, ?7, ?6,
+                             ?6, '{}', '[]', 'SETTLED', ?6)",
                     params![
                         prediction_id,
+                        FEATURE_VERSION_ID,
+                        LABEL_CONTRACT_ID,
                         BARRIER_SPEC_ID,
                         probability,
                         timestamp,
@@ -5986,7 +6357,7 @@ mod tests {
                       barrier_long_outcome, barrier_short_outcome,
                       error_metrics_json, settled_at)
                      VALUES (?1, 3, ?2, ?2, ?3, 101.0, 99.0, 1, 1, ?4, ?4, ?4,
-                             '{\"mae_error_usd\":0.1}', ?2)",
+                             '{\"mae_error_price_distance\":0.1}', ?2)",
                     params![
                         prediction_id,
                         timestamp,
@@ -5995,6 +6366,23 @@ mod tests {
                     ],
                 )
                 .expect("outcome evidence");
+            for horizon in [1_i64, 6, 12] {
+                connection
+                    .execute(
+                        "INSERT INTO prediction_horizon_outcomes
+                         (prediction_id, horizon_bars, origin_bar_timestamp,
+                          outcome_bar_timestamp, actual_return, actual_high, actual_low,
+                          interval_hit, direction_hit, error_metrics_json, settled_at)
+                         VALUES (?1, ?2, ?3, ?3, ?4, 101.0, 99.0, 1, 1, '{}', ?3)",
+                        params![
+                            prediction_id,
+                            horizon,
+                            timestamp,
+                            if positive { 0.01 } else { -0.01 },
+                        ],
+                    )
+                    .expect("price outcome evidence");
+            }
         };
         for index in 0..3 {
             insert_evidence(index);
@@ -6015,5 +6403,47 @@ mod tests {
             .model_health("health-model", &policy)
             .expect("same health window");
         assert_eq!(repeated.consecutive_successes, 2);
+
+        for index in 10..12 {
+            let connection = store.connection.lock().expect("database mutex");
+            let timestamp = DateTime::<Utc>::from_timestamp(1_700_000_000 + index * 300, 0)
+                .expect("test timestamp")
+                .to_rfc3339();
+            connection
+                .execute(
+                    "INSERT INTO predictions
+                     (prediction_id, model_id, feature_version, label_contract_id,
+                      barrier_spec_id, symbol, timeframe, origin_bar_timestamp,
+                      origin_close, origin_bid, origin_ask, origin_bar_index,
+                      generated_at, expires_at, forecast_json, proposal_json,
+                      settlement_status, created_at)
+                     VALUES (?1, 'health-model', ?2, ?3, ?4, 'GOLDm#', 'M5',
+                             ?5, 100.0, 100.0, 100.2, ?6, ?5, ?5, '{}', '[]',
+                             'TICK_PATH_INCOMPLETE', ?5)",
+                    params![
+                        format!("incomplete-{index}"),
+                        FEATURE_VERSION_ID,
+                        LABEL_CONTRACT_ID,
+                        BARRIER_SPEC_ID,
+                        timestamp,
+                        (1_700_000_000 + index * 300).div_euclid(300),
+                    ],
+                )
+                .expect("incomplete prediction");
+            drop(connection);
+            let health = store
+                .model_health("health-model", &policy)
+                .expect("incomplete health window");
+            if index == 11 {
+                assert_ne!(health.status, ModelHealthStatus::Healthy);
+                assert!(
+                    health
+                        .reason_codes
+                        .contains(&"LIVE_SETTLEMENT_COMPLETENESS_OUTSIDE_GATE".to_owned())
+                );
+                assert_eq!(health.generated_predictions, 6);
+                assert_eq!(health.barrier_outcomes_settled, 4);
+            }
+        }
     }
 }

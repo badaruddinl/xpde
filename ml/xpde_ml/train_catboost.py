@@ -23,6 +23,7 @@ from .dataset import (
     EXECUTABLE_SIDE_CONTRACT_ID,
     FEATURE_COLUMNS,
     FEATURE_VERSION,
+    LABEL_CONTRACT_ID,
     METADATA,
     build_training_frame,
     postprocess_quantiles,
@@ -352,6 +353,13 @@ def train(args) -> dict[str, Any]:
         if source_manifest.get("sha256") != source_sha256:
             raise ValueError("dataset SHA-256 does not match its manifest")
     raw = pd.read_csv(args.bars_csv, parse_dates=["timestamp"]).sort_values("timestamp")
+    tick_sizes = sorted(
+        {
+            float(value)
+            for value in raw.get("tick_size", pd.Series(dtype=float)).dropna()
+            if math.isfinite(float(value)) and float(value) > 0.0
+        }
+    )
     if source_manifest is not None:
         if source_manifest.get("symbol") != "GOLDm#":
             raise ValueError("dataset manifest symbol is incompatible")
@@ -366,7 +374,8 @@ def train(args) -> dict[str, Any]:
     )
     dataset_integrity_ok = bool(
         source_manifest is not None
-        and int(source_manifest.get("schema_version", 0)) >= 2
+        and int(source_manifest.get("schema_version", 0)) >= 3
+        and source_manifest.get("label_contract_id") == LABEL_CONTRACT_ID
         and source_manifest.get("contains_incomplete_bar") is False
         and source_manifest.get("git_dirty") is False
         and source_manifest.get("chart_mode") == "BID"
@@ -378,6 +387,13 @@ def train(args) -> dict[str, Any]:
         and float(executable_integrity.get("minimum_tick_coverage_per_bar", 0.0))
         >= 0.95
         and float(executable_integrity.get("tick_path_valid_rate", 0.0)) == 1.0
+        and len(tick_sizes) == 1
+        and math.isclose(
+            float(executable_integrity.get("tick_size", 0.0)),
+            tick_sizes[0],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     )
     training_mode = getattr(args, "training_mode", "candidate")
     if training_mode == "candidate" and not dataset_integrity_ok:
@@ -387,13 +403,24 @@ def train(args) -> dict[str, Any]:
             "tick coverage, and exact HISTORICAL_BID_ASK_TICKS executable sides"
         )
     frame = build_training_frame(raw)
+    label_integrity = {
+        "contract_id": LABEL_CONTRACT_ID,
+        "invalid_forward_labels": {
+            str(horizon): int(frame[f"target_{horizon}"].isna().sum())
+            for horizon in HORIZONS
+        },
+        "invalid_h3_barrier_labels": int(frame["barrier_long_class"].isna().sum()),
+        "invalid_h3_excursion_labels": int(
+            frame["mfe_long_price_distance"].isna().sum()
+        ),
+    }
     required = list(FEATURE_COLUMNS) + [
         *(f"target_{horizon}" for horizon in HORIZONS),
         "direction_3",
-        "mfe_long_usd",
-        "mae_long_usd",
-        "mfe_short_usd",
-        "mae_short_usd",
+        "mfe_long_price_distance",
+        "mae_long_price_distance",
+        "mfe_short_price_distance",
+        "mae_short_price_distance",
     ]
     dataset = frame.dropna(subset=required).reset_index(drop=True)
     minimum_candidate_rows = int(getattr(args, "minimum_candidate_rows", 20_000))
@@ -683,7 +710,7 @@ def train(args) -> dict[str, Any]:
     for side in ("long", "short"):
         excursion_metrics[side] = {}
         for excursion, alpha in (("mfe", 0.50), ("mae", 0.90)):
-            label = f"{excursion}_{side}_usd"
+            label = f"{excursion}_{side}_price_distance"
             excursion_model = _fit_excursion_model(
                 CatBoostRegressor,
                 x_train,
@@ -858,6 +885,7 @@ def train(args) -> dict[str, Any]:
         "training_mode": training_mode,
         "minimum_candidate_rows": minimum_candidate_rows,
         "feature_version": FEATURE_VERSION,
+        "label_contract_id": LABEL_CONTRACT_ID,
         "feature_columns": list(FEATURE_COLUMNS),
         "horizons": list(HORIZONS),
         "barrier_horizon": BARRIER_HORIZON,
@@ -866,6 +894,8 @@ def train(args) -> dict[str, Any]:
             "horizon_bars": BARRIER_HORIZON,
             "take_profit_atr_multiplier": BARRIER_TP_ATR_MULTIPLIER,
             "stop_loss_atr_multiplier": BARRIER_SL_ATR_MULTIPLIER,
+            "price_alignment": "BROKER_TICK_SIZE_OUTWARD",
+            "tick_size": tick_sizes[0] if len(tick_sizes) == 1 else None,
         },
         "executable_side_contract": {
             "id": EXECUTABLE_SIDE_CONTRACT_ID,
@@ -875,6 +905,7 @@ def train(args) -> dict[str, Any]:
             "source": "HISTORICAL_BID_ASK_TICKS",
             "first_passage": "ORDERED_PRICE_CHANGE_TICKS",
             "spread_features": "EXACT_BID_ASK_CLOSE_WINDOW",
+            "minimum_tick_coverage": 0.95,
         },
         "quantiles": list(QUANTILES),
         "purge_gap": METADATA.purge_gap,
@@ -891,6 +922,7 @@ def train(args) -> dict[str, Any]:
             "manifest_verified": source_manifest is not None,
             "integrity_gate_passed": dataset_integrity_ok,
             "executable_integrity": executable_integrity,
+            "label_integrity": label_integrity,
             "export_git_commit": (
                 source_manifest.get("git_commit")
                 if source_manifest is not None

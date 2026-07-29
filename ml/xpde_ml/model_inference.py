@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from .dataset import (
     EXECUTABLE_SIDE_CONTRACT_ID,
     FEATURE_COLUMNS,
     FEATURE_VERSION,
+    LABEL_CONTRACT_ID,
     barrier_prices,
     engineer_features,
     postprocess_quantiles,
@@ -61,6 +63,7 @@ def candidate_registration_payload(
         "model_type": "catboost_multi_quantile",
         "status": "candidate",
         "feature_version": manifest["feature_version"],
+        "label_contract_id": manifest["label_contract_id"],
         "schema_version": manifest["schema_version"],
         "eligibility_gate_version": manifest["eligibility_gate_version"],
         "training_mode": manifest["training_mode"],
@@ -161,12 +164,16 @@ class CandidateModel:
             raise ValueError("artifact checksum entries do not cover every required file")
         if self.manifest["feature_version"] != FEATURE_VERSION:
             raise ValueError("artifact feature version is incompatible")
+        if self.manifest.get("label_contract_id") != LABEL_CONTRACT_ID:
+            raise ValueError("artifact label contract is incompatible")
         if tuple(self.manifest["feature_columns"]) != FEATURE_COLUMNS:
             raise ValueError("artifact feature columns are incompatible")
         barrier_spec = self.manifest.get("barrier_spec", {})
         if (
             barrier_spec.get("id") != BARRIER_SPEC_ID
             or int(barrier_spec.get("horizon_bars", 0)) != BARRIER_HORIZON
+            or barrier_spec.get("price_alignment") != "BROKER_TICK_SIZE_OUTWARD"
+            or float(barrier_spec.get("tick_size", 0.0)) <= 0.0
         ):
             raise ValueError("artifact barrier contract is incompatible")
         executable_side = self.manifest.get("executable_side_contract", {})
@@ -176,6 +183,7 @@ class CandidateModel:
             or executable_side.get("long_exit_ohlc") != "BID"
             or executable_side.get("short_exit_ohlc") != "ASK"
             or executable_side.get("source") != "HISTORICAL_BID_ASK_TICKS"
+            or float(executable_side.get("minimum_tick_coverage", 0.0)) < 0.95
         ):
             raise ValueError("artifact executable-side contract is incompatible")
         self.quantile_models = {}
@@ -293,7 +301,15 @@ class CandidateModel:
         calibration = self.manifest["calibration_status"]
         origin = bars[-1]
         atr_24 = float(features.iloc[-1]["atr_24"])
-        barriers = barrier_prices(origin.close, atr_24)
+        tick_size = float(snapshot["symbol_spec"]["tick_size"])
+        artifact_tick_size = float(self.manifest["barrier_spec"]["tick_size"])
+        if not math.isclose(tick_size, artifact_tick_size, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("live broker tick size does not match the artifact contract")
+        barriers = barrier_prices(
+            origin.close,
+            atr_24,
+            tick_size,
+        )
         return {
             "prediction_id": deterministic_prediction_id(
                 model_id=self.model_id,
@@ -302,9 +318,13 @@ class CandidateModel:
                 origin_bar_timestamp=origin.timestamp.isoformat().replace("+00:00", "Z"),
                 feature_version=FEATURE_VERSION,
                 barrier_spec_id=BARRIER_SPEC_ID,
+                label_contract_id=LABEL_CONTRACT_ID,
             ),
             "model_id": self.model_id,
             "feature_version": FEATURE_VERSION,
+            "label_contract_id": LABEL_CONTRACT_ID,
+            "probability_reference": "FORECAST_ORIGIN",
+            "entry_conditioned_probability": False,
             "origin_bar_timestamp": origin.timestamp.isoformat().replace("+00:00", "Z"),
             "origin_close": origin.close,
             "origin_bar_index": int(origin.timestamp.timestamp() // 300),

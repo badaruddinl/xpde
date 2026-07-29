@@ -631,8 +631,12 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 "median_error": abs(actual_return - point["q50"]),
                 "interval_miss": not bool(interval_hit),
                 "direction_error": not bool(direction_hit),
-                "mfe_error_usd": expected_mfe - actual_mfe if horizon == 3 else None,
-                "mae_error_usd": expected_mae - actual_mae if horizon == 3 else None,
+                "mfe_error_price_distance": (
+                    expected_mfe - actual_mfe if horizon == 3 else None
+                ),
+                "mae_error_price_distance": (
+                    expected_mae - actual_mae if horizon == 3 else None
+                ),
             }
             inserted = connection.execute(
                 """

@@ -12,6 +12,7 @@ from xpde_ml.mt5_bridge import (
     completed_bar_distance,
     fetch_catchup_bars,
     forecast_generation_delay_ms,
+    has_complete_tick_coverage,
     next_retry_delay,
     post_payload,
 )
@@ -39,6 +40,14 @@ def test_http_error_includes_api_response_body(monkeypatch: pytest.MonkeyPatch) 
     assert raised.value.status == 400
     assert "snapshot rejected because data is stale" in raised.value.body
     assert "HTTP 400" in str(raised.value)
+
+
+def test_live_tick_coverage_requires_at_least_ninety_five_percent() -> None:
+    bar = {"tick_volume": 100.0, "executable_tick_count": 94}
+    assert not has_complete_tick_coverage(bar)
+    bar["executable_tick_count"] = 95
+    assert has_complete_tick_coverage(bar)
+    assert not has_complete_tick_coverage({"tick_volume": 0, "executable_tick_count": 10})
 
 
 def test_forecast_retry_accepts_already_accepted_response(

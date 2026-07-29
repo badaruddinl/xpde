@@ -415,10 +415,10 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
     assert rows[1]["barrier_short_outcome"] == "SL_FIRST"
     h1_metrics = json.loads(rows[0]["error_metrics_json"])
     h3_metrics = json.loads(rows[1]["error_metrics_json"])
-    assert h1_metrics["mfe_error_usd"] is None
-    assert h1_metrics["mae_error_usd"] is None
-    assert h3_metrics["mfe_error_usd"] is not None
-    assert h3_metrics["mae_error_usd"] is not None
+    assert h1_metrics["mfe_error_price_distance"] is None
+    assert h1_metrics["mae_error_price_distance"] is None
+    assert h3_metrics["mfe_error_price_distance"] is not None
+    assert h3_metrics["mae_error_price_distance"] is not None
     proposal_rows = connection.execute(
         "SELECT profile, action, barrier_outcome FROM decision_proposal_outcomes"
     ).fetchall()

@@ -29,7 +29,10 @@ test("server-renders the XPDE shadow terminal", async () => {
   assert.match(html, /Peluang arah dalam 3 bar \/ 15 menit/);
   assert.match(html, /Sisa reward dari harga entry tidak memadai/);
   assert.match(html, /Offline holdout coverage/);
-  assert.match(html, /Live coverage · 200 prediksi terakhir/);
+  assert.match(html, /Live coverage · fully-settled predictions/);
+  assert.match(html, /Origin forecast P\(TP-first\)/);
+  assert.match(html, /Tidak dikondisikan ulang terhadap current entry/);
+  assert.match(html, /Settlement completeness/);
   assert.match(html, /Current runtime session · direction/);
   assert.match(html, /Retry realtime/);
   assert.match(
@@ -51,4 +54,6 @@ test("keeps the server and client hydration fixture deterministic", async () => 
   const fixture = source.slice(fixtureStart, fixtureEnd);
   assert.doesNotMatch(fixture, /Date\.now\(\)|new Date\(\)\.toISOString\(\)/);
   assert.match(fixture, /DEMO_REFERENCE_MS/);
+  assert.match(source, /formatPrice\(state\.snapshot\.bid, priceDigits\)/);
+  assert.match(source, /state\.snapshot\.symbol_spec\.digits/);
 });

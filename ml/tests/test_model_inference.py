@@ -53,14 +53,19 @@ def test_probability_calibration_supports_v2_and_v3_payloads() -> None:
 def test_registration_payload_carries_executable_contract(tmp_path) -> None:
     manifest = {
         "model_id": "candidate-v3",
-        "feature_version": "goldm-m5-v4",
+        "feature_version": "goldm-m5-v5",
+        "label_contract_id": "exact-contiguous-m5-horizons-v1",
         "schema_version": 3,
         "eligibility_gate_version": 3,
         "training_mode": "candidate",
         "eligible_for_shadow": True,
-        "barrier_spec": {"id": "atr-1.25tp-1.00sl-h3-executable-v5"},
+        "barrier_spec": {
+            "id": "atr-1.25tp-1.00sl-h3-executable-tick-aligned-v6",
+            "price_alignment": "BROKER_TICK_SIZE_OUTWARD",
+            "tick_size": 0.01,
+        },
         "executable_side_contract": {
-            "id": "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4"
+            "id": "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5"
         },
         "eligibility_gates": {"dataset_integrity": True},
         "metrics": {"holdout": "verified"},
@@ -72,5 +77,6 @@ def test_registration_payload_carries_executable_contract(tmp_path) -> None:
     assert payload["eligibility_gate_version"] == 3
     assert (
         payload["executable_side_contract_id"]
-        == "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4"
+        == "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5"
     )
+    assert payload["label_contract_id"] == "exact-contiguous-m5-horizons-v1"

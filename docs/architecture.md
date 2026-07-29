@@ -97,12 +97,22 @@ The dataset gate also requires chart-Bid/tick-Bid parity within tick-size
 tolerance, `COPY_TICKS_ALL`, at least 95% tick-volume coverage, a parseable path
 for every bar, and exact path-to-OHLC reconstruction. The path is authoritative
 for first passage; OHLC is not used as a live ambiguity fallback.
+The label contract requires exact consecutive M5 timestamps at every forward
+step, so session and weekend gaps are masked for quantile, direction, barrier,
+MFE and MAE targets. Barrier prices are directionally rounded outward to the
+single broker tick size recorded in the artifact.
 LONG and SHORT retain `TP_FIRST`, `SL_FIRST`,
 `NO_HIT_BEFORE_EXPIRY`, `AMBIGUOUS_SAME_BAR`, and
 `AMBIGUOUS_SAME_TIMESTAMP`. Multiple executable prices sharing one millisecond
 are not assigned an invented order. A disagreement between q50,
 the direction classifier, and the stronger barrier side yields
 `FORECAST_SIDE_CONFLICT` and therefore `WAIT`.
+
+The same coverage invariant applies to live paths. SQLite stores source tick
+volume, executable tick count and coverage ratio alongside each ordered path.
+Settlement requires every expected bucket at >=95% coverage. Model health uses
+only fully settled outcomes and separately gates on >=98% settlement
+completeness over the latest due 200-prediction cohort.
 
 After downtime, market bars and their ordered `COPY_TICKS_ALL` paths are
 backfilled from the last local completed candle. Requests are gzip-compressed

@@ -12,7 +12,7 @@ np = pytest.importorskip("numpy")
 pd = pytest.importorskip("pandas")
 pytest.importorskip("catboost")
 
-from xpde_ml.dataset import BARRIER_SPEC_ID, build_training_frame
+from xpde_ml.dataset import BARRIER_SPEC_ID, LABEL_CONTRACT_ID, build_training_frame
 from xpde_ml.model_inference import CandidateModel
 from xpde_ml.train_catboost import train
 
@@ -55,6 +55,7 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
                 "ask_close": close + 0.24,
                 "executable_tick_count": 100 + index % 40,
                 "chart_mode": "BID",
+                "tick_size": 0.01,
             }
         )
         price = close
@@ -72,6 +73,8 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
     bars_csv.with_suffix(".manifest.json").write_text(
         json.dumps(
             {
+                "schema_version": 3,
+                "label_contract_id": LABEL_CONTRACT_ID,
                 "sha256": dataset_hash,
                 "symbol": "GOLDm#",
                 "timeframe": "M5",
@@ -81,10 +84,13 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
                 "git_commit": "synthetic-e2e",
                 "chart_mode": "BID",
                 "executable_side_source": "HISTORICAL_BID_ASK_TICKS",
+                "tick_collection_mode": "COPY_TICKS_ALL",
                 "executable_integrity": {
                     "parity_mismatch_rate": 0.0,
                     "bars_without_full_tick_history": 0,
                     "minimum_tick_coverage_per_bar": 1.0,
+                    "tick_path_valid_rate": 1.0,
+                    "tick_size": 0.01,
                 },
             }
         ),
@@ -112,6 +118,7 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
         "timeframe": "M5",
         "bid": float(latest.iloc[-1]["close"]) - 0.12,
         "ask": float(latest.iloc[-1]["close"]) + 0.12,
+        "symbol_spec": {"tick_size": 0.01, "digits": 2},
         "bars": [
             {
                 "timestamp": row.timestamp.isoformat().replace("+00:00", "Z"),

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from itertools import groupby
 import json
 
 from .contracts import HORIZONS
 
-FEATURE_VERSION = "goldm-m5-v4"
+FEATURE_VERSION = "goldm-m5-v5"
 FEATURE_COLUMNS = (
     "return_1",
     "return_3",
@@ -51,10 +52,12 @@ METADATA = DatasetMetadata(
 )
 
 BARRIER_HORIZON = 3
-BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v5"
+BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-tick-aligned-v6"
 EXECUTABLE_SIDE_CONTRACT_ID = (
-    "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4"
+    "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5"
 )
+LABEL_CONTRACT_ID = "exact-contiguous-m5-horizons-v1"
+MINIMUM_EXECUTABLE_TICK_COVERAGE = 0.95
 BARRIER_TP_ATR_MULTIPLIER = 1.25
 BARRIER_SL_ATR_MULTIPLIER = 1.0
 BARRIER_CLASS = {
@@ -64,15 +67,49 @@ BARRIER_CLASS = {
 }
 
 
-def barrier_prices(origin_close: float, atr: float) -> dict[str, float]:
+def snap_price_to_tick(price: float, tick_size: float, *, upward: bool) -> float:
+    """Snap a price outward to an executable broker tick without float drift."""
+    if not all(map(np_is_finite, (price, tick_size))) or price <= 0 or tick_size <= 0:
+        raise ValueError("price and tick size must be finite positive values")
+    price_decimal = Decimal(str(price))
+    tick_decimal = Decimal(str(tick_size))
+    rounding = ROUND_CEILING if upward else ROUND_FLOOR
+    ticks = (price_decimal / tick_decimal).to_integral_value(rounding=rounding)
+    return float(ticks * tick_decimal)
+
+
+def barrier_prices(
+    origin_close: float, atr: float, tick_size: float
+) -> dict[str, float]:
     """Return the exact prices represented by the barrier classifiers."""
-    if not all(map(np_is_finite, (origin_close, atr))) or origin_close <= 0 or atr <= 0:
-        raise ValueError("barrier origin and ATR must be finite positive values")
+    if (
+        not all(map(np_is_finite, (origin_close, atr, tick_size)))
+        or origin_close <= 0
+        or atr <= 0
+        or tick_size <= 0
+    ):
+        raise ValueError("barrier origin, ATR and tick size must be finite positive values")
     return {
-        "target_price_long": origin_close + BARRIER_TP_ATR_MULTIPLIER * atr,
-        "stop_price_long": origin_close - BARRIER_SL_ATR_MULTIPLIER * atr,
-        "target_price_short": origin_close - BARRIER_TP_ATR_MULTIPLIER * atr,
-        "stop_price_short": origin_close + BARRIER_SL_ATR_MULTIPLIER * atr,
+        "target_price_long": snap_price_to_tick(
+            origin_close + BARRIER_TP_ATR_MULTIPLIER * atr,
+            tick_size,
+            upward=True,
+        ),
+        "stop_price_long": snap_price_to_tick(
+            origin_close - BARRIER_SL_ATR_MULTIPLIER * atr,
+            tick_size,
+            upward=False,
+        ),
+        "target_price_short": snap_price_to_tick(
+            origin_close - BARRIER_TP_ATR_MULTIPLIER * atr,
+            tick_size,
+            upward=False,
+        ),
+        "stop_price_short": snap_price_to_tick(
+            origin_close + BARRIER_SL_ATR_MULTIPLIER * atr,
+            tick_size,
+            upward=True,
+        ),
     }
 
 
@@ -142,6 +179,21 @@ def postprocess_quantiles(values):
     return np.maximum.accumulate(array, axis=-1)
 
 
+def contiguous_forward_mask(timestamps, horizon: int, *, minutes: int = 5):
+    """Require every forward step to be an exact consecutive M5 timestamp."""
+    import pandas as pd
+
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    normalized = pd.to_datetime(timestamps, utc=True)
+    mask = normalized.notna()
+    for step in range(1, horizon + 1):
+        mask &= normalized.shift(-step).eq(
+            normalized + pd.Timedelta(minutes=minutes * step)
+        )
+    return mask
+
+
 def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
     """Add future-return, direction, excursion and TP-before-SL labels."""
     import numpy as np
@@ -163,9 +215,22 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
     ).all():
         raise ValueError("candidate labels currently require MT5 BID chart mode")
     close = result["close"].astype(float)
+    continuity_masks = {
+        horizon: contiguous_forward_mask(result["timestamp"], horizon)
+        for horizon in HORIZONS
+    }
+    continuity_masks.setdefault(
+        barrier_horizon,
+        contiguous_forward_mask(result["timestamp"], barrier_horizon),
+    )
     for horizon in HORIZONS:
-        result[f"target_{horizon}"] = np.log(close.shift(-horizon) / close)
-    result["direction_3"] = (result["target_3"] > 0).astype(float)
+        raw_target = np.log(close.shift(-horizon) / close)
+        result[f"target_{horizon}"] = raw_target.where(continuity_masks[horizon])
+    result["direction_3"] = np.where(
+        result["target_3"].notna(),
+        (result["target_3"] > 0).astype(float),
+        np.nan,
+    )
 
     barrier_long_outcome: list[str | None] = []
     barrier_short_outcome: list[str | None] = []
@@ -238,7 +303,19 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
         future = result.iloc[index + 1 : index + 1 + barrier_horizon]
         atr = float(row.get("atr_24", np.nan))
         start = float(row["close"])
-        if len(future) < barrier_horizon or not np.isfinite(atr) or atr <= 0:
+        is_contiguous = (
+            barrier_horizon in continuity_masks
+            and bool(continuity_masks[barrier_horizon].iloc[index])
+        )
+        tick_size = float(row.get("tick_size", np.nan))
+        if (
+            len(future) < barrier_horizon
+            or not is_contiguous
+            or not np.isfinite(atr)
+            or atr <= 0
+            or not np.isfinite(tick_size)
+            or tick_size <= 0
+        ):
             barrier_long_outcome.append(None)
             barrier_short_outcome.append(None)
             barrier_long_class.append(np.nan)
@@ -251,7 +328,7 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
             mae_short.append(np.nan)
             continue
 
-        prices = barrier_prices(start, atr)
+        prices = barrier_prices(start, atr, tick_size)
         long_outcome, long_touch_time = classify_barrier(
             future,
             target=prices["target_price_long"],
@@ -291,10 +368,10 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
     result["barrier_short_class"] = barrier_short_class
     result["barrier_long_first_touch_time_msc"] = barrier_long_first_touch_time
     result["barrier_short_first_touch_time_msc"] = barrier_short_first_touch_time
-    result["mfe_long_usd"] = mfe_long
-    result["mae_long_usd"] = mae_long
-    result["mfe_short_usd"] = mfe_short
-    result["mae_short_usd"] = mae_short
+    result["mfe_long_price_distance"] = mfe_long
+    result["mae_long_price_distance"] = mae_long
+    result["mfe_short_price_distance"] = mfe_short
+    result["mae_short_price_distance"] = mae_short
     return result
 
 

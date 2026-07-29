@@ -21,6 +21,7 @@ from xpde_ml.dataset import (
     BARRIER_SPEC_ID,
     EXECUTABLE_SIDE_CONTRACT_ID,
     FEATURE_VERSION,
+    LABEL_CONTRACT_ID,
 )
 from xpde_ml.model_inference import (
     REQUIRED_ARTIFACT_FILES,
@@ -73,12 +74,14 @@ def _golden_snapshot() -> dict:
         "timeframe": "M5",
         "bid": close - 0.12,
         "ask": close + 0.12,
+        "symbol_spec": {"tick_size": 0.01, "digits": 2},
         "bars": bars,
     }
 
 
 def _verify_golden_forecast(path: Path) -> None:
-    forecast = CandidateModel(path).forecast(_golden_snapshot())
+    snapshot = _golden_snapshot()
+    forecast = CandidateModel(path).forecast(snapshot)
     numeric_fields = (
         "origin_close",
         "direction_probability_up",
@@ -94,12 +97,31 @@ def _verify_golden_forecast(path: Path) -> None:
     if (
         forecast["barrier_spec_id"] != BARRIER_SPEC_ID
         or int(forecast["barrier_horizon_bars"]) != BARRIER_HORIZON
+        or forecast.get("label_contract_id") != LABEL_CONTRACT_ID
+        or forecast.get("probability_reference") != "FORECAST_ORIGIN"
+        or forecast.get("entry_conditioned_probability") is not False
         or forecast["stop_price_long"] >= forecast["origin_close"]
         or forecast["target_price_long"] <= forecast["origin_close"]
         or forecast["target_price_short"] >= forecast["origin_close"]
         or forecast["stop_price_short"] <= forecast["origin_close"]
     ):
         raise ValueError("golden forecast violates the barrier contract")
+    tick_size = float(snapshot["symbol_spec"]["tick_size"])
+    if any(
+        not math.isclose(
+            float(forecast[field]) / tick_size,
+            round(float(forecast[field]) / tick_size),
+            rel_tol=0.0,
+            abs_tol=1e-7,
+        )
+        for field in (
+            "target_price_long",
+            "stop_price_long",
+            "target_price_short",
+            "stop_price_short",
+        )
+    ):
+        raise ValueError("golden forecast barriers are not broker-tick aligned")
     for point in forecast["points"]:
         quantiles = [point[f"q{quantile}"] for quantile in (10, 25, 50, 75, 90)]
         if any(not math.isfinite(float(value)) for value in quantiles):
@@ -142,10 +164,14 @@ def verify_candidate(path: Path) -> dict:
         raise ValueError("artifact checksums do not cover every required file")
     if manifest.get("feature_version") != FEATURE_VERSION:
         raise ValueError("artifact feature version is incompatible")
+    if manifest.get("label_contract_id") != LABEL_CONTRACT_ID:
+        raise ValueError("artifact label contract is incompatible")
     barrier = manifest.get("barrier_spec", {})
     if (
         barrier.get("id") != BARRIER_SPEC_ID
         or int(barrier.get("horizon_bars", 0)) != BARRIER_HORIZON
+        or barrier.get("price_alignment") != "BROKER_TICK_SIZE_OUTWARD"
+        or float(barrier.get("tick_size", 0.0)) <= 0.0
     ):
         raise ValueError("artifact barrier contract is incompatible")
     executable_side = manifest.get("executable_side_contract", {})
@@ -155,6 +181,7 @@ def verify_candidate(path: Path) -> dict:
         or executable_side.get("long_exit_ohlc") != "BID"
         or executable_side.get("short_exit_ohlc") != "ASK"
         or executable_side.get("source") != "HISTORICAL_BID_ASK_TICKS"
+        or float(executable_side.get("minimum_tick_coverage", 0.0)) < 0.95
     ):
         raise ValueError("artifact executable-side contract is incompatible")
     model_id = str(manifest.get("model_id", "")).strip()

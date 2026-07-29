@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,8 @@ def make_artifact(path: Path, *, eligible: bool = True) -> Path:
     manifest = {
         "schema_version": 3,
         "model_id": "candidate-test-v3",
-        "feature_version": "goldm-m5-v4",
+        "feature_version": importer.FEATURE_VERSION,
+        "label_contract_id": importer.LABEL_CONTRACT_ID,
         "eligible_for_shadow": eligible,
         "eligibility_gate_version": 3,
         "training_mode": "candidate",
@@ -30,15 +32,18 @@ def make_artifact(path: Path, *, eligible: bool = True) -> Path:
         },
         "artifact_files": artifact_files,
         "barrier_spec": {
-            "id": "atr-1.25tp-1.00sl-h3-executable-v5",
+            "id": importer.BARRIER_SPEC_ID,
             "horizon_bars": 3,
+            "price_alignment": "BROKER_TICK_SIZE_OUTWARD",
+            "tick_size": 0.01,
         },
         "executable_side_contract": {
-            "id": "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4",
+            "id": importer.EXECUTABLE_SIDE_CONTRACT_ID,
             "chart_mode": "BID",
             "long_exit_ohlc": "BID",
             "short_exit_ohlc": "ASK",
             "source": "HISTORICAL_BID_ASK_TICKS",
+            "minimum_tick_coverage": 0.95,
         },
     }
     (path / "manifest.json").write_text(
@@ -67,17 +72,27 @@ class FakeCandidateModel:
 
     def forecast(self, snapshot: dict) -> dict:
         origin = snapshot["bars"][-1]
+        tick_size = float(snapshot["symbol_spec"]["tick_size"])
+
+        def snap(value: float, *, upward: bool) -> float:
+            ticks = value / tick_size
+            snapped_ticks = math.ceil(ticks - 1e-10) if upward else math.floor(ticks + 1e-10)
+            return snapped_ticks * tick_size
+
         return {
             "origin_close": origin["close"],
             "direction_probability_up": 0.55,
             "barrier_probability_long": 0.54,
             "barrier_probability_short": 0.46,
-            "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v5",
+            "barrier_spec_id": importer.BARRIER_SPEC_ID,
             "barrier_horizon_bars": 3,
-            "target_price_long": origin["close"] + 1.25,
-            "stop_price_long": origin["close"] - 1.0,
-            "target_price_short": origin["close"] - 1.25,
-            "stop_price_short": origin["close"] + 1.0,
+            "label_contract_id": importer.LABEL_CONTRACT_ID,
+            "probability_reference": "FORECAST_ORIGIN",
+            "entry_conditioned_probability": False,
+            "target_price_long": snap(origin["close"] + 1.25, upward=True),
+            "stop_price_long": snap(origin["close"] - 1.0, upward=False),
+            "target_price_short": snap(origin["close"] - 1.25, upward=False),
+            "stop_price_short": snap(origin["close"] + 1.0, upward=True),
             "points": [
                 {
                     "q10": -0.01,

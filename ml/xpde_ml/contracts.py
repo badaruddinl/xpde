@@ -16,6 +16,7 @@ def deterministic_prediction_id(
     origin_bar_timestamp: str,
     feature_version: str,
     barrier_spec_id: str,
+    label_contract_id: str,
 ) -> str:
     key = "|".join(
         (
@@ -25,6 +26,7 @@ def deterministic_prediction_id(
             origin_bar_timestamp,
             feature_version,
             barrier_spec_id,
+            label_contract_id,
         )
     )
     return str(uuid.uuid5(PREDICTION_ID_NAMESPACE, key))
