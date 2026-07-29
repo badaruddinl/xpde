@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 pub const SUPPORTED_SYMBOL: &str = "GOLDm#";
 pub const SUPPORTED_TIMEFRAME: &str = "M5";
-pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-v1";
+pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v2";
+pub const EXECUTABLE_SIDE_CONTRACT_ID: &str = "bid-entry-exit-long-ask-exit-short-v1";
 pub const BARRIER_HORIZON_BARS: u32 = 3;
 pub const M5_BAR_MINUTES: i64 = 5;
 
@@ -17,6 +18,104 @@ pub struct MarketBar {
     pub low: f64,
     pub close: f64,
     pub tick_volume: f64,
+    #[serde(default)]
+    pub bid_open: Option<f64>,
+    #[serde(default)]
+    pub bid_high: Option<f64>,
+    #[serde(default)]
+    pub bid_low: Option<f64>,
+    #[serde(default)]
+    pub bid_close: Option<f64>,
+    #[serde(default)]
+    pub ask_open: Option<f64>,
+    #[serde(default)]
+    pub ask_high: Option<f64>,
+    #[serde(default)]
+    pub ask_low: Option<f64>,
+    #[serde(default)]
+    pub ask_close: Option<f64>,
+    #[serde(default)]
+    pub executable_tick_count: u64,
+}
+
+impl MarketBar {
+    pub fn has_executable_sides(&self) -> bool {
+        let values = [
+            self.bid_open,
+            self.bid_high,
+            self.bid_low,
+            self.bid_close,
+            self.ask_open,
+            self.ask_high,
+            self.ask_low,
+            self.ask_close,
+        ];
+        if values.iter().any(Option::is_none) {
+            return false;
+        }
+        let bid_open = self.bid_open.unwrap_or_default();
+        let bid_high = self.bid_high.unwrap_or_default();
+        let bid_low = self.bid_low.unwrap_or_default();
+        let bid_close = self.bid_close.unwrap_or_default();
+        let ask_open = self.ask_open.unwrap_or_default();
+        let ask_high = self.ask_high.unwrap_or_default();
+        let ask_low = self.ask_low.unwrap_or_default();
+        let ask_close = self.ask_close.unwrap_or_default();
+        values.iter().flatten().all(|value| value.is_finite())
+            && bid_low > 0.0
+            && ask_low > bid_low
+            && bid_high >= bid_open.max(bid_close)
+            && bid_low <= bid_open.min(bid_close)
+            && ask_high >= ask_open.max(ask_close)
+            && ask_low <= ask_open.min(ask_close)
+            && ask_open > bid_open
+            && ask_high > bid_high
+            && ask_low > bid_low
+            && ask_close > bid_close
+            && self.executable_tick_count > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ChartMode {
+    Bid,
+    Last,
+    #[default]
+    Unknown,
+}
+
+impl ChartMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bid => "BID",
+            Self::Last => "LAST",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MarketStatus {
+    Open,
+    MarketClosed,
+    FeedStale,
+    BridgeDisconnected,
+    #[default]
+    Unknown,
+}
+
+impl MarketStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::MarketClosed => "MARKET_CLOSED",
+            Self::FeedStale => "FEED_STALE",
+            Self::BridgeDisconnected => "BRIDGE_DISCONNECTED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -45,12 +144,24 @@ pub struct SymbolSpec {
     pub margin_per_lot_buy: Option<f64>,
     #[serde(default)]
     pub margin_per_lot_sell: Option<f64>,
+    #[serde(default)]
+    pub chart_mode: ChartMode,
+    #[serde(default)]
+    pub quote_currency: String,
+    #[serde(default)]
+    pub pnl_currency: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DataQuality {
     pub completeness: f64,
     pub tick_age_ms: u64,
+    #[serde(default)]
+    pub absolute_tick_age_ms: u64,
+    #[serde(default)]
+    pub transport_tick_age_ms: u64,
+    #[serde(default)]
+    pub market_status: MarketStatus,
     pub missing_flags: Vec<String>,
     pub reason_codes: Vec<String>,
 }
@@ -59,6 +170,9 @@ impl DataQuality {
     pub fn is_valid(&self, max_tick_age_ms: u64) -> bool {
         self.completeness >= 0.995
             && self.tick_age_ms <= max_tick_age_ms
+            && self.absolute_tick_age_ms <= max_tick_age_ms
+            && self.transport_tick_age_ms <= max_tick_age_ms
+            && self.market_status == MarketStatus::Open
             && self.missing_flags.is_empty()
     }
 }
@@ -86,6 +200,32 @@ impl MarketSnapshot {
 
     pub fn mid_price(&self) -> f64 {
         (self.ask + self.bid) / 2.0
+    }
+
+    pub fn rolling_exit_spread(&self, maximum_bars: usize) -> Option<f64> {
+        let mut recent = self
+            .bars
+            .iter()
+            .chain(self.current_bar.iter())
+            .filter_map(|bar| Some((bar.timestamp, bar.ask_close? - bar.bid_close?)))
+            .filter(|(_, spread)| spread.is_finite() && *spread > 0.0)
+            .collect::<Vec<_>>();
+        recent.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
+        let mut spreads = recent
+            .into_iter()
+            .take(maximum_bars)
+            .map(|(_, spread)| spread)
+            .collect::<Vec<_>>();
+        if spreads.is_empty() {
+            return None;
+        }
+        spreads.sort_by(f64::total_cmp);
+        let middle = spreads.len() / 2;
+        Some(if spreads.len() % 2 == 0 {
+            (spreads[middle - 1] + spreads[middle]) / 2.0
+        } else {
+            spreads[middle]
+        })
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
@@ -132,6 +272,19 @@ impl MarketSnapshot {
                 .is_some_and(|bar| bar.timestamp.timestamp() % 300 != 0)
         {
             return Err(ContractError::MisalignedMarketBar);
+        }
+        if self.bars.iter().chain(self.current_bar.iter()).any(|bar| {
+            let has_any_executable_value = bar.bid_open.is_some()
+                || bar.bid_high.is_some()
+                || bar.bid_low.is_some()
+                || bar.bid_close.is_some()
+                || bar.ask_open.is_some()
+                || bar.ask_high.is_some()
+                || bar.ask_low.is_some()
+                || bar.ask_close.is_some();
+            has_any_executable_value && !bar.has_executable_sides()
+        }) {
+            return Err(ContractError::InvalidExecutableBar);
         }
         Ok(())
     }
@@ -267,6 +420,14 @@ pub struct DecisionProposal {
     pub profile: TradingProfile,
     #[serde(default)]
     pub broker_policy_id: String,
+    #[serde(default)]
+    pub cost_model_id: String,
+    #[serde(default)]
+    pub account_currency: String,
+    #[serde(default)]
+    pub quote_currency: String,
+    #[serde(default)]
+    pub pnl_currency: String,
     pub action: DecisionAction,
     pub generated_at: DateTime<Utc>,
     pub decision_valid_until: DateTime<Utc>,
@@ -284,6 +445,14 @@ pub struct DecisionProposal {
     pub reward_risk_ratio: f64,
     #[serde(default)]
     pub entry_deviation_from_origin: f64,
+    #[serde(default)]
+    pub entry_spread: f64,
+    #[serde(default)]
+    pub expected_exit_spread: f64,
+    #[serde(default)]
+    pub slippage_assumption: f64,
+    #[serde(default)]
+    pub commission: f64,
     pub invalidation_price: Option<f64>,
     pub target_price: Option<f64>,
     pub reason_codes: Vec<String>,
@@ -294,9 +463,11 @@ pub struct DecisionProposal {
 pub struct DecisionPolicy {
     pub profile: TradingProfile,
     pub broker_policy_id: String,
+    pub cost_model_id: String,
     pub max_tick_age_ms: u64,
     pub max_spread_usd: f64,
     pub commission_usd_per_lot: f64,
+    pub expected_exit_spread_usd: f64,
     pub slippage_buffer_usd: f64,
     pub min_direction_probability: f64,
     pub min_barrier_probability: f64,
@@ -312,9 +483,11 @@ impl DecisionPolicy {
         Self {
             profile: TradingProfile::Scalper,
             broker_policy_id: "goldm-demo-v1".to_owned(),
+            cost_model_id: "executable-side-v1".to_owned(),
             max_tick_age_ms: 10_000,
             max_spread_usd: 0.80,
             commission_usd_per_lot: 0.0,
+            expected_exit_spread_usd: 0.34,
             slippage_buffer_usd: 0.08,
             min_direction_probability: 0.56,
             min_barrier_probability: 0.52,
@@ -330,9 +503,11 @@ impl DecisionPolicy {
         Self {
             profile: TradingProfile::Sniper,
             broker_policy_id: "goldm-demo-v1".to_owned(),
+            cost_model_id: "executable-side-v1".to_owned(),
             max_tick_age_ms: 5_000,
             max_spread_usd: 0.55,
             commission_usd_per_lot: 0.0,
+            expected_exit_spread_usd: 0.34,
             slippage_buffer_usd: 0.08,
             min_direction_probability: 0.64,
             min_barrier_probability: 0.60,
@@ -367,6 +542,10 @@ pub fn decide_at(
         prediction_id: forecast.prediction_id,
         profile: policy.profile,
         broker_policy_id: policy.broker_policy_id.clone(),
+        cost_model_id: policy.cost_model_id.clone(),
+        account_currency: snapshot.account.currency.clone(),
+        quote_currency: snapshot.symbol_spec.quote_currency.clone(),
+        pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
         action: DecisionAction::NoPrediction,
         generated_at,
         decision_valid_until,
@@ -378,6 +557,10 @@ pub fn decide_at(
         remaining_risk_usd: 0.0,
         reward_risk_ratio: 0.0,
         entry_deviation_from_origin: 0.0,
+        entry_spread: snapshot.spread_usd(),
+        expected_exit_spread: policy.expected_exit_spread_usd,
+        slippage_assumption: policy.slippage_buffer_usd,
+        commission: policy.commission_usd_per_lot * snapshot.symbol_spec.volume_min,
         invalidation_price: None,
         target_price: None,
         reason_codes: vec![reason.to_owned()],
@@ -429,11 +612,13 @@ pub fn decide_at(
     let mut warnings = Vec::new();
 
     if !snapshot.data_quality.is_valid(policy.max_tick_age_ms) {
-        return no_prediction(
-            "DATA_INVALID_OR_STALE",
-            decision_valid_until,
-            outcome_matures_at,
-        );
+        let reason = match snapshot.data_quality.market_status {
+            MarketStatus::MarketClosed => "MARKET_CLOSED",
+            MarketStatus::FeedStale => "FEED_STALE",
+            MarketStatus::BridgeDisconnected => "BRIDGE_DISCONNECTED",
+            _ => "DATA_INVALID_OR_STALE",
+        };
+        return no_prediction(reason, decision_valid_until, outcome_matures_at);
     }
     if snapshot.spread_usd() > policy.max_spread_usd {
         return no_prediction(
@@ -501,16 +686,29 @@ pub fn decide_at(
         _ => unreachable!("selected side is always directional"),
     };
     let median_price = forecast.origin_close * horizon.q50.exp();
-    let all_in_cost_usd = snapshot.spread_usd()
-        + policy.slippage_buffer_usd
-        + policy.commission_usd_per_lot / snapshot.symbol_spec.contract_size;
-    let median_move_price = match selected_side {
-        DecisionAction::Long => median_price - reference_entry_price,
-        DecisionAction::Short => reference_entry_price - median_price,
+    let expected_exit_spread = snapshot
+        .rolling_exit_spread(24)
+        .unwrap_or(policy.expected_exit_spread_usd)
+        .max(0.0);
+    let median_exit_price = match selected_side {
+        DecisionAction::Long => median_price,
+        DecisionAction::Short => median_price + expected_exit_spread,
         _ => unreachable!("selected side is always directional"),
     };
+    let median_move_price = match selected_side {
+        DecisionAction::Long => median_exit_price - reference_entry_price,
+        DecisionAction::Short => reference_entry_price - median_exit_price,
+        _ => unreachable!("selected side is always directional"),
+    };
+    let slippage_cost =
+        policy.slippage_buffer_usd * snapshot.symbol_spec.contract_size * reference_lot;
+    let commission_cost = policy.commission_usd_per_lot * reference_lot;
     let median_move_after_cost =
-        (median_move_price - all_in_cost_usd) * snapshot.symbol_spec.contract_size * reference_lot;
+        median_move_price * snapshot.symbol_spec.contract_size * reference_lot
+            - slippage_cost
+            - commission_cost;
+    let non_spread_cost_price = policy.slippage_buffer_usd
+        + policy.commission_usd_per_lot / snapshot.symbol_spec.contract_size;
     let (remaining_reward_price, remaining_risk_price, entry_inside_barrier) = match selected_side {
         DecisionAction::Long => (
             target_price - reference_entry_price,
@@ -540,21 +738,38 @@ pub fn decide_at(
         _ => unreachable!("selected side is always directional"),
     }
     .max(snapshot.symbol_spec.tick_size);
-    let barrier_already_touched =
+    let executable_barrier_state =
         snapshot
             .current_bar
             .as_ref()
-            .is_some_and(|bar| match selected_side {
-                DecisionAction::Long => bar.high >= target_price || bar.low <= stop_price,
-                DecisionAction::Short => bar.low <= target_price || bar.high >= stop_price,
-                _ => false,
+            .and_then(|bar| match selected_side {
+                DecisionAction::Long => Some((
+                    bar.bid_high?,
+                    bar.bid_low?,
+                    bar.bid_high? >= target_price || bar.bid_low? <= stop_price,
+                )),
+                DecisionAction::Short => Some((
+                    bar.ask_high?,
+                    bar.ask_low?,
+                    bar.ask_low? <= target_price || bar.ask_high? >= stop_price,
+                )),
+                _ => None,
             });
+    let barrier_already_touched = executable_barrier_state
+        .map(|(_, _, touched)| touched)
+        .unwrap_or(false);
 
     let direction_ok = direction_probability >= policy.min_direction_probability;
     let barrier_ok = barrier_probability >= policy.min_barrier_probability;
 
     if barrier_already_touched {
         reasons.push("BARRIER_ALREADY_TOUCHED".to_owned());
+    }
+    if snapshot.symbol_spec.chart_mode != ChartMode::Bid {
+        reasons.push("UNSUPPORTED_CHART_MODE".to_owned());
+    }
+    if executable_barrier_state.is_none() {
+        reasons.push("EXECUTABLE_SIDE_BAR_MISSING".to_owned());
     }
     if !entry_inside_barrier {
         reasons.push("ENTRY_PRICE_OUTSIDE_BARRIER".to_owned());
@@ -566,7 +781,7 @@ pub fn decide_at(
         reasons.push("SPREAD_ABOVE_ATR_LIMIT".to_owned());
     }
     if median_move_after_cost <= 0.0
-        || remaining_reward_price <= all_in_cost_usd
+        || remaining_reward_price <= non_spread_cost_price
         || reward_risk_ratio < policy.min_reward_risk_ratio
     {
         reasons.push("REMAINING_EDGE_TOO_SMALL".to_owned());
@@ -601,6 +816,10 @@ pub fn decide_at(
         prediction_id: forecast.prediction_id,
         profile: policy.profile,
         broker_policy_id: policy.broker_policy_id.clone(),
+        cost_model_id: policy.cost_model_id.clone(),
+        account_currency: snapshot.account.currency.clone(),
+        quote_currency: snapshot.symbol_spec.quote_currency.clone(),
+        pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
         action,
         generated_at,
         decision_valid_until,
@@ -612,6 +831,10 @@ pub fn decide_at(
         remaining_risk_usd,
         reward_risk_ratio,
         entry_deviation_from_origin,
+        entry_spread: snapshot.spread_usd(),
+        expected_exit_spread,
+        slippage_assumption: policy.slippage_buffer_usd,
+        commission: commission_cost,
         invalidation_price: invalidation,
         target_price: target,
         reason_codes: reasons,
@@ -659,6 +882,8 @@ pub enum ContractError {
     FutureMarketData,
     #[error("M5 market bar timestamp is not aligned to a five-minute boundary")]
     MisalignedMarketBar,
+    #[error("market bar contains an invalid executable Bid/Ask contract")]
+    InvalidExecutableBar,
     #[error("invalid quantile ordering for horizon {0}")]
     InvalidQuantiles(u32),
     #[error("probability must be between zero and one")]
@@ -700,9 +925,34 @@ mod tests {
                     low: 3329.0,
                     close: 3330.5,
                     tick_volume: 100.0,
+                    bid_open: Some(3330.0),
+                    bid_high: Some(3331.0),
+                    bid_low: Some(3329.0),
+                    bid_close: Some(3330.5),
+                    ask_open: Some(3330.24),
+                    ask_high: Some(3331.24),
+                    ask_low: Some(3329.24),
+                    ask_close: Some(3330.74),
+                    executable_tick_count: 100,
                 })
                 .collect(),
-            current_bar: None,
+            current_bar: Some(MarketBar {
+                timestamp: now,
+                open: 3330.5,
+                high: 3330.8,
+                low: 3330.2,
+                close: 3330.6,
+                tick_volume: 10.0,
+                bid_open: Some(3330.5),
+                bid_high: Some(3330.8),
+                bid_low: Some(3330.2),
+                bid_close: Some(3330.6),
+                ask_open: Some(3330.74),
+                ask_high: Some(3331.04),
+                ask_low: Some(3330.44),
+                ask_close: Some(3330.84),
+                executable_tick_count: 10,
+            }),
             account: AccountSnapshot {
                 login: 1,
                 server: "Demo".to_owned(),
@@ -724,10 +974,16 @@ mod tests {
                 digits: 2,
                 margin_per_lot_buy: Some(3.34),
                 margin_per_lot_sell: Some(3.34),
+                chart_mode: ChartMode::Bid,
+                quote_currency: "USD".to_owned(),
+                pnl_currency: "USD".to_owned(),
             },
             data_quality: DataQuality {
                 completeness: 1.0,
                 tick_age_ms: 100,
+                absolute_tick_age_ms: 100,
+                transport_tick_age_ms: 100,
+                market_status: MarketStatus::Open,
                 missing_flags: Vec::new(),
                 reason_codes: Vec::new(),
             },
@@ -834,6 +1090,52 @@ mod tests {
     }
 
     #[test]
+    fn side_aware_costs_do_not_double_charge_long_spread() {
+        let snapshot = sample_snapshot();
+        let forecast = sample_forecast();
+        let policy = DecisionPolicy::scalper();
+        let proposal = decide(&snapshot, &forecast, &policy);
+        let median_bid_exit = forecast.origin_close * forecast.points[0].q50.exp();
+        let expected = (median_bid_exit - snapshot.ask)
+            * snapshot.symbol_spec.contract_size
+            * snapshot.symbol_spec.volume_min
+            - policy.slippage_buffer_usd
+                * snapshot.symbol_spec.contract_size
+                * snapshot.symbol_spec.volume_min;
+        assert!((proposal.median_move_after_cost_usd - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn short_exit_uses_rolling_executable_ask_spread() {
+        let snapshot = sample_snapshot();
+        let mut forecast = sample_forecast();
+        forecast.direction_probability_up = 0.33;
+        forecast.barrier_probability_long = 0.37;
+        forecast.barrier_probability_short = 0.63;
+        forecast.stop_price_short = 3331.5;
+        forecast.points[0].q10 = -0.0015;
+        forecast.points[0].q25 = -0.0010;
+        forecast.points[0].q50 = -0.0006;
+        forecast.points[0].q75 = -0.0001;
+        forecast.points[0].q90 = 0.0003;
+        let mut policy = DecisionPolicy::scalper();
+        policy.expected_exit_spread_usd = 0.80;
+
+        let proposal = decide(&snapshot, &forecast, &policy);
+
+        assert_eq!(proposal.action, DecisionAction::Short);
+        assert!((proposal.expected_exit_spread - 0.24).abs() < 1e-10);
+        let future_bid = forecast.origin_close * forecast.points[0].q50.exp();
+        let expected_move = (snapshot.bid - (future_bid + 0.24))
+            * snapshot.symbol_spec.contract_size
+            * snapshot.symbol_spec.volume_min
+            - policy.slippage_buffer_usd
+                * snapshot.symbol_spec.contract_size
+                * snapshot.symbol_spec.volume_min;
+        assert!((proposal.median_move_after_cost_usd - expected_move).abs() < 1e-10);
+    }
+
+    #[test]
     fn touched_barrier_forces_wait_before_entry() {
         let forecast = sample_forecast();
         let mut snapshot = sample_snapshot();
@@ -844,6 +1146,15 @@ mod tests {
             low: forecast.origin_close,
             close: forecast.origin_close,
             tick_volume: 10.0,
+            bid_open: Some(forecast.origin_close),
+            bid_high: Some(forecast.target_price_long),
+            bid_low: Some(forecast.origin_close),
+            bid_close: Some(forecast.origin_close),
+            ask_open: Some(forecast.origin_close + 0.24),
+            ask_high: Some(forecast.target_price_long + 0.24),
+            ask_low: Some(forecast.origin_close + 0.24),
+            ask_close: Some(forecast.origin_close + 0.24),
+            executable_tick_count: 10,
         });
         let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
         assert_eq!(decision.action, DecisionAction::Wait);
@@ -927,6 +1238,29 @@ mod tests {
             bar.open = forecast.origin_close;
             bar.high = forecast.origin_close + 1.0;
             bar.low = forecast.origin_close - 1.0;
+            bar.bid_open = Some(bar.open);
+            bar.bid_high = Some(bar.high);
+            bar.bid_low = Some(bar.low);
+            bar.bid_close = Some(bar.close);
+            bar.ask_open = Some(bar.open + 0.24);
+            bar.ask_high = Some(bar.high + 0.24);
+            bar.ask_low = Some(bar.low + 0.24);
+            bar.ask_close = Some(bar.close + 0.24);
+        }
+        if let Some(current) = snapshot.current_bar.as_mut() {
+            current.timestamp = forecast.origin_bar_timestamp + chrono::Duration::minutes(5);
+            current.open = forecast.origin_close;
+            current.high = forecast.origin_close + 0.25;
+            current.low = forecast.origin_close - 0.25;
+            current.close = forecast.origin_close;
+            current.bid_open = Some(current.open);
+            current.bid_high = Some(current.high);
+            current.bid_low = Some(current.low);
+            current.bid_close = Some(current.close);
+            current.ask_open = Some(current.open + 0.24);
+            current.ask_high = Some(current.high + 0.24);
+            current.ask_low = Some(current.low + 0.24);
+            current.ask_close = Some(current.close + 0.24);
         }
         let proposal = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
         assert_eq!(proposal.action, DecisionAction::Long);

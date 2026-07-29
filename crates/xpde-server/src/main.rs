@@ -26,9 +26,10 @@ use tower_http::{
 use tracing::{info, warn};
 use uuid::Uuid;
 use xpde_domain::{
-    AccountSnapshot, BARRIER_HORIZON_BARS, BARRIER_SPEC_ID, CalibrationStatus, DataQuality,
-    DecisionAction, DecisionPolicy, DecisionProposal, ForecastEnvelope, ForecastPoint,
-    HumanFeedback, MarketBar, MarketSnapshot, SymbolSpec, decide, decide_at,
+    AccountSnapshot, BARRIER_HORIZON_BARS, BARRIER_SPEC_ID, CalibrationStatus, ChartMode,
+    DataQuality, DecisionAction, DecisionPolicy, DecisionProposal, EXECUTABLE_SIDE_CONTRACT_ID,
+    ForecastEnvelope, ForecastPoint, HumanFeedback, MarketBar, MarketSnapshot, MarketStatus,
+    SymbolSpec, decide, decide_at,
 };
 
 const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
@@ -45,18 +46,34 @@ struct AppState {
 struct PolicySet {
     scalper: DecisionPolicy,
     sniper: DecisionPolicy,
+    model_health: ModelHealthPolicy,
 }
 
 #[derive(Debug, Deserialize)]
 struct PolicyFile {
     broker_profile: BrokerPolicyFile,
     policy: ProfilePoliciesFile,
+    model_health: ModelHealthPolicy,
 }
 
 #[derive(Debug, Deserialize)]
 struct BrokerPolicyFile {
     broker_policy_id: String,
+    cost_model_id: String,
     commission_usd_per_lot: f64,
+    expected_exit_spread_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelHealthPolicy {
+    minimum_settled_predictions: usize,
+    minimum_interval_coverage: f64,
+    maximum_interval_coverage: f64,
+    maximum_direction_brier: f64,
+    maximum_barrier_brier_ratio_to_baseline: f64,
+    maximum_barrier_ece: f64,
+    minimum_mae_q90_coverage: f64,
+    maximum_mae_q90_coverage: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +101,9 @@ fn load_policy_set() -> Result<PolicySet, String> {
         .map_err(|error| format!("failed to parse policy config {path}: {error}"))?;
     let apply = |mut policy: DecisionPolicy, values: &ProfilePolicyFile| {
         policy.broker_policy_id = config.broker_profile.broker_policy_id.clone();
+        policy.cost_model_id = config.broker_profile.cost_model_id.clone();
         policy.commission_usd_per_lot = config.broker_profile.commission_usd_per_lot;
+        policy.expected_exit_spread_usd = config.broker_profile.expected_exit_spread_usd;
         policy.max_spread_usd = values.max_spread_usd;
         policy.max_spread_atr_ratio = values.max_spread_atr_ratio;
         policy.slippage_buffer_usd = values.slippage_buffer_usd;
@@ -97,6 +116,7 @@ fn load_policy_set() -> Result<PolicySet, String> {
     Ok(PolicySet {
         scalper: apply(DecisionPolicy::scalper(), &config.policy.scalper),
         sniper: apply(DecisionPolicy::sniper(), &config.policy.sniper),
+        model_health: config.model_health.clone(),
     })
 }
 
@@ -109,6 +129,7 @@ struct RuntimeState {
     snapshot: MarketSnapshot,
     forecast: ForecastEnvelope,
     proposals: Vec<DecisionProposal>,
+    model_health: ModelHealth,
     safety: SafetyStatus,
 }
 
@@ -120,6 +141,48 @@ enum ForecastStatus {
     Current,
     OriginMismatch,
     Expired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ModelHealthStatus {
+    WarmingUp,
+    Healthy,
+    Degraded,
+    Suspended,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelHealth {
+    status: ModelHealthStatus,
+    sample_size: usize,
+    minimum_sample_size: usize,
+    interval_coverage: Option<f64>,
+    direction_brier: Option<f64>,
+    direction_baseline_brier: Option<f64>,
+    barrier_brier: Option<f64>,
+    barrier_baseline_brier: Option<f64>,
+    barrier_ece: Option<f64>,
+    mae_q90_coverage: Option<f64>,
+    reason_codes: Vec<String>,
+}
+
+impl ModelHealth {
+    fn warming_up(minimum_sample_size: usize) -> Self {
+        Self {
+            status: ModelHealthStatus::WarmingUp,
+            sample_size: 0,
+            minimum_sample_size,
+            interval_coverage: None,
+            direction_brier: None,
+            direction_baseline_brier: None,
+            barrier_brier: None,
+            barrier_baseline_brier: None,
+            barrier_ece: None,
+            mae_q90_coverage: None,
+            reason_codes: vec!["MODEL_LIVE_HEALTH_WARMING_UP".to_owned()],
+        }
+    }
 }
 
 fn forecast_status(
@@ -179,6 +242,7 @@ struct ModelRegistration {
     training_mode: String,
     eligible_for_shadow: bool,
     barrier_spec_id: String,
+    executable_side_contract_id: String,
     eligibility_gates: serde_json::Map<String, serde_json::Value>,
     artifact_path: String,
     metrics: serde_json::Value,
@@ -240,6 +304,7 @@ struct ModelRecord {
     training_mode: String,
     eligible_for_shadow: bool,
     barrier_spec_id: String,
+    executable_side_contract_id: String,
     artifact_path: String,
     metrics: serde_json::Value,
     created_at: String,
@@ -268,6 +333,73 @@ fn ensure_column(
     Ok(())
 }
 
+fn brier_score(probabilities: &[f64], outcomes: &[f64]) -> Option<f64> {
+    if probabilities.is_empty() || probabilities.len() != outcomes.len() {
+        return None;
+    }
+    Some(
+        probabilities
+            .iter()
+            .zip(outcomes)
+            .map(|(probability, outcome)| (probability - outcome).powi(2))
+            .sum::<f64>()
+            / probabilities.len() as f64,
+    )
+}
+
+fn constant_baseline_brier(outcomes: &[f64]) -> Option<f64> {
+    if outcomes.is_empty() {
+        return None;
+    }
+    let base_rate = outcomes.iter().sum::<f64>() / outcomes.len() as f64;
+    brier_score(&vec![base_rate; outcomes.len()], outcomes)
+}
+
+fn expected_calibration_error(probabilities: &[f64], outcomes: &[f64]) -> Option<f64> {
+    if probabilities.is_empty() || probabilities.len() != outcomes.len() {
+        return None;
+    }
+    let mut bins = vec![(0usize, 0.0f64, 0.0f64); 10];
+    for (&probability, &outcome) in probabilities.iter().zip(outcomes) {
+        let index = ((probability.clamp(0.0, 0.999_999) * 10.0) as usize).min(9);
+        bins[index].0 += 1;
+        bins[index].1 += probability;
+        bins[index].2 += outcome;
+    }
+    Some(
+        bins.into_iter()
+            .filter(|(count, _, _)| *count > 0)
+            .map(|(count, probability_sum, outcome_sum)| {
+                let count_f64 = count as f64;
+                count_f64 * ((probability_sum / count_f64) - (outcome_sum / count_f64)).abs()
+            })
+            .sum::<f64>()
+            / probabilities.len() as f64,
+    )
+}
+
+fn apply_model_health_gate(proposals: &mut [DecisionProposal], health: &ModelHealth) {
+    let reason = match health.status {
+        ModelHealthStatus::Degraded => Some("MODEL_LIVE_HEALTH_DEGRADED"),
+        ModelHealthStatus::Suspended => Some("MODEL_LIVE_HEALTH_SUSPENDED"),
+        _ => None,
+    };
+    let Some(reason) = reason else {
+        return;
+    };
+    for proposal in proposals {
+        if matches!(
+            proposal.action,
+            DecisionAction::Long | DecisionAction::Short
+        ) {
+            proposal.action = DecisionAction::Wait;
+            proposal.target_price = None;
+            proposal.invalidation_price = None;
+            proposal.reason_codes.push(reason.to_owned());
+        }
+    }
+}
+
 impl Store {
     fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent()
@@ -282,6 +414,8 @@ impl Store {
         connection.execute_batch(MIGRATION)?;
         ensure_column(&connection, "predictions", "origin_bar_timestamp", "TEXT")?;
         ensure_column(&connection, "predictions", "origin_close", "REAL")?;
+        ensure_column(&connection, "predictions", "origin_bid", "REAL")?;
+        ensure_column(&connection, "predictions", "origin_ask", "REAL")?;
         ensure_column(&connection, "predictions", "origin_bar_index", "INTEGER")?;
         ensure_column(&connection, "predictions", "feature_version", "TEXT")?;
         ensure_column(&connection, "predictions", "barrier_spec_id", "TEXT")?;
@@ -342,6 +476,37 @@ impl Store {
         )?;
         ensure_column(
             &connection,
+            "symbol_specs",
+            "chart_mode",
+            "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+        )?;
+        ensure_column(
+            &connection,
+            "symbol_specs",
+            "quote_currency",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
+            "symbol_specs",
+            "pnl_currency",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        for (column, definition) in [
+            ("bid_open", "REAL"),
+            ("bid_high", "REAL"),
+            ("bid_low", "REAL"),
+            ("bid_close", "REAL"),
+            ("ask_open", "REAL"),
+            ("ask_high", "REAL"),
+            ("ask_low", "REAL"),
+            ("ask_close", "REAL"),
+            ("executable_tick_count", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            ensure_column(&connection, "market_bars", column, definition)?;
+        }
+        ensure_column(
+            &connection,
             "model_registry",
             "eligible_for_shadow",
             "INTEGER NOT NULL DEFAULT 0",
@@ -350,6 +515,12 @@ impl Store {
             &connection,
             "model_registry",
             "barrier_spec_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
+            "model_registry",
+            "executable_side_contract_id",
             "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(
@@ -433,8 +604,9 @@ impl Store {
         transaction.execute(
             "INSERT INTO symbol_specs
              (symbol, description, contract_size, volume_min, volume_max, volume_step,
-              tick_size, tick_value, stops_level_points, digits, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              tick_size, tick_value, stops_level_points, digits, chart_mode,
+              quote_currency, pnl_currency, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(symbol) DO UPDATE SET
                description=excluded.description,
                contract_size=excluded.contract_size,
@@ -445,6 +617,9 @@ impl Store {
                tick_value=excluded.tick_value,
                stops_level_points=excluded.stops_level_points,
                digits=excluded.digits,
+               chart_mode=excluded.chart_mode,
+               quote_currency=excluded.quote_currency,
+               pnl_currency=excluded.pnl_currency,
                captured_at=excluded.captured_at
              WHERE description IS NOT excluded.description
                 OR contract_size IS NOT excluded.contract_size
@@ -454,7 +629,10 @@ impl Store {
                 OR tick_size IS NOT excluded.tick_size
                 OR tick_value IS NOT excluded.tick_value
                 OR stops_level_points IS NOT excluded.stops_level_points
-                OR digits IS NOT excluded.digits",
+                OR digits IS NOT excluded.digits
+                OR chart_mode IS NOT excluded.chart_mode
+                OR quote_currency IS NOT excluded.quote_currency
+                OR pnl_currency IS NOT excluded.pnl_currency",
             params![
                 snapshot.symbol,
                 snapshot.symbol_spec.description,
@@ -466,14 +644,35 @@ impl Store {
                 snapshot.symbol_spec.tick_value,
                 snapshot.symbol_spec.stops_level_points,
                 snapshot.symbol_spec.digits,
+                snapshot.symbol_spec.chart_mode.as_str(),
+                snapshot.symbol_spec.quote_currency,
+                snapshot.symbol_spec.pnl_currency,
                 snapshot.timestamp.to_rfc3339(),
             ],
         )?;
         if let Some(bar) = snapshot.bars.iter().max_by_key(|bar| bar.timestamp) {
             transaction.execute(
-                "INSERT OR IGNORE INTO market_bars
-                 (symbol, timeframe, timestamp, open, high, low, close, tick_volume)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO market_bars
+                 (symbol, timeframe, timestamp, open, high, low, close, tick_volume,
+                  bid_open, bid_high, bid_low, bid_close,
+                  ask_open, ask_high, ask_low, ask_close, executable_tick_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                         ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(symbol, timeframe, timestamp) DO UPDATE SET
+                   open=excluded.open, high=excluded.high, low=excluded.low,
+                   close=excluded.close, tick_volume=excluded.tick_volume,
+                   bid_open=COALESCE(excluded.bid_open, market_bars.bid_open),
+                   bid_high=COALESCE(excluded.bid_high, market_bars.bid_high),
+                   bid_low=COALESCE(excluded.bid_low, market_bars.bid_low),
+                   bid_close=COALESCE(excluded.bid_close, market_bars.bid_close),
+                   ask_open=COALESCE(excluded.ask_open, market_bars.ask_open),
+                   ask_high=COALESCE(excluded.ask_high, market_bars.ask_high),
+                   ask_low=COALESCE(excluded.ask_low, market_bars.ask_low),
+                   ask_close=COALESCE(excluded.ask_close, market_bars.ask_close),
+                   executable_tick_count=MAX(
+                     excluded.executable_tick_count,
+                     market_bars.executable_tick_count
+                   )",
                 params![
                     snapshot.symbol,
                     snapshot.timeframe,
@@ -483,6 +682,15 @@ impl Store {
                     bar.low,
                     bar.close,
                     bar.tick_volume,
+                    bar.bid_open,
+                    bar.bid_high,
+                    bar.bid_low,
+                    bar.bid_close,
+                    bar.ask_open,
+                    bar.ask_high,
+                    bar.ask_low,
+                    bar.ask_close,
+                    bar.executable_tick_count,
                 ],
             )?;
         }
@@ -524,8 +732,11 @@ impl Store {
         let inserted = {
             let mut statement = transaction.prepare(
                 "INSERT OR REPLACE INTO market_bars
-                 (symbol, timeframe, timestamp, open, high, low, close, tick_volume)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (symbol, timeframe, timestamp, open, high, low, close, tick_volume,
+                  bid_open, bid_high, bid_low, bid_close,
+                  ask_open, ask_high, ask_low, ask_close, executable_tick_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                         ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )?;
             let mut inserted = 0;
             for bar in &request.bars {
@@ -538,6 +749,15 @@ impl Store {
                     bar.low,
                     bar.close,
                     bar.tick_volume,
+                    bar.bid_open,
+                    bar.bid_high,
+                    bar.bid_low,
+                    bar.bid_close,
+                    bar.ask_open,
+                    bar.ask_high,
+                    bar.ask_low,
+                    bar.ask_close,
+                    bar.executable_tick_count,
                 ])?;
             }
             inserted
@@ -596,16 +816,22 @@ impl Store {
             .first()
             .map(|proposal| proposal.outcome_matures_at)
             .unwrap_or(forecast.generated_at);
+        let origin_bar = snapshot
+            .bars
+            .iter()
+            .find(|bar| bar.timestamp == forecast.origin_bar_timestamp);
+        let origin_bid = origin_bar.and_then(|bar| bar.bid_close);
+        let origin_ask = origin_bar.and_then(|bar| bar.ask_close);
         let inserted = connection.execute(
             "INSERT OR IGNORE INTO predictions
              (prediction_id, model_id, feature_version, barrier_spec_id,
               direction_probability_up, barrier_probability_long,
               barrier_probability_short,
               symbol, timeframe, origin_bar_timestamp,
-              origin_close, origin_bar_index, generated_at, expires_at,
+              origin_close, origin_bid, origin_ask, origin_bar_index, generated_at, expires_at,
               decision_valid_until, outcome_matures_at,
               forecast_json, proposal_json, is_duplicate, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 0, ?21)",
             params![
                 forecast.prediction_id.to_string(),
                 forecast.model_id,
@@ -618,6 +844,8 @@ impl Store {
                 snapshot.timeframe,
                 forecast.origin_bar_timestamp.to_rfc3339(),
                 forecast.origin_close,
+                origin_bid,
+                origin_ask,
                 forecast.origin_bar_index,
                 forecast.generated_at.to_rfc3339(),
                 outcome_matures_at.to_rfc3339(),
@@ -706,8 +934,9 @@ impl Store {
             "INSERT INTO model_registry
              (model_id, model_type, status, feature_version, schema_version,
               eligibility_gate_version, training_mode, eligible_for_shadow,
-              barrier_spec_id, artifact_path, metrics_json, created_at, promoted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+              barrier_spec_id, executable_side_contract_id, artifact_path,
+              metrics_json, created_at, promoted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)
              ON CONFLICT(model_id) DO UPDATE SET
                model_type=excluded.model_type,
                status=excluded.status,
@@ -717,6 +946,7 @@ impl Store {
                training_mode=excluded.training_mode,
                eligible_for_shadow=excluded.eligible_for_shadow,
                barrier_spec_id=excluded.barrier_spec_id,
+               executable_side_contract_id=excluded.executable_side_contract_id,
                artifact_path=excluded.artifact_path,
                metrics_json=excluded.metrics_json",
             params![
@@ -729,6 +959,7 @@ impl Store {
                 model.training_mode,
                 model.eligible_for_shadow,
                 model.barrier_spec_id,
+                model.executable_side_contract_id,
                 model.artifact_path,
                 model.metrics.to_string(),
                 Utc::now().to_rfc3339(),
@@ -751,12 +982,13 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT model_id, model_type, status, feature_version, schema_version,
                     eligibility_gate_version, training_mode, eligible_for_shadow,
-                    barrier_spec_id, artifact_path, metrics_json, created_at, promoted_at
+                    barrier_spec_id, executable_side_contract_id, artifact_path,
+                    metrics_json, created_at, promoted_at
              FROM model_registry ORDER BY created_at DESC",
         )?;
         statement
             .query_map([], |row| {
-                let metrics_json: String = row.get(10)?;
+                let metrics_json: String = row.get(11)?;
                 Ok(ModelRecord {
                     model_id: row.get(0)?,
                     model_type: row.get(1)?,
@@ -767,10 +999,11 @@ impl Store {
                     training_mode: row.get(6)?,
                     eligible_for_shadow: row.get(7)?,
                     barrier_spec_id: row.get(8)?,
-                    artifact_path: row.get(9)?,
+                    executable_side_contract_id: row.get(9)?,
+                    artifact_path: row.get(10)?,
                     metrics: serde_json::from_str(&metrics_json).unwrap_or(serde_json::Value::Null),
-                    created_at: row.get(11)?,
-                    promoted_at: row.get(12)?,
+                    created_at: row.get(12)?,
+                    promoted_at: row.get(13)?,
                 })
             })?
             .collect()
@@ -782,7 +1015,7 @@ impl Store {
         let pending = {
             let mut statement = connection.prepare(
                 "SELECT p.prediction_id, p.symbol, p.timeframe,
-                        p.origin_bar_timestamp, p.origin_close,
+                        p.origin_bar_timestamp, p.origin_close, p.origin_bid, p.origin_ask,
                         p.forecast_json, p.proposal_json
                  FROM predictions p
                  WHERE p.origin_bar_timestamp IS NOT NULL
@@ -829,8 +1062,10 @@ impl Store {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, f64>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<f64>>(5)?,
+                        row.get::<_, Option<f64>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -843,13 +1078,21 @@ impl Store {
             timeframe,
             origin_bar_timestamp,
             origin_close,
+            origin_bid,
+            origin_ask,
             forecast_json,
             proposal_json,
         ) in pending
         {
+            let (Some(origin_bid), Some(origin_ask)) = (origin_bid, origin_ask) else {
+                continue;
+            };
             let outcome_bars = {
                 let mut statement = transaction.prepare(
-                    "SELECT timestamp, high, low, close FROM market_bars
+                    "SELECT timestamp, high, low, close,
+                            bid_high, bid_low, bid_close,
+                            ask_high, ask_low, ask_close
+                     FROM market_bars
                      WHERE symbol=?1 AND timeframe=?2 AND timestamp>?3
                      ORDER BY timestamp LIMIT 12",
                 )?;
@@ -860,6 +1103,12 @@ impl Store {
                             row.get::<_, f64>(1)?,
                             row.get::<_, f64>(2)?,
                             row.get::<_, f64>(3)?,
+                            row.get::<_, Option<f64>>(4)?,
+                            row.get::<_, Option<f64>>(5)?,
+                            row.get::<_, Option<f64>>(6)?,
+                            row.get::<_, Option<f64>>(7)?,
+                            row.get::<_, Option<f64>>(8)?,
+                            row.get::<_, Option<f64>>(9)?,
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?
@@ -892,22 +1141,48 @@ impl Store {
                 )?;
 
                 let horizon_bars = &outcome_bars[..horizon];
+                if horizon_bars.iter().any(|bar| {
+                    bar.4.is_none()
+                        || bar.5.is_none()
+                        || bar.6.is_none()
+                        || bar.7.is_none()
+                        || bar.8.is_none()
+                        || bar.9.is_none()
+                }) {
+                    continue;
+                }
                 let (barrier_long, barrier_short) = if target.horizon_bars == BARRIER_HORIZON_BARS {
-                    let barrier_bars = horizon_bars
+                    let long_barrier_bars = horizon_bars
                         .iter()
-                        .map(|bar| (bar.1, bar.2, bar.3))
+                        .map(|bar| {
+                            (
+                                bar.4.unwrap_or_default(),
+                                bar.5.unwrap_or_default(),
+                                bar.6.unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let short_barrier_bars = horizon_bars
+                        .iter()
+                        .map(|bar| {
+                            (
+                                bar.7.unwrap_or_default(),
+                                bar.8.unwrap_or_default(),
+                                bar.9.unwrap_or_default(),
+                            )
+                        })
                         .collect::<Vec<_>>();
                     let long = barrier_outcome(
                         DecisionAction::Long,
                         forecast.target_price_long,
                         forecast.stop_price_long,
-                        &barrier_bars,
+                        &long_barrier_bars,
                     );
                     let short = barrier_outcome(
                         DecisionAction::Short,
                         forecast.target_price_short,
                         forecast.stop_price_short,
-                        &barrier_bars,
+                        &short_barrier_bars,
                     );
                     for proposal in &proposals {
                         if !matches!(
@@ -925,7 +1200,11 @@ impl Store {
                             proposal.action,
                             proposal_target,
                             proposal_stop,
-                            &barrier_bars,
+                            if proposal.action == DecisionAction::Long {
+                                &long_barrier_bars
+                            } else {
+                                &short_barrier_bars
+                            },
                         ) else {
                             continue;
                         };
@@ -968,15 +1247,18 @@ impl Store {
                     continue;
                 }
 
-                let final_price = horizon_bars.last().map(|bar| bar.3).unwrap_or(origin_close);
+                let final_price = horizon_bars
+                    .last()
+                    .and_then(|bar| bar.6)
+                    .unwrap_or(origin_close);
                 let actual_return = (final_price / origin_close).ln();
                 let actual_high = horizon_bars
                     .iter()
-                    .map(|bar| bar.1)
+                    .filter_map(|bar| bar.4)
                     .fold(f64::NEG_INFINITY, f64::max);
                 let actual_low = horizon_bars
                     .iter()
-                    .map(|bar| bar.2)
+                    .filter_map(|bar| bar.5)
                     .fold(f64::INFINITY, f64::min);
                 let interval_hit =
                     i64::from(actual_return >= target.q10 && actual_return <= target.q90);
@@ -985,15 +1267,23 @@ impl Store {
                     (
                         forecast.expected_mfe_long,
                         forecast.expected_mae_long,
-                        (actual_high - origin_close).max(0.0),
-                        (origin_close - actual_low).max(0.0),
+                        (actual_high - origin_ask).max(0.0),
+                        (origin_ask - actual_low).max(0.0),
                     )
                 } else {
+                    let actual_ask_high = horizon_bars
+                        .iter()
+                        .filter_map(|bar| bar.7)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let actual_ask_low = horizon_bars
+                        .iter()
+                        .filter_map(|bar| bar.8)
+                        .fold(f64::INFINITY, f64::min);
                     (
                         forecast.expected_mfe_short,
                         forecast.expected_mae_short,
-                        (origin_close - actual_low).max(0.0),
-                        (actual_high - origin_close).max(0.0),
+                        (origin_bid - actual_ask_low).max(0.0),
+                        (actual_ask_high - origin_bid).max(0.0),
                     )
                 };
                 let barrier = if target.q50 >= 0.0 {
@@ -1046,6 +1336,154 @@ impl Store {
         }
         transaction.commit()?;
         Ok(settled)
+    }
+
+    fn model_health(
+        &self,
+        model_id: &str,
+        policy: &ModelHealthPolicy,
+    ) -> Result<ModelHealth, rusqlite::Error> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let rows = {
+            let mut statement = connection.prepare(
+                "SELECT o.interval_hit, o.actual_return, p.direction_probability_up,
+                        o.barrier_long_outcome, p.barrier_probability_long,
+                        o.barrier_short_outcome, p.barrier_probability_short,
+                        o.error_metrics_json
+                 FROM prediction_horizon_outcomes o
+                 JOIN predictions p ON p.prediction_id=o.prediction_id
+                 WHERE o.horizon_bars=3
+                   AND p.model_id=?1
+                   AND p.barrier_spec_id=?2
+                   AND p.is_duplicate=0
+                 ORDER BY o.origin_bar_timestamp DESC
+                 LIMIT 200",
+            )?;
+            statement
+                .query_map(params![model_id, BARRIER_SPEC_ID], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<f64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<f64>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.len() < policy.minimum_settled_predictions {
+            let mut health = ModelHealth::warming_up(policy.minimum_settled_predictions);
+            health.sample_size = rows.len();
+            return Ok(health);
+        }
+
+        let interval_coverage =
+            rows.iter().map(|row| row.0 as f64).sum::<f64>() / rows.len() as f64;
+        let mut direction_probabilities = Vec::new();
+        let mut direction_outcomes = Vec::new();
+        let mut barrier_probabilities = [Vec::new(), Vec::new()];
+        let mut barrier_outcomes = [Vec::new(), Vec::new()];
+        let mut mae_covered = Vec::new();
+        for row in &rows {
+            if let Some(probability) = row.2 {
+                direction_probabilities.push(probability);
+                direction_outcomes.push(if row.1 >= 0.0 { 1.0 } else { 0.0 });
+            }
+            for (side, (outcome, probability)) in
+                [(&row.3, row.4), (&row.5, row.6)].into_iter().enumerate()
+            {
+                if let (Some(outcome), Some(probability)) = (outcome.as_deref(), probability)
+                    && matches!(outcome, "TP_FIRST" | "SL_FIRST" | "NO_HIT_BEFORE_EXPIRY")
+                {
+                    barrier_probabilities[side].push(probability);
+                    barrier_outcomes[side].push(if outcome == "TP_FIRST" { 1.0 } else { 0.0 });
+                }
+            }
+            if let Ok(metrics) = serde_json::from_str::<serde_json::Value>(&row.7)
+                && let Some(error) = metrics["mae_error_usd"].as_f64()
+            {
+                mae_covered.push(if error >= 0.0 { 1.0 } else { 0.0 });
+            }
+        }
+        let direction_brier = brier_score(&direction_probabilities, &direction_outcomes);
+        let direction_baseline_brier = constant_baseline_brier(&direction_outcomes);
+        let side_barrier_metrics = (0..2)
+            .filter_map(|side| {
+                let score = brier_score(&barrier_probabilities[side], &barrier_outcomes[side])?;
+                let baseline = constant_baseline_brier(&barrier_outcomes[side])?;
+                let ratio = if baseline > f64::EPSILON {
+                    score / baseline
+                } else if score <= f64::EPSILON {
+                    1.0
+                } else {
+                    f64::INFINITY
+                };
+                Some((score, baseline, ratio))
+            })
+            .collect::<Vec<_>>();
+        let worst_barrier = side_barrier_metrics
+            .iter()
+            .copied()
+            .max_by(|left, right| left.2.total_cmp(&right.2));
+        let barrier_brier = worst_barrier.map(|metric| metric.0);
+        let barrier_baseline_brier = worst_barrier.map(|metric| metric.1);
+        let barrier_ratio = worst_barrier.map(|metric| metric.2);
+        let barrier_ece = (0..2)
+            .filter_map(|side| {
+                expected_calibration_error(&barrier_probabilities[side], &barrier_outcomes[side])
+            })
+            .max_by(f64::total_cmp);
+        let mae_q90_coverage = (!mae_covered.is_empty())
+            .then(|| mae_covered.iter().sum::<f64>() / mae_covered.len() as f64);
+
+        let mut reasons = Vec::new();
+        if interval_coverage < policy.minimum_interval_coverage
+            || interval_coverage > policy.maximum_interval_coverage
+        {
+            reasons.push("LIVE_INTERVAL_COVERAGE_OUTSIDE_GATE".to_owned());
+        }
+        if direction_brier.is_none_or(|score| score > policy.maximum_direction_brier) {
+            reasons.push("LIVE_DIRECTION_BRIER_OUTSIDE_GATE".to_owned());
+        }
+        if barrier_ratio.is_none_or(|ratio| ratio > policy.maximum_barrier_brier_ratio_to_baseline)
+        {
+            reasons.push("LIVE_BARRIER_BRIER_OUTSIDE_GATE".to_owned());
+        }
+        if barrier_ece.is_none_or(|ece| ece > policy.maximum_barrier_ece) {
+            reasons.push("LIVE_BARRIER_ECE_OUTSIDE_GATE".to_owned());
+        }
+        if mae_q90_coverage.is_none_or(|coverage| {
+            coverage < policy.minimum_mae_q90_coverage || coverage > policy.maximum_mae_q90_coverage
+        }) {
+            reasons.push("LIVE_MAE_COVERAGE_OUTSIDE_GATE".to_owned());
+        }
+        let severe = reasons.len() >= 2
+            || direction_brier.is_some_and(|score| score > policy.maximum_direction_brier * 1.25)
+            || barrier_ratio
+                .is_some_and(|ratio| ratio > policy.maximum_barrier_brier_ratio_to_baseline * 1.25);
+        let status = if reasons.is_empty() {
+            ModelHealthStatus::Healthy
+        } else if severe {
+            ModelHealthStatus::Suspended
+        } else {
+            ModelHealthStatus::Degraded
+        };
+        Ok(ModelHealth {
+            status,
+            sample_size: rows.len(),
+            minimum_sample_size: policy.minimum_settled_predictions,
+            interval_coverage: Some(interval_coverage),
+            direction_brier,
+            direction_baseline_brier,
+            barrier_brier,
+            barrier_baseline_brier,
+            barrier_ece,
+            mae_q90_coverage,
+            reason_codes: reasons,
+        })
     }
 
     fn evaluation_summary(
@@ -1671,6 +2109,7 @@ async fn post_backfill(
             || bar.low > bar.open.min(bar.close)
             || bar.timestamp > Utc::now() + chrono::Duration::minutes(5)
             || bar.timestamp.timestamp() % 300 != 0
+            || !bar.has_executable_sides()
     }) {
         return Err(ApiError::bad_request("backfill contains an invalid bar"));
     }
@@ -1692,11 +2131,6 @@ async fn post_snapshot(
     snapshot
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    if !snapshot.data_quality.is_valid(10_000) {
-        return Err(ApiError::bad_request(
-            "snapshot rejected because data is stale or incomplete",
-        ));
-    }
     state
         .store
         .save_snapshot(&snapshot)
@@ -1704,7 +2138,12 @@ async fn post_snapshot(
 
     let mut runtime = state.runtime.write().await;
     runtime.snapshot = snapshot;
-    runtime.connection_status = "MT5_CONNECTED";
+    runtime.connection_status = match runtime.snapshot.data_quality.market_status {
+        MarketStatus::Open if runtime.snapshot.data_quality.is_valid(10_000) => "MT5_CONNECTED",
+        MarketStatus::MarketClosed => "MARKET_CLOSED",
+        MarketStatus::BridgeDisconnected => "BRIDGE_DISCONNECTED",
+        _ => "MT5_STALE",
+    };
     runtime.mode = "LIVE_SHADOW";
     runtime.updated_at = Utc::now();
     runtime.safety.feed_is_demo = false;
@@ -1721,6 +2160,8 @@ async fn post_snapshot(
     );
     let sniper = decide(&runtime.snapshot, &runtime.forecast, &state.policies.sniper);
     runtime.proposals = vec![scalper, sniper];
+    let health = runtime.model_health.clone();
+    apply_model_health_gate(&mut runtime.proposals, &health);
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -1731,7 +2172,16 @@ async fn post_forecast(
     forecast
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let model_health = state
+        .store
+        .model_health(&forecast.model_id, &state.policies.model_health)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let mut runtime = state.runtime.write().await;
+    if !runtime.snapshot.data_quality.is_valid(10_000) {
+        return Err(ApiError::bad_request(
+            "forecast rejected because the executable market snapshot is not actionable",
+        ));
+    }
     let latest_completed = runtime
         .snapshot
         .bars
@@ -1745,10 +2195,23 @@ async fn post_forecast(
             "forecast origin does not match the latest completed M5 candle",
         ));
     }
-    let proposals = vec![
+    if runtime.snapshot.symbol_spec.chart_mode != ChartMode::Bid
+        || !latest_completed.has_executable_sides()
+        || !runtime
+            .snapshot
+            .current_bar
+            .as_ref()
+            .is_some_and(MarketBar::has_executable_sides)
+    {
+        return Err(ApiError::bad_request(
+            "forecast rejected because exact Bid/Ask executable bars are unavailable",
+        ));
+    }
+    let mut proposals = vec![
         decide(&runtime.snapshot, &forecast, &state.policies.scalper),
         decide(&runtime.snapshot, &forecast, &state.policies.sniper),
     ];
+    apply_model_health_gate(&mut proposals, &model_health);
     let inserted = state
         .store
         .save_prediction(&runtime.snapshot, &forecast, &proposals)
@@ -1761,6 +2224,9 @@ async fn post_forecast(
     {
         runtime.forecast = saved_forecast;
         runtime.proposals = saved_proposals;
+        runtime.model_health = model_health;
+        let health = runtime.model_health.clone();
+        apply_model_health_gate(&mut runtime.proposals, &health);
         runtime.updated_at = Utc::now();
         runtime.forecast_status = forecast_status(
             &runtime.snapshot,
@@ -1772,6 +2238,7 @@ async fn post_forecast(
     }
     runtime.forecast = forecast;
     runtime.proposals = proposals;
+    runtime.model_health = model_health;
     runtime.updated_at = Utc::now();
     runtime.forecast_status = forecast_status(
         &runtime.snapshot,
@@ -1858,9 +2325,10 @@ async fn post_model_registration(
         .all(|value| value.as_bool() == Some(true));
     if model.status != "retired"
         && (model.schema_version != 3
-            || model.eligibility_gate_version < 2
+            || model.eligibility_gate_version < 3
             || model.training_mode != "candidate"
-            || model.barrier_spec_id != "atr-1.25tp-1.00sl-h3-v1"
+            || model.barrier_spec_id != BARRIER_SPEC_ID
+            || model.executable_side_contract_id != EXECUTABLE_SIDE_CONTRACT_ID
             || model.eligibility_gates.is_empty()
             || !gates_are_booleans)
     {
@@ -1894,11 +2362,22 @@ async fn get_evaluation_summary(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let current_model_id = state.runtime.read().await.forecast.model_id.clone();
-    state
+    let model_health = state
+        .store
+        .model_health(&current_model_id, &state.policies.model_health)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut summary = state
         .store
         .evaluation_summary(&current_model_id, state.started_at)
-        .map(Json)
-        .map_err(|error| ApiError::internal(error.to_string()))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if let Some(object) = summary.as_object_mut() {
+        object.insert(
+            "model_health".to_owned(),
+            serde_json::to_value(model_health)
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+        );
+    }
+    Ok(Json(summary))
 }
 
 async fn websocket(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
@@ -1924,6 +2403,12 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 
 async fn public_runtime_state(state: &AppState) -> RuntimeState {
     let mut runtime = state.runtime.read().await.clone();
+    runtime.model_health = state
+        .store
+        .model_health(&runtime.forecast.model_id, &state.policies.model_health)
+        .unwrap_or_else(|_| {
+            ModelHealth::warming_up(state.policies.model_health.minimum_settled_predictions)
+        });
     let now = Utc::now();
     runtime.forecast_status = forecast_status(
         &runtime.snapshot,
@@ -1936,9 +2421,23 @@ async fn public_runtime_state(state: &AppState) -> RuntimeState {
             .signed_duration_since(runtime.updated_at)
             .num_milliseconds()
             .max(0) as u64;
-        runtime.snapshot.data_quality.tick_age_ms =
-            runtime.snapshot.data_quality.tick_age_ms.max(bridge_age_ms);
-        if runtime.snapshot.data_quality.tick_age_ms > state.policies.scalper.max_tick_age_ms {
+        runtime.snapshot.data_quality.transport_tick_age_ms = runtime
+            .snapshot
+            .data_quality
+            .transport_tick_age_ms
+            .max(bridge_age_ms);
+        runtime.snapshot.data_quality.tick_age_ms = runtime
+            .snapshot
+            .data_quality
+            .absolute_tick_age_ms
+            .max(runtime.snapshot.data_quality.transport_tick_age_ms);
+        if bridge_age_ms > state.policies.scalper.max_tick_age_ms {
+            runtime.connection_status = "BRIDGE_DISCONNECTED";
+            runtime.snapshot.data_quality.market_status = MarketStatus::BridgeDisconnected;
+        } else if runtime.snapshot.data_quality.market_status == MarketStatus::MarketClosed {
+            runtime.connection_status = "MARKET_CLOSED";
+        } else if runtime.snapshot.data_quality.tick_age_ms > state.policies.scalper.max_tick_age_ms
+        {
             runtime.connection_status = "MT5_STALE";
         }
         runtime.proposals = vec![
@@ -1955,6 +2454,8 @@ async fn public_runtime_state(state: &AppState) -> RuntimeState {
                 now,
             ),
         ];
+        let health = runtime.model_health.clone();
+        apply_model_health_gate(&mut runtime.proposals, &health);
     }
     runtime
 }
@@ -1997,6 +2498,15 @@ fn demo_state() -> RuntimeState {
             low,
             close,
             tick_volume: 150.0 + (index % 9) as f64 * 11.0,
+            bid_open: Some(open),
+            bid_high: Some(high),
+            bid_low: Some(low),
+            bid_close: Some(close),
+            ask_open: Some(open + 0.34),
+            ask_high: Some(high + 0.34),
+            ask_low: Some(low + 0.34),
+            ask_close: Some(close + 0.34),
+            executable_tick_count: 100,
         });
         price = close;
     }
@@ -2031,10 +2541,16 @@ fn demo_state() -> RuntimeState {
             digits: 2,
             margin_per_lot_buy: Some(3.34),
             margin_per_lot_sell: Some(3.34),
+            chart_mode: ChartMode::Bid,
+            quote_currency: "USD".to_owned(),
+            pnl_currency: "USD".to_owned(),
         },
         data_quality: DataQuality {
             completeness: 1.0,
             tick_age_ms: 0,
+            absolute_tick_age_ms: 0,
+            transport_tick_age_ms: 0,
+            market_status: MarketStatus::Open,
             missing_flags: Vec::new(),
             reason_codes: vec!["DEMO_DATA".to_owned()],
         },
@@ -2048,7 +2564,7 @@ fn demo_state() -> RuntimeState {
     let forecast = ForecastEnvelope {
         prediction_id: Uuid::new_v4(),
         model_id: "baseline-demo-v1".to_owned(),
-        feature_version: "goldm-m5-v1".to_owned(),
+        feature_version: "goldm-m5-v3".to_owned(),
         origin_bar_timestamp: origin.timestamp,
         origin_close: origin.close,
         origin_bar_index: origin.timestamp.timestamp().div_euclid(300),
@@ -2121,6 +2637,7 @@ fn demo_state() -> RuntimeState {
         snapshot,
         forecast,
         proposals,
+        model_health: ModelHealth::warming_up(100),
         safety: SafetyStatus {
             auto_trading_enabled: false,
             human_confirmation_required: true,
@@ -2215,5 +2732,84 @@ mod tests {
             forecast_status(&runtime.snapshot, &forecast, false, runtime.updated_at),
             ForecastStatus::OriginMismatch
         );
+    }
+
+    #[test]
+    fn model_health_gate_abstains_without_mutating_model() {
+        let runtime = demo_state();
+        let mut proposals = runtime.proposals;
+        proposals[0].action = DecisionAction::Long;
+        proposals[0].target_price = Some(3333.0);
+        proposals[0].invalidation_price = Some(3328.0);
+        let health = ModelHealth {
+            status: ModelHealthStatus::Suspended,
+            sample_size: 200,
+            minimum_sample_size: 100,
+            interval_coverage: Some(0.62),
+            direction_brier: Some(0.31),
+            direction_baseline_brier: Some(0.25),
+            barrier_brier: Some(0.28),
+            barrier_baseline_brier: Some(0.24),
+            barrier_ece: Some(0.14),
+            mae_q90_coverage: Some(0.76),
+            reason_codes: vec!["LIVE_INTERVAL_COVERAGE_OUTSIDE_GATE".to_owned()],
+        };
+
+        apply_model_health_gate(&mut proposals, &health);
+
+        assert_eq!(proposals[0].action, DecisionAction::Wait);
+        assert_eq!(proposals[0].target_price, None);
+        assert_eq!(proposals[0].invalidation_price, None);
+        assert!(
+            proposals[0]
+                .reason_codes
+                .contains(&"MODEL_LIVE_HEALTH_SUSPENDED".to_owned())
+        );
+    }
+
+    #[test]
+    fn calibration_helpers_match_known_probabilities() {
+        let probabilities = [0.8, 0.2];
+        let outcomes = [1.0, 0.0];
+        assert!((brier_score(&probabilities, &outcomes).unwrap() - 0.04).abs() < 1e-12);
+        assert!(
+            (expected_calibration_error(&probabilities, &outcomes).unwrap() - 0.2).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn sqlite_round_trip_persists_executable_origin_sides() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        let runtime = demo_state();
+        store
+            .save_snapshot(&runtime.snapshot)
+            .expect("snapshot persistence");
+        assert!(
+            store
+                .save_prediction(&runtime.snapshot, &runtime.forecast, &runtime.proposals,)
+                .expect("prediction persistence")
+        );
+        let origin = runtime
+            .snapshot
+            .bars
+            .iter()
+            .find(|bar| bar.timestamp == runtime.forecast.origin_bar_timestamp)
+            .expect("origin bar");
+        let connection = store.connection.lock().expect("database mutex");
+        let persisted: (f64, f64) = connection
+            .query_row(
+                "SELECT origin_bid, origin_ask FROM predictions
+                 WHERE prediction_id=?1",
+                [runtime.forecast.prediction_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("persisted executable origin");
+
+        assert_eq!(persisted.0, origin.bid_close.unwrap());
+        assert_eq!(persisted.1, origin.ask_close.unwrap());
     }
 }

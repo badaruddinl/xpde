@@ -7,17 +7,19 @@ calls `order_send`.
 ```text
 MetaTrader 5 terminal
         |
-        | read-only account, symbol, tick and M5 bars
+        | read-only account, symbol, UTC ticks and M5 chart bars
         v
 Python MT5 bridge
         |
+        +--> exact historical/live Bid and Ask OHLC aggregation
         +--> empirical direct-horizon baseline
         |    (CatBoost artifacts can replace it after validation)
         v
 Rust HTTP ingestion
         |
-        +--> contract and freshness validation
-        +--> account-aware Scalper/Sniper policy
+        +--> chart-mode, absolute/transport freshness validation
+        +--> executable-side, account-aware Scalper/Sniper policy
+        +--> rolling live model-health gate
         +--> append-oriented audit trail
         v
 SQLite WAL
@@ -55,8 +57,16 @@ ONNX or non-Python inference runtime is promoted.
 
 - The server binds to `127.0.0.1` by default.
 - There is no route for placing, modifying or closing an order.
-- A stale or incomplete feed is rejected before it can update runtime state.
+- Stale/closed/disconnected snapshots may update connection telemetry, but can
+  never create a forecast or actionable proposal.
+- `absolute_tick_age_ms` comes from the provider timestamp after the same
+  explicitly configured normalization used by rate bars and executable ticks;
+  `transport_tick_age_ms` measures how long the local bridge has seen no change.
+- `MARKET_CLOSED`, `FEED_STALE` and `BRIDGE_DISCONNECTED` are separate states.
 - Drift, excessive spread or invalid calibration produces abstention.
+- Missing exact Bid/Ask bars or a chart mode other than `BID` produces abstention.
+- After the live evidence minimum, degraded coverage/Brier/ECE/MAE coverage
+  forces `WAIT`; XPDE never auto-retrains or auto-promotes from this signal.
 - Leverage changes risk and margin policy only; it does not enter the market
   direction feature set.
 - Human feedback is stored separately from objective market outcomes.
@@ -79,7 +89,10 @@ the first `h` completed candles strictly after that origin for horizons 1, 3, 6
 and 12; wall-clock expiry is not used as a proxy for the outcome candle.
 
 Barrier training and live evaluation use the same explicit three-bar horizon.
-LONG and SHORT are modelled independently and retain `TP_FIRST`, `SL_FIRST`,
+For a Bid chart, LONG enters Ask and exits against future Bid OHLC; SHORT enters
+Bid and exits against future Ask OHLC constructed from historical ticks.
+One-sided OHLC or a spread approximation is not accepted for candidate training.
+LONG and SHORT retain `TP_FIRST`, `SL_FIRST`,
 `NO_HIT_BEFORE_EXPIRY`, and `AMBIGUOUS_SAME_BAR`. A disagreement between q50,
 the direction classifier, and the stronger barrier side yields
 `FORECAST_SIDE_CONFLICT` and therefore `WAIT`.
@@ -98,6 +111,19 @@ Dashboard evaluation scopes are deliberately separate:
 Zero live samples are rendered as unavailable rather than as a misleading
 zero-percent result.
 
+## Cost and currency semantics
+
+The versioned cost model does not subtract the current spread twice:
+
+- LONG median move = future median Bid − current Ask − slippage − commission.
+- SHORT median move = current Bid − (future median Bid + expected exit spread)
+  − slippage − commission.
+
+Expected exit spread is the rolling median of recent exact Bid/Ask closes, with
+the broker profile value used only when no valid executable bars exist.
+Proposal records include account, quote and P&L currency plus every cost
+assumption used by the decision.
+
 ## Reproducible training boundary
 
 MT5 dataset exports receive a sidecar manifest with symbol, timeframe, UTC
@@ -106,5 +132,6 @@ dataset from Drive to ephemeral `/content`, verifies the hash, checks out the
 exact repository commit and runs the test suite before training.
 
 Every candidate includes a model card, machine-readable evaluation report and
-SHA-256 checksum list. Local inference refuses missing, modified or incomplete
-schema-v2 artifacts. Candidates remain shadow-only and immutable in Drive.
+SHA-256 checksum list. Local inference accepts only complete schema-v3,
+gate-v3 artifacts with the exact executable-side contract. Candidates remain
+shadow-only and immutable in Drive.

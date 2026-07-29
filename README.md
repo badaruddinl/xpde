@@ -14,13 +14,21 @@ records outcomes and feedback, then leaves the final decision to a human.
 - MT5 epoch timestamps stored as UTC, with an explicit provider override only.
 - Explicit completed-bar catch-up after downtime without retroactive live forecasts.
 - Purged walk-forward evaluation, conformal interval calibration, calibrated
-  direction and symmetric LONG/SHORT barrier classifiers.
+  direction and executable-side LONG/SHORT barrier classifiers.
 - Exact prediction origin plus objective settlement for every 1/3/6/12-bar horizon.
 - Deterministic prediction IDs and a database uniqueness contract make retries idempotent.
 - Condition-dependent MFE/MAE models; lot preview remains disabled for the baseline.
 - Scalper and strict Sniper policies use the current bid/ask, reject already-touched
   barriers and require enough remaining reward/risk after costs.
-- Dynamic MT5 account and symbol specifications.
+- Historical ticks are aggregated into separate Bid and Ask OHLC. LONG outcomes
+  use Bid exits; SHORT outcomes use Ask exits. A non-Bid chart mode is rejected.
+- Absolute provider tick age and local transport age are checked independently;
+  market closed, stale feed and disconnected bridge remain distinct states.
+- Side-aware costs use Ask-entry/Bid-exit for LONG and Bid-entry/estimated
+  Ask-exit for SHORT. The exit spread is the rolling median of exact Bid/Ask bars.
+- Live coverage, Brier, ECE and MAE-coverage gates can degrade or suspend new
+  proposals after the minimum settled sample is reached.
+- Dynamic MT5 account, currency and symbol specifications.
 - MT5 `order_calc_margin()` is authoritative for lot-preview margin when available.
 - SQLite WAL audit trail, prediction registry and outcome settlement.
 - Rust REST/WebSocket service bound to localhost.
@@ -108,7 +116,8 @@ Use `-Once` for a single connectivity snapshot and catch-up check:
 
 `-Once` is intended only for diagnostics and deliberately does not manufacture
 a live forecast from the last candle seen during startup. After it exits, the
-core marks the feed `MT5_STALE` and returns `NO_PREDICTION`.
+core eventually marks the bridge `BRIDGE_DISCONNECTED` and returns
+`NO_PREDICTION`.
 
 If multiple MT5 terminals are installed, copy `.env.example` to a local ignored
 `.env` or set `MT5_PATH`. Credentials are optional when the selected terminal is
@@ -116,7 +125,14 @@ already logged in; never commit them.
 
 MetaTrader 5 Python timestamps are treated as UTC. Only set
 `MT5_UTC_OFFSET_OVERRIDE_HOURS` when a provider has been independently verified
-to encode a fixed non-UTC offset.
+to encode a fixed non-UTC offset. The same verified normalization is applied to
+rate bars, ticks and the absolute freshness calculation. A future tick beyond
+the freshness tolerance is rejected instead of being clamped into a fresh tick.
+
+`MT5_MARKET_UTC_OFFSET_HOURS` controls only interpretation of the configured
+`GOLDm#` quote window (01:00–23:59). Set it to the timezone used by the broker's
+instrument specification; when empty it follows the verified provider timestamp
+offset. It does not alter normalized stored timestamps.
 
 ## Verification
 
@@ -147,6 +163,11 @@ promotion to champion is deliberately manual and requires enough settled shadow
 predictions. Training artifacts and historical exports are local and ignored by
 Git.
 
+Candidate training is intentionally blocked unless the dataset manifest proves
+that it came from a Bid chart and historical Bid/Ask ticks. Chart OHLC with a
+spread approximation is not silently accepted. Existing artifacts trained on
+the older one-sided contract must be retired and retrained.
+
 The backfill command treats the fetched MT5 window as authoritative and replaces
 the local `GOLDm#`/M5 bar cache before importing chunks. Use `--append` only when
 an intentional incremental import is required. Every export also creates a
@@ -167,7 +188,8 @@ manifest, runs Rust/Python/Next.js tests, trains the candidate, verifies artifac
 checksums and copies an immutable candidate folder plus ZIP back to Drive. The
 artifact records the Git commit, dirty state, runtime and dependency versions.
 
-Only candidate schema v3 is executable. Schema v2 artifacts belong under
+Only candidate schema v3 with eligibility gate version 3 or newer is executable.
+Schema v2 and gate-v2 artifacts belong under
 `artifacts/catboost/retired/`; the launcher and retry path fall back to the
 empirical baseline rather than loading one. Candidate schema v3 contains
 `evaluation.json`, `model_card.md`,
@@ -180,11 +202,17 @@ models. Import a downloaded Colab ZIP through the checked and immutable importer
 ```
 
 The importer requires the exact artifact file set, validates the schema, feature,
-barrier and eligibility contracts, verifies every checksum, loads every model,
-runs a finite/non-crossing golden forecast, refuses duplicate run IDs and only
-promotes eligible candidates to the local `latest` shadow slot. Promotion uses
-staging plus rollback. The bridge repeats checksum and contract validation before
-loading a candidate.
+barrier, executable-side and eligibility contracts, verifies every checksum,
+loads every model, runs a finite/non-crossing golden forecast, refuses duplicate
+run IDs and only promotes eligible candidates to the local `latest` shadow slot.
+Promotion uses staging plus rollback. The importer registers the candidate when
+the core is available; otherwise the bridge registers it when it is loaded.
+The bridge repeats checksum and contract validation before loading a candidate.
+
+Local installation includes a separate inference dependency set (CatBoost,
+NumPy and pandas). Scikit-learn remains training-only. If an otherwise valid
+candidate cannot load because inference packages are absent, rerun
+`XPDE-Install.cmd`; the importer reports this explicitly.
 
 Forecast barrier evaluation and actionable proposal evaluation are intentionally
 separate. Every settled H3 forecast records counterfactual LONG and SHORT
@@ -195,7 +223,9 @@ forecast quality and a proposal metric never masquerades as model coverage.
 the metric comparable to the trained probability; `tp_vs_sl_conditional_rate`
 is reported separately. Live monitoring also exposes direction/barrier Brier,
 reliability bins, expected calibration error, and per-horizon coverage, width and
-pinball loss.
+pinball loss. Once at least 100 H3 outcomes exist, the live-health policy can
+change from `HEALTHY` to `DEGRADED` or `SUSPENDED`; either unhealthy state forces
+directional proposals to `WAIT` without retraining or mutating the model.
 
 Rust is the canonical production settlement implementation. The Python
 `xpde-settle` command is retained for offline analysis/replay and must not run as

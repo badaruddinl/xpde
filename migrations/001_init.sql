@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS symbol_specs (
     tick_value REAL NOT NULL,
     stops_level_points INTEGER NOT NULL,
     digits INTEGER NOT NULL,
+    chart_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
+    quote_currency TEXT NOT NULL DEFAULT '',
+    pnl_currency TEXT NOT NULL DEFAULT '',
     captured_at TEXT NOT NULL
 );
 
@@ -36,6 +39,15 @@ CREATE TABLE IF NOT EXISTS market_bars (
     low REAL NOT NULL,
     close REAL NOT NULL,
     tick_volume REAL NOT NULL,
+    bid_open REAL,
+    bid_high REAL,
+    bid_low REAL,
+    bid_close REAL,
+    ask_open REAL,
+    ask_high REAL,
+    ask_low REAL,
+    ask_close REAL,
+    executable_tick_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(symbol, timeframe, timestamp)
 );
 
@@ -60,6 +72,7 @@ CREATE TABLE IF NOT EXISTS model_registry (
     training_mode TEXT NOT NULL DEFAULT '',
     eligible_for_shadow INTEGER NOT NULL DEFAULT 0,
     barrier_spec_id TEXT NOT NULL DEFAULT '',
+    executable_side_contract_id TEXT NOT NULL DEFAULT '',
     artifact_path TEXT NOT NULL,
     metrics_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -78,6 +91,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     timeframe TEXT NOT NULL,
     origin_bar_timestamp TEXT,
     origin_close REAL,
+    origin_bid REAL,
+    origin_ask REAL,
     origin_bar_index INTEGER,
     generated_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,

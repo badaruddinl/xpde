@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+
+
+def environment_integer(name: str, default: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    return default if not raw else int(raw)
 
 
 @dataclass(frozen=True)

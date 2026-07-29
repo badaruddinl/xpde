@@ -11,6 +11,7 @@ max_tick_age_ms = 10000
 
 [broker_profile]
 broker_policy_id = "goldm-demo-v1"
+cost_model_id = "executable-side-rolling-spread-v1"
 instrument_name = "GOLD"
 asset_class = "Precious Metals"
 expected_leverage = 1000
@@ -20,6 +21,17 @@ maximum_lot = 100.0
 minimum_price_fluctuation = 0.01
 advertised_min_spread_usd = 0.24
 commission_usd_per_lot = 0.0
+expected_exit_spread_usd = 0.34
+
+[model_health]
+minimum_settled_predictions = 100
+minimum_interval_coverage = 0.70
+maximum_interval_coverage = 0.90
+maximum_direction_brier = 0.26
+maximum_barrier_brier_ratio_to_baseline = 1.05
+maximum_barrier_ece = 0.12
+minimum_mae_q90_coverage = 0.80
+maximum_mae_q90_coverage = 0.98
 
 [policy.scalper]
 max_spread_usd = 0.80

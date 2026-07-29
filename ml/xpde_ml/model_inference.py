@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from .contracts import HORIZONS, deterministic_prediction_id, validate_snapshot
 from .dataset import (
     BARRIER_HORIZON,
     BARRIER_SPEC_ID,
+    EXECUTABLE_SIDE_CONTRACT_ID,
     FEATURE_COLUMNS,
     FEATURE_VERSION,
     barrier_prices,
@@ -33,6 +35,42 @@ REQUIRED_ARTIFACT_FILES = frozenset(
         "checksums.sha256",
     }
 )
+
+INFERENCE_DEPENDENCIES = ("catboost", "numpy", "pandas")
+
+
+def preflight_inference_dependencies() -> None:
+    missing = [
+        dependency
+        for dependency in INFERENCE_DEPENDENCIES
+        if importlib.util.find_spec(dependency) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "Candidate valid, but local inference dependencies are missing: "
+            f"{', '.join(missing)}. Run XPDE-Install.cmd again."
+        )
+
+
+def candidate_registration_payload(
+    manifest: dict[str, Any],
+    artifact_path: Path,
+) -> dict[str, Any]:
+    return {
+        "model_id": manifest["model_id"],
+        "model_type": "catboost_multi_quantile",
+        "status": "candidate",
+        "feature_version": manifest["feature_version"],
+        "schema_version": manifest["schema_version"],
+        "eligibility_gate_version": manifest["eligibility_gate_version"],
+        "training_mode": manifest["training_mode"],
+        "eligible_for_shadow": manifest["eligible_for_shadow"],
+        "barrier_spec_id": manifest["barrier_spec"]["id"],
+        "executable_side_contract_id": manifest["executable_side_contract"]["id"],
+        "eligibility_gates": manifest["eligibility_gates"],
+        "artifact_path": str(artifact_path.resolve()),
+        "metrics": manifest["metrics"],
+    }
 
 
 def verify_artifact_checksums(artifact_dir: Path) -> None:
@@ -77,10 +115,8 @@ class CandidateModel:
         *,
         allow_ineligible_for_testing: bool = False,
     ):
-        try:
-            import catboost
-        except ImportError as error:
-            raise RuntimeError("CatBoost is required for candidate inference") from error
+        preflight_inference_dependencies()
+        import catboost
 
         self.artifact_dir = artifact_dir
         verify_artifact_checksums(artifact_dir)
@@ -89,7 +125,7 @@ class CandidateModel:
         )
         if int(self.manifest.get("schema_version", 0)) != 3:
             raise ValueError("artifact schema is incompatible; schema v3 is required")
-        if int(self.manifest.get("eligibility_gate_version", 0)) < 2:
+        if int(self.manifest.get("eligibility_gate_version", 0)) < 3:
             raise ValueError("artifact eligibility gate version is incompatible")
         if (
             not allow_ineligible_for_testing
@@ -133,6 +169,15 @@ class CandidateModel:
             or int(barrier_spec.get("horizon_bars", 0)) != BARRIER_HORIZON
         ):
             raise ValueError("artifact barrier contract is incompatible")
+        executable_side = self.manifest.get("executable_side_contract", {})
+        if (
+            executable_side.get("id") != EXECUTABLE_SIDE_CONTRACT_ID
+            or executable_side.get("chart_mode") != "BID"
+            or executable_side.get("long_exit_ohlc") != "BID"
+            or executable_side.get("short_exit_ohlc") != "ASK"
+            or executable_side.get("source") != "HISTORICAL_BID_ASK_TICKS"
+        ):
+            raise ValueError("artifact executable-side contract is incompatible")
         self.quantile_models = {}
         for horizon in HORIZONS:
             model = catboost.CatBoostRegressor()

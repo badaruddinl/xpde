@@ -20,6 +20,7 @@ from .dataset import (
     BARRIER_SL_ATR_MULTIPLIER,
     BARRIER_SPEC_ID,
     BARRIER_TP_ATR_MULTIPLIER,
+    EXECUTABLE_SIDE_CONTRACT_ID,
     FEATURE_COLUMNS,
     FEATURE_VERSION,
     METADATA,
@@ -312,6 +313,7 @@ def _register(url: str, manifest: dict[str, Any], artifact_path: Path) -> None:
         "training_mode": manifest["training_mode"],
         "eligible_for_shadow": manifest["eligible_for_shadow"],
         "barrier_spec_id": manifest["barrier_spec"]["id"],
+        "executable_side_contract_id": manifest["executable_side_contract"]["id"],
         "eligibility_gates": manifest["eligibility_gates"],
         "artifact_path": str(artifact_path.resolve()),
         "metrics": manifest["metrics"],
@@ -360,7 +362,16 @@ def train(args) -> dict[str, Any]:
         source_manifest is not None
         and source_manifest.get("contains_incomplete_bar") is False
         and source_manifest.get("git_dirty") is False
+        and source_manifest.get("chart_mode") == "BID"
+        and source_manifest.get("executable_side_source")
+        == "HISTORICAL_BID_ASK_TICKS"
     )
+    training_mode = getattr(args, "training_mode", "candidate")
+    if training_mode == "candidate" and not dataset_integrity_ok:
+        raise ValueError(
+            "candidate training requires a clean dataset manifest with BID chart "
+            "mode and exact HISTORICAL_BID_ASK_TICKS executable sides"
+        )
     frame = build_training_frame(raw)
     required = list(FEATURE_COLUMNS) + [
         *(f"target_{horizon}" for horizon in HORIZONS),
@@ -371,7 +382,6 @@ def train(args) -> dict[str, Any]:
         "mae_short_usd",
     ]
     dataset = frame.dropna(subset=required).reset_index(drop=True)
-    training_mode = getattr(args, "training_mode", "candidate")
     minimum_candidate_rows = int(getattr(args, "minimum_candidate_rows", 20_000))
     candidate_sample_ok = len(dataset) >= minimum_candidate_rows
     if training_mode == "candidate" and not candidate_sample_ok:
@@ -837,6 +847,13 @@ def train(args) -> dict[str, Any]:
             "horizon_bars": BARRIER_HORIZON,
             "take_profit_atr_multiplier": BARRIER_TP_ATR_MULTIPLIER,
             "stop_loss_atr_multiplier": BARRIER_SL_ATR_MULTIPLIER,
+        },
+        "executable_side_contract": {
+            "id": EXECUTABLE_SIDE_CONTRACT_ID,
+            "chart_mode": "BID",
+            "long_exit_ohlc": "BID",
+            "short_exit_ohlc": "ASK",
+            "source": "HISTORICAL_BID_ASK_TICKS",
         },
         "quantiles": list(QUANTILES),
         "purge_gap": METADATA.purge_gap,

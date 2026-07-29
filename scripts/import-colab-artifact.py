@@ -6,6 +6,8 @@ import math
 import shutil
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from datetime import UTC, datetime, timedelta
@@ -14,10 +16,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "ml"))
 
-from xpde_ml.dataset import BARRIER_HORIZON, BARRIER_SPEC_ID, FEATURE_VERSION
+from xpde_ml.dataset import (
+    BARRIER_HORIZON,
+    BARRIER_SPEC_ID,
+    EXECUTABLE_SIDE_CONTRACT_ID,
+    FEATURE_VERSION,
+)
 from xpde_ml.model_inference import (
     REQUIRED_ARTIFACT_FILES,
     CandidateModel,
+    candidate_registration_payload,
     verify_artifact_checksums,
 )
 
@@ -105,7 +113,7 @@ def verify_candidate(path: Path) -> dict:
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     if int(manifest.get("schema_version", 0)) != 3:
         raise ValueError("only schema v3 artifacts can be imported")
-    if int(manifest.get("eligibility_gate_version", 0)) < 2:
+    if int(manifest.get("eligibility_gate_version", 0)) < 3:
         raise ValueError("artifact eligibility gate version is incompatible")
     if manifest.get("training_mode") != "candidate":
         raise ValueError("only candidate-mode artifacts can be imported")
@@ -140,6 +148,15 @@ def verify_candidate(path: Path) -> dict:
         or int(barrier.get("horizon_bars", 0)) != BARRIER_HORIZON
     ):
         raise ValueError("artifact barrier contract is incompatible")
+    executable_side = manifest.get("executable_side_contract", {})
+    if (
+        executable_side.get("id") != EXECUTABLE_SIDE_CONTRACT_ID
+        or executable_side.get("chart_mode") != "BID"
+        or executable_side.get("long_exit_ohlc") != "BID"
+        or executable_side.get("short_exit_ohlc") != "ASK"
+        or executable_side.get("source") != "HISTORICAL_BID_ASK_TICKS"
+    ):
+        raise ValueError("artifact executable-side contract is incompatible")
     model_id = str(manifest.get("model_id", "")).strip()
     if not model_id or Path(model_id).name != model_id:
         raise ValueError("artifact model_id is invalid")
@@ -194,6 +211,29 @@ def import_candidate(
     return target
 
 
+def register_candidate(target: Path, register_url: str) -> str:
+    manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+    payload = candidate_registration_payload(manifest, target)
+    request = urllib.request.Request(
+        register_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if response.status not in (200, 201, 202):
+                raise RuntimeError(
+                    f"model registry rejected candidate with HTTP {response.status}"
+                )
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"model registry rejected candidate with HTTP {error.code}: {body}"
+        ) from error
+    return "registered"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Verify and import an immutable XPDE Colab artifact"
@@ -205,13 +245,36 @@ def main() -> None:
         default=REPO_ROOT / "artifacts" / "catboost",
     )
     parser.add_argument("--no-promote-latest", action="store_true")
+    parser.add_argument(
+        "--register-url",
+        default="http://127.0.0.1:8787/api/v1/models/register",
+    )
     args = parser.parse_args()
     target = import_candidate(
         args.source.resolve(),
         args.artifacts_root.resolve(),
         promote_latest=not args.no_promote_latest,
     )
-    print(json.dumps({"imported": str(target), "promoted_latest": not args.no_promote_latest}))
+    registration = "disabled"
+    if args.register_url:
+        try:
+            registration = register_candidate(target, args.register_url)
+        except urllib.error.URLError:
+            registration = "pending_core_unavailable"
+            print(
+                "Candidate imported safely; model registry is offline. "
+                "XPDE-Start.cmd will register it when the candidate is loaded.",
+                file=sys.stderr,
+            )
+    print(
+        json.dumps(
+            {
+                "imported": str(target),
+                "promoted_latest": not args.no_promote_latest,
+                "registration": registration,
+            }
+        )
+    )
 
 
 if __name__ == "__main__":

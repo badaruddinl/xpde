@@ -130,9 +130,10 @@ if ($existingBridge) {
         if (
             $manifest.eligible_for_shadow -eq $true -and
             [int]$manifest.schema_version -eq 3 -and
-            [int]$manifest.eligibility_gate_version -ge 2 -and
+            [int]$manifest.eligibility_gate_version -ge 3 -and
             $manifest.training_mode -eq "candidate" -and
-            $manifest.barrier_spec.id -eq "atr-1.25tp-1.00sl-h3-v1" -and
+            $manifest.barrier_spec.id -eq "atr-1.25tp-1.00sl-h3-executable-v2" -and
+            $manifest.executable_side_contract.id -eq "bid-entry-exit-long-ask-exit-short-v1" -and
             [int]$manifest.barrier_spec.horizon_bars -eq 3 -and
             $allGatesPassed -and
             $hasRequiredFiles

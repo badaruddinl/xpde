@@ -7,15 +7,44 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any
 
 from .baseline import forecast_from_snapshot
-from .time_utils import BrokerClock
+from .executable_bars import (
+    CHART_MODE_BID,
+    ExecutableBarTracker,
+    collect_executable_bars,
+    overlay_executable_bars,
+    symbol_chart_mode,
+)
+from .time_utils import BrokerClock, environment_integer
 
 SYMBOL = "GOLDm#"
 TIMEFRAME = "M5"
+MAX_TICK_AGE_MS = 10_000
+
+
+def infer_market_status(
+    *,
+    now_utc: datetime,
+    absolute_tick_age_ms: int,
+    terminal_connected: bool,
+    market_utc_offset_hours: int = 0,
+) -> str:
+    if not terminal_connected:
+        return "BRIDGE_DISCONNECTED"
+    market_time = now_utc + timedelta(hours=market_utc_offset_hours)
+    within_week = market_time.weekday() < 5
+    within_quote_hours = datetime_time(1, 0) <= market_time.time() <= datetime_time(
+        23, 59, 59
+    )
+    if not within_week or not within_quote_hours:
+        return "MARKET_CLOSED"
+    if absolute_tick_age_ms > MAX_TICK_AGE_MS:
+        return "FEED_STALE"
+    return "OPEN"
 
 
 class PayloadRejected(RuntimeError):
@@ -67,6 +96,10 @@ def build_snapshot(
     mt5: Any,
     bar_count: int = 500,
     broker_clock: BrokerClock | None = None,
+    *,
+    executable_bars: dict[str, dict[str, Any]] | None = None,
+    transport_tick_age_ms: int = 0,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     if not mt5.symbol_select(SYMBOL, True):
         raise RuntimeError(f"MetaTrader5 symbol {SYMBOL!r} is unavailable")
@@ -98,6 +131,24 @@ def build_snapshot(
 
     tick_time_ms = int(getattr(tick, "time_msc", int(tick.time * 1000)))
     clock = broker_clock or BrokerClock()
+    reference_now = now_utc or datetime.now(UTC)
+    tick_timestamp = clock.to_utc(tick_time_ms / 1000)
+    signed_tick_age_ms = int(
+        (reference_now - tick_timestamp).total_seconds() * 1000
+    )
+    absolute_tick_age_ms = max(0, signed_tick_age_ms)
+    terminal = mt5.terminal_info()
+    terminal_connected = bool(terminal and getattr(terminal, "connected", False))
+    market_status = infer_market_status(
+        now_utc=reference_now,
+        absolute_tick_age_ms=absolute_tick_age_ms,
+        terminal_connected=terminal_connected,
+        market_utc_offset_hours=environment_integer(
+            "MT5_MARKET_UTC_OFFSET_HOURS",
+            clock.offset_hours,
+        ),
+    )
+    chart_mode = symbol_chart_mode(mt5, symbol)
     missing_flags: list[str] = []
     if tick.bid <= 0:
         missing_flags.append("BID_MISSING")
@@ -105,6 +156,10 @@ def build_snapshot(
         missing_flags.append("ASK_INVALID")
     if len(rates) < 48:
         missing_flags.append("BARS_INSUFFICIENT")
+    if chart_mode != CHART_MODE_BID:
+        missing_flags.append("CHART_MODE_UNSUPPORTED_FOR_MODEL")
+    if signed_tick_age_ms < -MAX_TICK_AGE_MS:
+        missing_flags.append("TICK_TIMESTAMP_IN_FUTURE")
 
     bars = [
         {
@@ -117,6 +172,17 @@ def build_snapshot(
         }
         for rate in rates
     ]
+    bars = overlay_executable_bars(bars, executable_bars or {})
+    executable_fields = tuple(
+        f"{side}_{field}"
+        for side in ("bid", "ask")
+        for field in ("open", "high", "low", "close")
+    )
+    if bars and (
+        not all(field in bars[-1] for field in executable_fields)
+        or int(bars[-1].get("executable_tick_count", 0)) <= 0
+    ):
+        missing_flags.append("EXECUTABLE_SIDE_BAR_MISSING")
     current_bar = None
     if current_rates is not None and len(current_rates) == 1:
         rate = current_rates[0]
@@ -128,6 +194,14 @@ def build_snapshot(
             "close": float(rate["close"]),
             "tick_volume": float(rate["tick_volume"]),
         }
+        current_bar = overlay_executable_bars(
+            [current_bar], executable_bars or {}
+        )[0]
+    if current_bar is None or (
+        not all(field in current_bar for field in executable_fields)
+        or int(current_bar.get("executable_tick_count", 0)) <= 0
+    ):
+        missing_flags.append("CURRENT_EXECUTABLE_SIDE_BAR_MISSING")
 
     return {
         "symbol": SYMBOL,
@@ -157,6 +231,9 @@ def build_snapshot(
             "tick_value": float(symbol.trade_tick_value),
             "stops_level_points": int(symbol.trade_stops_level),
             "digits": int(symbol.digits),
+            "chart_mode": chart_mode,
+            "quote_currency": str(getattr(symbol, "currency_profit", "") or "USD"),
+            "pnl_currency": str(account.currency),
             "margin_per_lot_buy": (
                 float(margin_buy)
                 if margin_buy is not None and float(margin_buy) > 0
@@ -170,9 +247,10 @@ def build_snapshot(
         },
         "data_quality": {
             "completeness": 1.0 if not missing_flags else 0.0,
-            # MT5 Python epoch timestamps are UTC. The polling loop replaces
-            # this with a monotonic age based on actual tick changes.
-            "tick_age_ms": 0,
+            "tick_age_ms": max(absolute_tick_age_ms, transport_tick_age_ms),
+            "absolute_tick_age_ms": absolute_tick_age_ms,
+            "transport_tick_age_ms": max(0, transport_tick_age_ms),
+            "market_status": market_status,
             "missing_flags": missing_flags,
             "reason_codes": (
                 [f"UTC_PROVIDER_OVERRIDE_HOURS_{clock.offset_hours}"]
@@ -248,6 +326,15 @@ def fetch_catchup_bars(
         }
         for rate in rates
     ]
+    if len(rates):
+        executable, _ = collect_executable_bars(
+            mt5,
+            symbol=SYMBOL,
+            start_epoch=min(float(rate["time"]) for rate in rates),
+            end_epoch=max(float(rate["time"]) for rate in rates) + 300.0,
+            clock=clock,
+        )
+        bars = overlay_executable_bars(bars, executable)
     return sorted(
         {
             bar["timestamp"]: bar
@@ -303,6 +390,10 @@ def main() -> None:
         "--backfill-url",
         default="http://127.0.0.1:8787/api/v1/market/backfill",
     )
+    parser.add_argument(
+        "--model-register-url",
+        default="http://127.0.0.1:8787/api/v1/models/register",
+    )
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--max-retry-delay", type=float, default=10.0)
     parser.add_argument("--once", action="store_true")
@@ -329,11 +420,15 @@ def main() -> None:
         if initial_tick is None:
             raise RuntimeError("MetaTrader5 did not return an initial tick")
         broker_clock = BrokerClock(
-            int(os.getenv("MT5_UTC_OFFSET_OVERRIDE_HOURS", "0"))
+            environment_integer("MT5_UTC_OFFSET_OVERRIDE_HOURS")
         )
+        executable_tracker = ExecutableBarTracker(retention_bars=24)
         candidate = None
         if args.model_dir:
-            from .model_inference import CandidateModel
+            from .model_inference import (
+                CandidateModel,
+                candidate_registration_payload,
+            )
 
             candidate = CandidateModel(args.model_dir)
             if not candidate.manifest.get("eligible_for_shadow", False):
@@ -341,12 +436,27 @@ def main() -> None:
                     f"candidate {candidate.model_id} did not pass the shadow eligibility gate"
                 )
             print(f"XPDE candidate model loaded: {candidate.model_id}", flush=True)
+            post_payload(
+                args.model_register_url,
+                candidate_registration_payload(candidate.manifest, args.model_dir),
+                expected_status=(200, 201, 202),
+            )
         retry_delay = max(args.interval, 0.5)
         pending_startup_forecast: dict[str, Any] | None = None
         pending_startup_bar: str | None = None
         while True:
             try:
-                startup_snapshot = build_snapshot(mt5, broker_clock=broker_clock)
+                executable_tracker.refresh(
+                    mt5,
+                    symbol=SYMBOL,
+                    clock=broker_clock,
+                    now_epoch=datetime.now(UTC).timestamp(),
+                )
+                startup_snapshot = build_snapshot(
+                    mt5,
+                    broker_clock=broker_clock,
+                    executable_bars=executable_tracker.bars,
+                )
                 latest_completed_bar = startup_snapshot["bars"][-1]["timestamp"]
                 cursor = get_payload(args.cursor_url).get(
                     "last_completed_bar_timestamp"
@@ -368,7 +478,12 @@ def main() -> None:
                         flush=True,
                     )
                 post_payload(args.api_url, startup_snapshot)
-                if not args.snapshot_only and not startup_had_gap:
+                if (
+                    not args.snapshot_only
+                    and not startup_had_gap
+                    and startup_snapshot["data_quality"]["market_status"] == "OPEN"
+                    and not startup_snapshot["data_quality"]["missing_flags"]
+                ):
                     if (
                         pending_startup_forecast is None
                         or pending_startup_bar != latest_completed_bar
@@ -422,7 +537,22 @@ def main() -> None:
         retry_delay = max(args.interval, 0.5)
         while True:
             try:
-                snapshot = build_snapshot(mt5, broker_clock=broker_clock)
+                now_epoch = datetime.now(UTC).timestamp()
+                executable_tracker.refresh(
+                    mt5,
+                    symbol=SYMBOL,
+                    clock=broker_clock,
+                    now_epoch=now_epoch,
+                )
+                transport_tick_age_ms = int(
+                    (time.monotonic() - last_tick_change) * 1000
+                )
+                snapshot = build_snapshot(
+                    mt5,
+                    broker_clock=broker_clock,
+                    executable_bars=executable_tracker.bars,
+                    transport_tick_age_ms=transport_tick_age_ms,
+                )
                 tick_signature = (
                     snapshot["timestamp"],
                     snapshot["bid"],
@@ -431,8 +561,12 @@ def main() -> None:
                 if tick_signature != last_tick_signature:
                     last_tick_signature = tick_signature
                     last_tick_change = time.monotonic()
-                snapshot["data_quality"]["tick_age_ms"] = int(
+                snapshot["data_quality"]["transport_tick_age_ms"] = int(
                     (time.monotonic() - last_tick_change) * 1000
+                )
+                snapshot["data_quality"]["tick_age_ms"] = max(
+                    int(snapshot["data_quality"]["absolute_tick_age_ms"]),
+                    int(snapshot["data_quality"]["transport_tick_age_ms"]),
                 )
                 if args.print_snapshot:
                     print(json.dumps(snapshot, indent=2))
@@ -467,6 +601,8 @@ def main() -> None:
                 if (
                     not args.snapshot_only
                     and not skipped_retroactive_forecast
+                    and snapshot["data_quality"]["market_status"] == "OPEN"
+                    and not snapshot["data_quality"]["missing_flags"]
                     and latest_bar != last_forecast_bar
                 ):
                     if pending_forecast is None or pending_forecast_bar != latest_bar:

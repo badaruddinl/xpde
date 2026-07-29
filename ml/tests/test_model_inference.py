@@ -4,7 +4,11 @@ import hashlib
 
 import pytest
 
-from xpde_ml.model_inference import _calibrate_probability, verify_artifact_checksums
+from xpde_ml.model_inference import (
+    _calibrate_probability,
+    candidate_registration_payload,
+    verify_artifact_checksums,
+)
 
 
 def test_artifact_checksum_verification_detects_tampering(tmp_path) -> None:
@@ -44,3 +48,29 @@ def test_probability_calibration_supports_v2_and_v3_payloads() -> None:
         0.1,
         {"method": "constant", "value": 0.37},
     ) == pytest.approx(0.37)
+
+
+def test_registration_payload_carries_executable_contract(tmp_path) -> None:
+    manifest = {
+        "model_id": "candidate-v3",
+        "feature_version": "goldm-m5-v3",
+        "schema_version": 3,
+        "eligibility_gate_version": 3,
+        "training_mode": "candidate",
+        "eligible_for_shadow": True,
+        "barrier_spec": {"id": "atr-1.25tp-1.00sl-h3-executable-v2"},
+        "executable_side_contract": {
+            "id": "bid-entry-exit-long-ask-exit-short-v1"
+        },
+        "eligibility_gates": {"dataset_integrity": True},
+        "metrics": {"holdout": "verified"},
+    }
+
+    payload = candidate_registration_payload(manifest, tmp_path)
+
+    assert payload["schema_version"] == 3
+    assert payload["eligibility_gate_version"] == 3
+    assert (
+        payload["executable_side_contract_id"]
+        == "bid-entry-exit-long-ask-exit-short-v1"
+    )

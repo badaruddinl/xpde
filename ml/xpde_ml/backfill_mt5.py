@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from .mt5_bridge import SYMBOL, TIMEFRAME, initialize_mt5, load_local_env
-from .time_utils import BrokerClock
+from .executable_bars import (
+    collect_executable_bars,
+    overlay_executable_bars,
+    symbol_chart_mode,
+)
+from .time_utils import BrokerClock, environment_integer
 
 
 def validate_export_bars(
@@ -38,6 +43,27 @@ def validate_export_bars(
             or float(bar["low"]) > min(float(bar["open"]), float(bar["close"]))
         ):
             raise ValueError("dataset contains an invalid OHLC candle")
+        for side in ("bid", "ask"):
+            side_open = float(bar[f"{side}_open"])
+            side_high = float(bar[f"{side}_high"])
+            side_low = float(bar[f"{side}_low"])
+            side_close = float(bar[f"{side}_close"])
+            if (
+                side_open <= 0.0
+                or side_close <= 0.0
+                or side_high < max(side_open, side_close)
+                or side_low > min(side_open, side_close)
+            ):
+                raise ValueError(
+                    f"dataset contains an invalid executable {side.upper()} candle"
+                )
+        if any(
+            float(bar[f"ask_{field}"]) <= float(bar[f"bid_{field}"])
+            for field in ("open", "high", "low", "close")
+        ):
+            raise ValueError("dataset executable Ask OHLC is not above Bid")
+        if int(bar.get("executable_tick_count", 0)) <= 0:
+            raise ValueError("dataset executable-side candle has no source ticks")
 
     reference = now_utc or datetime.now(UTC)
     latest_completed_start = int(reference.timestamp() // 300) * 300 - 300
@@ -80,6 +106,7 @@ def write_dataset_manifest(
     *,
     utc_offset_override_hours: int,
     validation: dict[str, int],
+    chart_mode: str,
 ) -> Path:
     digest = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
     manifest_path = dataset_path.with_suffix(".manifest.json")
@@ -88,6 +115,8 @@ def write_dataset_manifest(
         "symbol": SYMBOL,
         "timeframe": TIMEFRAME,
         "provider": "MetaTrader5",
+        "chart_mode": chart_mode,
+        "executable_side_source": "HISTORICAL_BID_ASK_TICKS",
         "first_timestamp": bars[0]["timestamp"],
         "last_timestamp": bars[-1]["timestamp"],
         "row_count": len(bars),
@@ -107,7 +136,7 @@ def write_dataset_manifest(
     return manifest_path
 
 
-def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int]:
+def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int, str]:
     if not mt5.symbol_select(SYMBOL, True):
         raise RuntimeError(f"MetaTrader5 symbol {SYMBOL!r} is unavailable")
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -116,8 +145,9 @@ def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int]:
     if tick is None or symbol is None or rates is None:
         code, message = mt5.last_error()
         raise RuntimeError(f"MetaTrader5 backfill failed ({code}): {message}")
-    clock = BrokerClock(int(os.getenv("MT5_UTC_OFFSET_OVERRIDE_HOURS", "0")))
+    clock = BrokerClock(environment_integer("MT5_UTC_OFFSET_OVERRIDE_HOURS"))
     point = float(symbol.point)
+    chart_mode = symbol_chart_mode(mt5, symbol)
     bars = [
         {
             "timestamp": clock.iso_utc(float(rate["time"])),
@@ -127,11 +157,27 @@ def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int]:
             "close": float(rate["close"]),
             "tick_volume": float(rate["tick_volume"]),
             "spread_usd": float(rate["spread"]) * point,
+            "chart_mode": chart_mode,
         }
         for rate in rates
     ]
     bars.sort(key=lambda bar: bar["timestamp"])
-    return bars, clock.offset_hours
+    if not bars:
+        return bars, clock.offset_hours, chart_mode
+    raw_start = min(float(rate["time"]) for rate in rates)
+    raw_end = max(float(rate["time"]) for rate in rates) + 300.0
+    executable, _ = collect_executable_bars(
+        mt5,
+        symbol=SYMBOL,
+        start_epoch=raw_start,
+        end_epoch=raw_end,
+        clock=clock,
+    )
+    return (
+        overlay_executable_bars(bars, executable),
+        clock.offset_hours,
+        chart_mode,
+    )
 
 
 def write_csv(path: Path, bars: list[dict[str, Any]]) -> None:
@@ -201,7 +247,7 @@ def main() -> None:
 
     initialize_mt5(mt5)
     try:
-        bars, offset = fetch_bars(mt5, args.bars)
+        bars, offset, chart_mode = fetch_bars(mt5, args.bars)
     finally:
         mt5.shutdown()
     if not bars:
@@ -213,6 +259,7 @@ def main() -> None:
         bars,
         utc_offset_override_hours=offset,
         validation=validation,
+        chart_mode=chart_mode,
     )
     inserted = (
         0

@@ -16,7 +16,7 @@ $arguments = @(
     "--interval", $Interval.ToString([Globalization.CultureInfo]::InvariantCulture)
 )
 if ($Once) {
-    $arguments += "--once"
+    $arguments += @("--once", "--snapshot-only")
 }
 
 Push-Location $repoRoot

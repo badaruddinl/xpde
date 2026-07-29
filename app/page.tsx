@@ -18,6 +18,15 @@ interface MarketBar {
   low: number;
   close: number;
   tick_volume: number;
+  bid_open?: number | null;
+  bid_high?: number | null;
+  bid_low?: number | null;
+  bid_close?: number | null;
+  ask_open?: number | null;
+  ask_high?: number | null;
+  ask_low?: number | null;
+  ask_close?: number | null;
+  executable_tick_count?: number;
 }
 
 interface ForecastPoint {
@@ -33,6 +42,10 @@ interface Proposal {
   prediction_id: string;
   profile: Profile;
   broker_policy_id: string;
+  cost_model_id: string;
+  account_currency: string;
+  quote_currency: string;
+  pnl_currency: string;
   action: DecisionAction;
   generated_at: string;
   decision_valid_until: string;
@@ -44,6 +57,10 @@ interface Proposal {
   remaining_risk_usd: number;
   reward_risk_ratio: number;
   entry_deviation_from_origin: number;
+  entry_spread: number;
+  expected_exit_spread: number;
+  slippage_assumption: number;
+  commission: number;
   invalidation_price: number | null;
   target_price: number | null;
   reason_codes: string[];
@@ -80,10 +97,21 @@ interface DashboardState {
       tick_value: number;
       margin_per_lot_buy?: number | null;
       margin_per_lot_sell?: number | null;
+      chart_mode: "BID" | "LAST" | "UNKNOWN";
+      quote_currency: string;
+      pnl_currency: string;
     };
     data_quality: {
       completeness: number;
       tick_age_ms: number;
+      absolute_tick_age_ms: number;
+      transport_tick_age_ms: number;
+      market_status:
+        | "OPEN"
+        | "MARKET_CLOSED"
+        | "FEED_STALE"
+        | "BRIDGE_DISCONNECTED"
+        | "UNKNOWN";
       missing_flags: string[];
       reason_codes: string[];
     };
@@ -119,6 +147,19 @@ interface DashboardState {
     points: ForecastPoint[];
   };
   proposals: Proposal[];
+  model_health: {
+    status: "WARMING_UP" | "HEALTHY" | "DEGRADED" | "SUSPENDED";
+    sample_size: number;
+    minimum_sample_size: number;
+    interval_coverage: number | null;
+    direction_brier: number | null;
+    direction_baseline_brier: number | null;
+    barrier_brier: number | null;
+    barrier_baseline_brier: number | null;
+    barrier_ece: number | null;
+    mae_q90_coverage: number | null;
+    reason_codes: string[];
+  };
   safety: {
     auto_trading_enabled: boolean;
     human_confirmation_required: boolean;
@@ -199,13 +240,25 @@ function buildDemoState(): DashboardState {
     const open = price;
     const close = 3331.3 + index * 0.018 + Math.sin(index / 3.6) * 0.56;
     price = close;
+    const high = Math.max(open, close) + 0.3 + (index % 3) * 0.05;
+    const low = Math.min(open, close) - 0.28 - (index % 2) * 0.04;
+    const spread = 0.34;
     return {
       timestamp: new Date(baseTime + index * 5 * 60_000).toISOString(),
       open,
-      high: Math.max(open, close) + 0.3 + (index % 3) * 0.05,
-      low: Math.min(open, close) - 0.28 - (index % 2) * 0.04,
+      high,
+      low,
       close,
       tick_volume: 155 + (index % 8) * 12,
+      bid_open: open,
+      bid_high: high,
+      bid_low: low,
+      bid_close: close,
+      ask_open: open + spread,
+      ask_high: high + spread,
+      ask_low: low + spread,
+      ask_close: close + spread,
+      executable_tick_count: 155 + (index % 8) * 12,
     };
   });
   const predictionId = "demo-shadow-prediction";
@@ -242,10 +295,16 @@ function buildDemoState(): DashboardState {
         tick_value: 0.01,
         margin_per_lot_buy: 3.34,
         margin_per_lot_sell: 3.34,
+        chart_mode: "BID",
+        quote_currency: "USD",
+        pnl_currency: "USD",
       },
       data_quality: {
         completeness: 1,
         tick_age_ms: 0,
+        absolute_tick_age_ms: 0,
+        transport_tick_age_ms: 0,
+        market_status: "OPEN",
         missing_flags: [],
         reason_codes: ["DEMO_DATA"],
       },
@@ -253,7 +312,7 @@ function buildDemoState(): DashboardState {
     forecast: {
       prediction_id: predictionId,
       model_id: "baseline-demo-v1",
-      feature_version: "goldm-m5-v1",
+      feature_version: "goldm-m5-v3",
       origin_bar_timestamp: bars[bars.length - 1].timestamp,
       origin_close: bars[bars.length - 1].close,
       origin_bar_index: Math.floor(
@@ -263,7 +322,7 @@ function buildDemoState(): DashboardState {
       direction_probability_up: 0.57,
       barrier_probability_long: 0.54,
       barrier_probability_short: 0.46,
-      barrier_spec_id: "atr-1.25tp-1.00sl-h3-v1",
+      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v2",
       barrier_horizon_bars: 3,
       target_price_long: bars[bars.length - 1].close + 1.25,
       stop_price_long: bars[bars.length - 1].close - 1,
@@ -292,6 +351,10 @@ function buildDemoState(): DashboardState {
         prediction_id: predictionId,
         profile: "SCALPER",
         broker_policy_id: "goldm-demo-v1",
+        cost_model_id: "executable-side-rolling-spread-v1",
+        account_currency: "USD",
+        quote_currency: "USD",
+        pnl_currency: "USD",
         action: "WAIT",
         generated_at: now,
         decision_valid_until: decisionValidUntil,
@@ -303,6 +366,10 @@ function buildDemoState(): DashboardState {
         remaining_risk_usd: 0.17,
         reward_risk_ratio: 0.35,
         entry_deviation_from_origin: 0.17,
+        entry_spread: 0.34,
+        expected_exit_spread: 0.34,
+        slippage_assumption: 0.03,
+        commission: 0,
         invalidation_price: null,
         target_price: null,
         reason_codes: ["REMAINING_EDGE_TOO_SMALL"],
@@ -312,6 +379,10 @@ function buildDemoState(): DashboardState {
         prediction_id: predictionId,
         profile: "SNIPER",
         broker_policy_id: "goldm-demo-v1",
+        cost_model_id: "executable-side-rolling-spread-v1",
+        account_currency: "USD",
+        quote_currency: "USD",
+        pnl_currency: "USD",
         action: "WAIT",
         generated_at: now,
         decision_valid_until: decisionValidUntil,
@@ -323,6 +394,10 @@ function buildDemoState(): DashboardState {
         remaining_risk_usd: 0.17,
         reward_risk_ratio: 0.35,
         entry_deviation_from_origin: 0.17,
+        entry_spread: 0.34,
+        expected_exit_spread: 0.34,
+        slippage_assumption: 0.03,
+        commission: 0,
         invalidation_price: null,
         target_price: null,
         reason_codes: [
@@ -333,6 +408,19 @@ function buildDemoState(): DashboardState {
         risk_warnings: ["HIGH_LEVERAGE_ACCOUNT", "MANUAL_CONFIRMATION_REQUIRED"],
       },
     ],
+    model_health: {
+      status: "WARMING_UP",
+      sample_size: 0,
+      minimum_sample_size: MIN_LIVE_EVIDENCE,
+      interval_coverage: null,
+      direction_brier: null,
+      direction_baseline_brier: null,
+      barrier_brier: null,
+      barrier_baseline_brier: null,
+      barrier_ece: null,
+      mae_q90_coverage: null,
+      reason_codes: ["MODEL_LIVE_HEALTH_WARMING_UP"],
+    },
     safety: {
       auto_trading_enabled: false,
       human_confirmation_required: true,
@@ -342,7 +430,7 @@ function buildDemoState(): DashboardState {
 }
 
 function money(value: number, digits = 2, currency = "USD") {
-  return new Intl.NumberFormat("en-US", {
+  return new Intl.NumberFormat("en-ID", {
     style: "currency",
     currency,
     minimumFractionDigits: digits,
@@ -385,6 +473,14 @@ function reasonLabel(reason: string) {
     FORECAST_EXPIRED: "Masa berlaku keputusan forecast sudah lewat",
     FORECAST_INVALID: "Kontrak forecast atau barrier tidak valid",
     EXCURSION_MODEL_UNAVAILABLE: "Model MFE/MAE dinamis belum tersedia",
+    MARKET_CLOSED: "Pasar sedang tutup",
+    FEED_STALE: "Tick broker sudah kedaluwarsa",
+    BRIDGE_DISCONNECTED: "Bridge MT5 terputus",
+    UNSUPPORTED_CHART_MODE: "Chart broker bukan Bid; kontrak executable tidak didukung",
+    EXECUTABLE_SIDE_BAR_MISSING: "Candle Bid/Ask executable belum lengkap",
+    MODEL_LIVE_HEALTH_WARMING_UP: "Evidence live belum mencapai sampel minimum",
+    MODEL_LIVE_HEALTH_DEGRADED: "Kesehatan model live menurun; proposal dihentikan",
+    MODEL_LIVE_HEALTH_SUSPENDED: "Model disuspensi oleh gate evidence live",
   };
   return labels[reason] ?? reason.replaceAll("_", " ").toLowerCase();
 }
@@ -392,7 +488,8 @@ function reasonLabel(reason: string) {
 export default function Home() {
   const [state, setState] = useState<DashboardState>(() => buildDemoState());
   const [profile, setProfile] = useState<Profile>("SCALPER");
-  const [transport, setTransport] = useState<"connected" | "fallback">("fallback");
+  const [coreApiConnected, setCoreApiConnected] = useState(false);
+  const [transport, setTransport] = useState<"connected" | "reconnecting">("reconnecting");
   const [feedbackStatus, setFeedbackStatus] = useState("");
   const [riskPercent, setRiskPercent] = useState(1);
   const [evaluation, setEvaluation] = useState<EvaluationSummary | null>(null);
@@ -404,8 +501,9 @@ export default function Home() {
       const response = await fetch(`${API_BASE}/api/v1/state`, { cache: "no-store" });
       if (!response.ok) throw new Error("API unavailable");
       setState((await response.json()) as DashboardState);
+      setCoreApiConnected(true);
     } catch {
-      setTransport("fallback");
+      setCoreApiConnected(false);
     }
   }, []);
 
@@ -424,7 +522,7 @@ export default function Home() {
   useEffect(() => {
     const initial = window.setTimeout(loadState, 0);
     const timer =
-      transport === "fallback" ? window.setInterval(loadState, 3000) : null;
+      transport === "reconnecting" ? window.setInterval(loadState, 3000) : null;
     return () => {
       window.clearTimeout(initial);
       if (timer !== null) window.clearInterval(timer);
@@ -451,19 +549,21 @@ export default function Home() {
       socket = new WebSocket("ws://127.0.0.1:8787/ws");
       socket.addEventListener("open", () => {
         attempt = 0;
+        setCoreApiConnected(true);
         setTransport("connected");
       });
       socket.addEventListener("message", (event) => {
         try {
           setState(JSON.parse(event.data) as DashboardState);
+          setCoreApiConnected(true);
           setTransport("connected");
         } catch {
-          setTransport("fallback");
+          setTransport("reconnecting");
         }
       });
       socket.addEventListener("close", () => {
         if (stopped) return;
-        setTransport("fallback");
+        setTransport("reconnecting");
         const delay = Math.min(30_000, 1000 * 2 ** attempt);
         attempt += 1;
         retryTimer = window.setTimeout(connect, delay);
@@ -684,12 +784,12 @@ export default function Home() {
         if (!stateResponse.ok) continue;
         const nextState = (await stateResponse.json()) as DashboardState;
         setState(nextState);
+        setCoreApiConnected(true);
         const stateAgeMs = Date.now() - Date.parse(nextState.updated_at);
         if (
           nextState.connection_status === "MT5_CONNECTED" &&
           stateAgeMs < 15_000
         ) {
-          setTransport("connected");
           setRetryStatus("Realtime tersambung kembali.");
           return;
         }
@@ -710,13 +810,13 @@ export default function Home() {
       <strong className="decision-action">{proposal.action.replace("_", " ")}</strong>
       <p>{proposal.reason_codes.length ? reasonLabel(proposal.reason_codes[0]) : "Semua gate profil terpenuhi."}</p>
       <div className="decision-numbers">
-        <div><span>Median move setelah biaya · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.median_move_after_cost_usd)}</strong></div>
+        <div><span>Median move setelah biaya · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.median_move_after_cost_usd, 2, proposal.pnl_currency || state.snapshot.account.currency)}</strong></div>
         <div>
           <span>Entry / reward / risk</span>
           <strong>
             {proposal.reference_entry_price === null
               ? "—"
-              : `${proposal.reference_entry_price.toFixed(2)} · ${money(proposal.remaining_reward_usd)} / ${money(proposal.remaining_risk_usd)}`}
+              : `${proposal.reference_entry_price.toFixed(2)} · ${money(proposal.remaining_reward_usd, 2, proposal.pnl_currency || state.snapshot.account.currency)} / ${money(proposal.remaining_risk_usd, 2, proposal.pnl_currency || state.snapshot.account.currency)}`}
           </strong>
         </div>
         <div><span>Reward / risk tersisa</span><strong>{proposal.reward_risk_ratio.toFixed(2)}×</strong></div>
@@ -731,6 +831,13 @@ export default function Home() {
         <div>
           <span>Barrier TP / SL · {forecastSide}</span>
           <strong>{barrierTarget.toFixed(2)} / {barrierStop.toFixed(2)}</strong>
+        </div>
+        <div>
+          <span>Cost model · {proposal.cost_model_id}</span>
+          <strong>
+            spread {proposal.entry_spread.toFixed(2)} → {proposal.expected_exit_spread.toFixed(2)}
+            {" · "}slip {proposal.slippage_assumption.toFixed(2)}
+          </strong>
         </div>
       </div>
       <ul className="reason-list">
@@ -759,10 +866,13 @@ export default function Home() {
           </span>
         </div>
         <div className="connection">
-          <span className={`pulse ${transport}`} />
+          <span className={`pulse ${coreApiConnected ? "connected" : "fallback"}`} />
           <div>
-            <strong>{transport === "connected" ? "Core tersambung" : "Demo lokal"}</strong>
-            <span>{state.connection_status.replaceAll("_", " ")}</span>
+            <strong>{coreApiConnected ? "Core API tersambung" : "Core API tidak tersambung"}</strong>
+            <span>
+              WebSocket {transport === "connected" ? "live" : "reconnecting"}
+              {" · "}{state.snapshot.data_quality.market_status.replaceAll("_", " ")}
+            </span>
           </div>
           <button
             className="retry-button"
@@ -780,6 +890,9 @@ export default function Home() {
         <span className="safe-badge">SHADOW MODE</span>
         <span className={`data-badge ${state.safety.feed_is_demo ? "demo" : "live"}`}>
           {state.safety.feed_is_demo ? "DEMO DATA" : "MT5 LIVE"}
+        </span>
+        <span className={`data-badge ${state.snapshot.data_quality.market_status === "OPEN" ? "live" : "demo"}`}>
+          MARKET {state.snapshot.data_quality.market_status.replaceAll("_", " ")}
         </span>
         <span className={`data-badge ${state.forecast_status === "CURRENT" ? "live" : "demo"}`}>
           FORECAST {state.forecast_status.replaceAll("_", " ")}
@@ -814,7 +927,7 @@ export default function Home() {
 
             <div className="chart-meta">
               <div><span>Last live</span><strong>{lastPrice.toFixed(2)}</strong></div>
-              <div><span>Spread aktual</span><strong>{spread.toFixed(2)} USD</strong></div>
+              <div><span>Spread aktual</span><strong>{spread.toFixed(2)} {state.snapshot.symbol_spec.quote_currency}</strong></div>
               <div><span>Keputusan valid</span><strong>{time(proposal.decision_valid_until)} UTC</strong></div>
               <div><span>Outcome matang</span><strong>{time(proposal.outcome_matures_at)} UTC</strong></div>
               <div><span>Model</span><strong>{state.forecast.model_id}</strong></div>
@@ -1037,6 +1150,15 @@ export default function Home() {
             <div className="gate-row"><span><i className={state.forecast.drift_detected ? "bad" : "ok"} /> Drift detector</span><strong>{state.forecast.drift_detected ? "Detected" : "Clear"}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Live direction Brier</span><strong>{activeEvaluation?.direction_brier?.toFixed(4) ?? "—"}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Barrier calibration ECE</span><strong>{evaluation?.barrier_expected_calibration_error === null || evaluation?.barrier_expected_calibration_error === undefined ? "—" : percent(evaluation.barrier_expected_calibration_error)}</strong></div>
+            <div className="gate-row">
+              <span>
+                <i className={state.model_health.status === "HEALTHY" ? "ok" : state.model_health.status === "WARMING_UP" ? "warn" : "bad"} />
+                Live model health
+              </span>
+              <strong>{state.model_health.status.replaceAll("_", " ")}</strong>
+            </div>
+            <div className="gate-row"><span><i className={state.snapshot.symbol_spec.chart_mode === "BID" ? "ok" : "bad"} /> Executable bars</span><strong>{state.snapshot.symbol_spec.chart_mode} · Bid/Ask</strong></div>
+            <div className="gate-row"><span><i className={state.snapshot.data_quality.absolute_tick_age_ms <= 10_000 ? "ok" : "bad"} /> Absolute tick age</span><strong>{state.snapshot.data_quality.absolute_tick_age_ms} ms</strong></div>
             <div className="gate-row"><span><i className="warn" /> Data source</span><strong>{state.safety.feed_is_demo ? "Demo" : "MT5 live"}</strong></div>
           </section>
 

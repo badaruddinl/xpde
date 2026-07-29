@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .contracts import HORIZONS
 
-FEATURE_VERSION = "goldm-m5-v2"
+FEATURE_VERSION = "goldm-m5-v3"
 FEATURE_COLUMNS = (
     "return_1",
     "return_3",
@@ -45,7 +45,8 @@ METADATA = DatasetMetadata(
 )
 
 BARRIER_HORIZON = 3
-BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-v1"
+BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v2"
+EXECUTABLE_SIDE_CONTRACT_ID = "bid-entry-exit-long-ask-exit-short-v1"
 BARRIER_TP_ATR_MULTIPLIER = 1.25
 BARRIER_SL_ATR_MULTIPLIER = 1.0
 BARRIER_CLASS = {
@@ -128,6 +129,21 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
     import numpy as np
 
     result = frame.copy()
+    executable_columns = {
+        f"{side}_{field}"
+        for side in ("bid", "ask")
+        for field in ("open", "high", "low", "close")
+    }
+    missing = sorted(executable_columns - set(result.columns))
+    if missing:
+        raise ValueError(
+            "executable Bid/Ask OHLC is required for objective labels; missing "
+            + ", ".join(missing)
+        )
+    if "chart_mode" not in result.columns or not (
+        result["chart_mode"].astype(str).str.upper() == "BID"
+    ).all():
+        raise ValueError("candidate labels currently require MT5 BID chart mode")
     close = result["close"].astype(float)
     for horizon in HORIZONS:
         result[f"target_{horizon}"] = np.log(close.shift(-horizon) / close)
@@ -150,11 +166,13 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
         side: str,
     ) -> str:
         for _, future_bar in future.iterrows():
-            high = float(future_bar["high"])
-            low = float(future_bar["low"])
             if side == "long":
+                high = float(future_bar["bid_high"])
+                low = float(future_bar["bid_low"])
                 tp_hit, sl_hit = high >= target, low <= stop
             else:
+                high = float(future_bar["ask_high"])
+                low = float(future_bar["ask_low"])
                 tp_hit, sl_hit = low <= target, high >= stop
             if tp_hit and sl_hit:
                 return "AMBIGUOUS_SAME_BAR"
@@ -196,12 +214,16 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
         barrier_short_outcome.append(short_outcome)
         barrier_long_class.append(BARRIER_CLASS.get(long_outcome, np.nan))
         barrier_short_class.append(BARRIER_CLASS.get(short_outcome, np.nan))
-        future_high = float(future["high"].max())
-        future_low = float(future["low"].min())
-        mfe_long.append(max(0.0, future_high - start))
-        mae_long.append(max(0.0, start - future_low))
-        mfe_short.append(max(0.0, start - future_low))
-        mae_short.append(max(0.0, future_high - start))
+        future_bid_high = float(future["bid_high"].max())
+        future_bid_low = float(future["bid_low"].min())
+        future_ask_high = float(future["ask_high"].max())
+        future_ask_low = float(future["ask_low"].min())
+        long_entry_ask = float(row["ask_close"])
+        short_entry_bid = float(row["bid_close"])
+        mfe_long.append(max(0.0, future_bid_high - long_entry_ask))
+        mae_long.append(max(0.0, long_entry_ask - future_bid_low))
+        mfe_short.append(max(0.0, short_entry_bid - future_ask_low))
+        mae_short.append(max(0.0, future_ask_high - short_entry_bid))
 
     result["barrier_long_outcome"] = barrier_long_outcome
     result["barrier_short_outcome"] = barrier_short_outcome

@@ -34,15 +34,27 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
         close = max(100.0, open_price + change)
         upper = float(rng.uniform(0.12, 0.95))
         lower = float(rng.uniform(0.12, 0.95))
+        high = max(open_price, close) + upper
+        low = min(open_price, close) - lower
         rows.append(
             {
                 "timestamp": start + timedelta(minutes=5 * index),
                 "open": open_price,
-                "high": max(open_price, close) + upper,
-                "low": min(open_price, close) - lower,
+                "high": high,
+                "low": low,
                 "close": close,
                 "tick_volume": float(100 + index % 40),
                 "spread_usd": 0.24,
+                "bid_open": open_price,
+                "bid_high": high,
+                "bid_low": low,
+                "bid_close": close,
+                "ask_open": open_price + 0.24,
+                "ask_high": high + 0.24,
+                "ask_low": low + 0.24,
+                "ask_close": close + 0.24,
+                "executable_tick_count": 100 + index % 40,
+                "chart_mode": "BID",
             }
         )
         price = close
@@ -67,6 +79,8 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
                 "contains_incomplete_bar": False,
                 "git_dirty": False,
                 "git_commit": "synthetic-e2e",
+                "chart_mode": "BID",
+                "executable_side_source": "HISTORICAL_BID_ASK_TICKS",
             }
         ),
         encoding="utf-8",

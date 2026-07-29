@@ -16,8 +16,9 @@ from xpde_ml.backfill_mt5 import (
 
 def sample_bars() -> list[dict]:
     start = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
-    return [
-        {
+    bars = []
+    for index in range(3):
+        bar = {
             "timestamp": (start + timedelta(minutes=5 * index)).isoformat(),
             "open": 4000.0 + index,
             "high": 4001.2 + index,
@@ -26,8 +27,12 @@ def sample_bars() -> list[dict]:
             "tick_volume": 100.0 + index,
             "spread_usd": 0.24,
         }
-        for index in range(3)
-    ]
+        for field in ("open", "high", "low", "close"):
+            bar[f"bid_{field}"] = bar[field]
+            bar[f"ask_{field}"] = bar[field] + 0.24
+        bar["executable_tick_count"] = 100 + index
+        bars.append(bar)
+    return bars
 
 
 def test_dataset_manifest_matches_export_hash(tmp_path) -> None:
@@ -43,12 +48,15 @@ def test_dataset_manifest_matches_export_hash(tmp_path) -> None:
         bars,
         utc_offset_override_hours=3,
         validation=validation,
+        chart_mode="BID",
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["row_count"] == 3
     assert manifest["utc_offset_override_hours"] == 3
     assert manifest["contains_incomplete_bar"] is False
+    assert manifest["chart_mode"] == "BID"
+    assert manifest["executable_side_source"] == "HISTORICAL_BID_ASK_TICKS"
     assert isinstance(manifest["git_dirty"], bool)
     assert manifest["sha256"] == hashlib.sha256(dataset.read_bytes()).hexdigest()
     with dataset.open(newline="", encoding="utf-8") as handle:
