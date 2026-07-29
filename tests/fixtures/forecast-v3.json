@@ -1,7 +1,7 @@
 {
   "prediction_id": "9b3f7f0e-2d28-4a60-a188-d7f45cc13b2e",
   "model_id": "python-golden-v3",
-  "feature_version": "goldm-m5-v3",
+  "feature_version": "goldm-m5-v4",
   "origin_bar_timestamp": "2026-07-29T10:00:00Z",
   "origin_close": 3330.5,
   "origin_bar_index": 5951064,
@@ -9,7 +9,7 @@
   "direction_probability_up": 0.67,
   "barrier_probability_long": 0.63,
   "barrier_probability_short": 0.37,
-  "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v2",
+  "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v3",
   "barrier_horizon_bars": 3,
   "target_price_long": 3333.0,
   "stop_price_long": 3328.5,

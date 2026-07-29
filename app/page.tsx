@@ -39,6 +39,7 @@ interface ForecastPoint {
 }
 
 interface Proposal {
+  proposal_id?: string | null;
   prediction_id: string;
   profile: Profile;
   broker_policy_id: string;
@@ -46,21 +47,30 @@ interface Proposal {
   account_currency: string;
   quote_currency: string;
   pnl_currency: string;
+  pnl_calculation_source?: string;
+  conversion_rate?: number | null;
   action: DecisionAction;
   generated_at: string;
   decision_valid_until: string;
   outcome_matures_at: string;
-  median_move_after_cost_usd: number;
+  median_move_after_cost_account: number;
   reference_lot: number;
   reference_entry_price: number | null;
-  remaining_reward_usd: number;
-  remaining_risk_usd: number;
+  remaining_reward_account: number;
+  remaining_risk_account: number;
   reward_risk_ratio: number;
   entry_deviation_from_origin: number;
   entry_spread: number;
   expected_exit_spread: number;
+  exit_spread_sample_size?: number;
+  exit_spread_quantile?: number;
+  exit_spread_window?: number;
   slippage_assumption: number;
   commission: number;
+  decision_age_seconds?: number;
+  remaining_horizon_seconds?: number;
+  maximum_decision_age_seconds?: number;
+  model_health_status?: string;
   invalidation_price: number | null;
   target_price: number | null;
   reason_codes: string[];
@@ -100,6 +110,8 @@ interface DashboardState {
       chart_mode: "BID" | "LAST" | "UNKNOWN";
       quote_currency: string;
       pnl_currency: string;
+      pnl_calculation_source?: string;
+      conversion_rate?: number | null;
     };
     data_quality: {
       completeness: number;
@@ -159,6 +171,14 @@ interface DashboardState {
     barrier_ece: number | null;
     mae_q90_coverage: number | null;
     reason_codes: string[];
+    checks?: {
+      code: string;
+      observed: number | null;
+      threshold: string;
+      passed: boolean;
+    }[];
+    consecutive_failures?: number;
+    consecutive_successes?: number;
   };
   safety: {
     auto_trading_enabled: boolean;
@@ -312,7 +332,7 @@ function buildDemoState(): DashboardState {
     forecast: {
       prediction_id: predictionId,
       model_id: "baseline-demo-v1",
-      feature_version: "goldm-m5-v3",
+      feature_version: "goldm-m5-v4",
       origin_bar_timestamp: bars[bars.length - 1].timestamp,
       origin_close: bars[bars.length - 1].close,
       origin_bar_index: Math.floor(
@@ -322,7 +342,7 @@ function buildDemoState(): DashboardState {
       direction_probability_up: 0.57,
       barrier_probability_long: 0.54,
       barrier_probability_short: 0.46,
-      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v2",
+      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v3",
       barrier_horizon_bars: 3,
       target_price_long: bars[bars.length - 1].close + 1.25,
       stop_price_long: bars[bars.length - 1].close - 1,
@@ -359,11 +379,11 @@ function buildDemoState(): DashboardState {
         generated_at: now,
         decision_valid_until: decisionValidUntil,
         outcome_matures_at: outcomeMaturesAt,
-        median_move_after_cost_usd: -0.01,
+        median_move_after_cost_account: -0.01,
         reference_lot: 0.1,
         reference_entry_price: 3333.08,
-        remaining_reward_usd: 0.06,
-        remaining_risk_usd: 0.17,
+        remaining_reward_account: 0.06,
+        remaining_risk_account: 0.17,
         reward_risk_ratio: 0.35,
         entry_deviation_from_origin: 0.17,
         entry_spread: 0.34,
@@ -387,11 +407,11 @@ function buildDemoState(): DashboardState {
         generated_at: now,
         decision_valid_until: decisionValidUntil,
         outcome_matures_at: outcomeMaturesAt,
-        median_move_after_cost_usd: -0.01,
+        median_move_after_cost_account: -0.01,
         reference_lot: 0.1,
         reference_entry_price: 3333.08,
-        remaining_reward_usd: 0.06,
-        remaining_risk_usd: 0.17,
+        remaining_reward_account: 0.06,
+        remaining_risk_account: 0.17,
         reward_risk_ratio: 0.35,
         entry_deviation_from_origin: 0.17,
         entry_spread: 0.34,
@@ -481,6 +501,15 @@ function reasonLabel(reason: string) {
     MODEL_LIVE_HEALTH_WARMING_UP: "Evidence live belum mencapai sampel minimum",
     MODEL_LIVE_HEALTH_DEGRADED: "Kesehatan model live menurun; proposal dihentikan",
     MODEL_LIVE_HEALTH_SUSPENDED: "Model disuspensi oleh gate evidence live",
+    LIVE_INTERVAL_COVERAGE_OUTSIDE_GATE: "Coverage interval live",
+    LIVE_DIRECTION_BRIER_OUTSIDE_GATE: "Direction Brier vs baseline",
+    LIVE_BARRIER_BRIER_OUTSIDE_GATE: "Barrier Brier vs baseline",
+    LIVE_BARRIER_ECE_OUTSIDE_GATE: "Barrier calibration ECE",
+    LIVE_MAE_COVERAGE_OUTSIDE_GATE: "MAE q90 coverage",
+    CURRENCY_CONVERSION_UNAVAILABLE: "Konversi PnL ke mata uang account tidak tersedia",
+    EXIT_SPREAD_ESTIMATE_UNAVAILABLE: "Sampel estimasi spread exit belum mencukupi",
+    ENTRY_WINDOW_EXPIRED: "Jendela entry forecast sudah berakhir",
+    BROKER_STOPS_LEVEL_VIOLATION: "Target atau stop melanggar minimum stops broker",
   };
   return labels[reason] ?? reason.replaceAll("_", " ").toLowerCase();
 }
@@ -491,6 +520,7 @@ export default function Home() {
   const [coreApiConnected, setCoreApiConnected] = useState(false);
   const [transport, setTransport] = useState<"connected" | "reconnecting">("reconnecting");
   const [feedbackStatus, setFeedbackStatus] = useState("");
+  const [feedbackReason, setFeedbackReason] = useState("trend conflict");
   const [riskPercent, setRiskPercent] = useState(1);
   const [evaluation, setEvaluation] = useState<EvaluationSummary | null>(null);
   const [retrying, setRetrying] = useState(false);
@@ -686,7 +716,7 @@ export default function Home() {
     if (
       proposal.reference_entry_price === null ||
       proposal.invalidation_price === null ||
-      proposal.remaining_reward_usd <= 0 ||
+      proposal.remaining_reward_account <= 0 ||
       proposal.reward_risk_ratio <= 0
     ) {
       return { lot: null, reason: "Entry atau barrier proposal tidak valid." };
@@ -734,20 +764,27 @@ export default function Home() {
       setFeedbackStatus("Feedback hanya aktif untuk forecast live yang current.");
       return;
     }
+    if (!proposal.proposal_id) {
+      setFeedbackStatus("Instance proposal belum tersedia; tunggu state realtime berikutnya.");
+      return;
+    }
     setFeedbackStatus("Menyimpan…");
     try {
       const response = await fetch(`${API_BASE}/api/v1/feedback`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          proposal_id: proposal.proposal_id,
           prediction_id: state.forecast.prediction_id,
           profile,
           proposal_action: proposal.action,
           model_id: state.forecast.model_id,
           forecast_side: forecastSide,
-          selected_reason: proposal.reason_codes[0] ?? null,
+          selected_reason: verdict === "REJECTED" ? feedbackReason : null,
           verdict,
-          reason_codes: verdict === "REJECTED" ? ["MANUAL_REVIEW_REJECTED"] : [],
+          reason_codes: verdict === "REJECTED"
+            ? ["MANUAL_REVIEW_REJECTED", feedbackReason.toUpperCase().replaceAll(/[^A-Z0-9]+/g, "_")]
+            : [],
           note: null,
           created_at: new Date().toISOString(),
         }),
@@ -810,13 +847,13 @@ export default function Home() {
       <strong className="decision-action">{proposal.action.replace("_", " ")}</strong>
       <p>{proposal.reason_codes.length ? reasonLabel(proposal.reason_codes[0]) : "Semua gate profil terpenuhi."}</p>
       <div className="decision-numbers">
-        <div><span>Median move setelah biaya · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.median_move_after_cost_usd, 2, proposal.pnl_currency || state.snapshot.account.currency)}</strong></div>
+        <div><span>Median move setelah biaya · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.median_move_after_cost_account, 2, proposal.account_currency || state.snapshot.account.currency)}</strong></div>
         <div>
           <span>Entry / reward / risk</span>
           <strong>
             {proposal.reference_entry_price === null
               ? "—"
-              : `${proposal.reference_entry_price.toFixed(2)} · ${money(proposal.remaining_reward_usd, 2, proposal.pnl_currency || state.snapshot.account.currency)} / ${money(proposal.remaining_risk_usd, 2, proposal.pnl_currency || state.snapshot.account.currency)}`}
+              : `${proposal.reference_entry_price.toFixed(2)} · ${money(proposal.remaining_reward_account, 2, proposal.account_currency || state.snapshot.account.currency)} / ${money(proposal.remaining_risk_account, 2, proposal.account_currency || state.snapshot.account.currency)}`}
           </strong>
         </div>
         <div><span>Reward / risk tersisa</span><strong>{proposal.reward_risk_ratio.toFixed(2)}×</strong></div>
@@ -838,6 +875,22 @@ export default function Home() {
             spread {proposal.entry_spread.toFixed(2)} → {proposal.expected_exit_spread.toFixed(2)}
             {" · "}slip {proposal.slippage_assumption.toFixed(2)}
           </strong>
+        </div>
+        <div>
+          <span>Exit spread evidence</span>
+          <strong>
+            q{Math.round((proposal.exit_spread_quantile ?? 0) * 100)}
+            {" · "}n={proposal.exit_spread_sample_size ?? 0}
+            {" · "}window {proposal.exit_spread_window ?? 0} bar
+          </strong>
+        </div>
+        <div>
+          <span>PnL source</span>
+          <strong>{proposal.pnl_calculation_source || "UNAVAILABLE"} · {proposal.account_currency}</strong>
+        </div>
+        <div>
+          <span>Entry age / limit</span>
+          <strong>{proposal.decision_age_seconds ?? 0}s / {proposal.maximum_decision_age_seconds ?? 0}s</strong>
         </div>
       </div>
       <ul className="reason-list">
@@ -940,6 +993,12 @@ export default function Home() {
                   <span>Tidak boleh digunakan untuk keputusan entry.</span>
                 </div>
               ) : null}
+              {state.model_health.status === "SUSPENDED" ? (
+                <div className="stale-forecast-overlay" role="alert">
+                  <strong>MODEL SUSPENDED</strong>
+                  <span>Forecast hanya untuk diagnostik; proposal entry dihentikan.</span>
+                </div>
+              ) : null}
               <div className="price-axis">
                 <span>{maxPrice.toFixed(2)}</span>
                 <span>{((maxPrice + minPrice) / 2).toFixed(2)}</span>
@@ -968,7 +1027,7 @@ export default function Home() {
                 })}
               </div>
               <div className="forecast-zone">
-                <span className="forecast-label">FORECAST</span>
+                <span className="forecast-label">BID-PRICE FORECAST</span>
                 <div
                   className="barrier-reference target"
                   style={{ top: `${((maxPrice - barrierTarget) / range) * 100}%` }}
@@ -1016,6 +1075,7 @@ export default function Home() {
               <span><i className="legend-band" /> 80% interval</span>
               <span><i className="legend-inner-band" /> 50% interval</span>
               <span><i className="legend-median" /> Median forecast</span>
+              <span>Envelope: Bid · LONG entry: Ask · SHORT entry: Bid</span>
               <span><i className="legend-live" /> Live M5</span>
             </div>
           </div>
@@ -1157,6 +1217,15 @@ export default function Home() {
               </span>
               <strong>{state.model_health.status.replaceAll("_", " ")}</strong>
             </div>
+            {state.model_health.checks?.map((check) => (
+              <div className="gate-row health-detail" key={check.code}>
+                <span><i className={check.passed ? "ok" : "bad"} /> {reasonLabel(check.code)}</span>
+                <strong>
+                  {check.observed === null ? "—" : check.observed.toFixed(4)}
+                  {" / "}{check.threshold}
+                </strong>
+              </div>
+            ))}
             <div className="gate-row"><span><i className={state.snapshot.symbol_spec.chart_mode === "BID" ? "ok" : "bad"} /> Executable bars</span><strong>{state.snapshot.symbol_spec.chart_mode} · Bid/Ask</strong></div>
             <div className="gate-row"><span><i className={state.snapshot.data_quality.absolute_tick_age_ms <= 10_000 ? "ok" : "bad"} /> Absolute tick age</span><strong>{state.snapshot.data_quality.absolute_tick_age_ms} ms</strong></div>
             <div className="gate-row"><span><i className="warn" /> Data source</span><strong>{state.safety.feed_is_demo ? "Demo" : "MT5 live"}</strong></div>
@@ -1165,10 +1234,27 @@ export default function Home() {
           <section className="panel feedback-panel">
             <span className="eyebrow">Human verification</span>
             <h2>Apakah proposal ini layak?</h2>
+            <label className="feedback-reason">
+              <span>Alasan jika Reject</span>
+              <select
+                aria-label="Alasan penolakan proposal"
+                onChange={(event) => setFeedbackReason(event.target.value)}
+                value={feedbackReason}
+              >
+                <option value="trend conflict">Trend conflict</option>
+                <option value="news risk">News risk</option>
+                <option value="support/resistance">Support/resistance</option>
+                <option value="entry already late">Entry already late</option>
+                <option value="spread abnormal">Spread abnormal</option>
+                <option value="risk too large">Risk too large</option>
+                <option value="chart/data suspicious">Chart/data suspicious</option>
+                <option value="other">Other</option>
+              </select>
+            </label>
             <div className="feedback-actions">
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT"} type="button" onClick={() => submitFeedback("ACCEPTED")}>Accept</button>
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT"} type="button" onClick={() => submitFeedback("UNCERTAIN")}>Unsure</button>
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT"} type="button" onClick={() => submitFeedback("REJECTED")}>Reject</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("ACCEPTED")}>Accept</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("UNCERTAIN")}>Unsure</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("REJECTED")}>Reject</button>
             </div>
             <small>{feedbackStatus || "Feedback tidak mengubah label harga objektif."}</small>
           </section>

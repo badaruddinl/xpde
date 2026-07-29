@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 
@@ -100,3 +101,30 @@ def test_barrier_contract_and_quantile_postprocessing_are_explicit() -> None:
     }
     processed = postprocess_quantiles([[0.1, -0.2, 0.0, 0.3, 0.2]])
     assert processed.tolist() == [[0.1, 0.1, 0.1, 0.3, 0.3]]
+
+
+def test_tick_sequence_resolves_same_bar_first_touch() -> None:
+    import pandas as pd
+
+    rows = [
+        {"close": 100.0, "high": 100.1, "low": 99.9, "atr_24": 1.0},
+        {"close": 100.0, "high": 101.5, "low": 98.8, "atr_24": 1.0},
+        {"close": 100.0, "high": 100.2, "low": 99.8, "atr_24": 1.0},
+        {"close": 100.0, "high": 100.2, "low": 99.8, "atr_24": 1.0},
+    ]
+    for index, row in enumerate(rows):
+        for field in ("open", "high", "low", "close"):
+            value = row.get(field, row["close"])
+            row[f"bid_{field}"] = value
+            row[f"ask_{field}"] = value + 0.24
+        row["chart_mode"] = "BID"
+        row["executable_tick_path_json"] = json.dumps(
+            [
+                [1_000 + index * 300_000, 100.0, 100.24],
+                [2_000 + index * 300_000, 101.3, 101.54],
+                [3_000 + index * 300_000, 98.8, 99.04],
+            ]
+        )
+    labelled = add_objective_labels(pd.DataFrame(rows))
+    assert labelled.loc[0, "barrier_long_outcome"] == "TP_FIRST"
+    assert labelled.loc[0, "barrier_long_first_touch_time_msc"] == 302_000

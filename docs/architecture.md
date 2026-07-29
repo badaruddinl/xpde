@@ -92,6 +92,9 @@ Barrier training and live evaluation use the same explicit three-bar horizon.
 For a Bid chart, LONG enters Ask and exits against future Bid OHLC; SHORT enters
 Bid and exits against future Ask OHLC constructed from historical ticks.
 One-sided OHLC or a spread approximation is not accepted for candidate training.
+The dataset gate also requires chart-Bid/tick-Bid parity within tick-size
+tolerance and sufficient tick coverage. A compact ordered tick path resolves
+same-bar first passage whenever the raw history is available.
 LONG and SHORT retain `TP_FIRST`, `SL_FIRST`,
 `NO_HIT_BEFORE_EXPIRY`, and `AMBIGUOUS_SAME_BAR`. A disagreement between q50,
 the direction classifier, and the stronger barrier side yields
@@ -119,10 +122,35 @@ The versioned cost model does not subtract the current spread twice:
 - SHORT median move = current Bid − (future median Bid + expected exit spread)
   − slippage − commission.
 
-Expected exit spread is the rolling median of recent exact Bid/Ask closes, with
-the broker profile value used only when no valid executable bars exist.
-Proposal records include account, quote and P&L currency plus every cost
-assumption used by the decision.
+Expected exit spread uses a configured conservative quantile over at least 12
+recent exact Bid/Ask closes. Insufficient samples force `WAIT`.
+`order_calc_profit()` supplies account-currency profit-per-price-unit factors;
+non-matching account/P&L currencies force
+`CURRENCY_CONVERSION_UNAVAILABLE` when that authoritative conversion is absent.
+Proposal records include account, quote and P&L currency, conversion metadata
+and every cost assumption used by the decision.
+
+## Dynamic proposal evidence
+
+`predictions` owns the immutable forecast. Every material decision change is
+stored separately in `decision_proposal_instances` with an exact `proposal_id`,
+quote timestamp, entry, action, target, stop, cost assumptions and model-health
+state. Human feedback refers to this ID. Policy evidence evaluates the first
+actionable instance per profile (or another instance explicitly accepted by the
+human) over the next three fully completed M5 bars.
+
+Decision age is bounded independently of forecast expiry. Warming, degraded or
+suspended model health forces `WAIT`; health transitions use persisted
+multi-window hysteresis and are recorded as events.
+
+## Market and executable storage
+
+The broker weekly calendar is configuration-driven and combined with holiday
+overrides, symbol trade mode, absolute tick age and transport freshness. Exact
+bar upserts only replace stored Bid/Ask OHLC when the incoming tick count is at
+least as complete; first and last tick timestamps make that comparison auditable.
+Legacy predictions without executable origin sides or the current barrier
+contract are quarantined as `LEGACY_UNSETTLEABLE`.
 
 ## Reproducible training boundary
 

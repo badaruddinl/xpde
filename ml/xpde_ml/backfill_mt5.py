@@ -24,7 +24,7 @@ def validate_export_bars(
     bars: list[dict[str, Any]],
     *,
     now_utc: datetime | None = None,
-) -> dict[str, int]:
+) -> dict[str, int | float]:
     if not bars:
         raise ValueError("dataset export contains no completed bars")
     timestamps = [
@@ -37,6 +37,11 @@ def validate_export_bars(
         raise ValueError("dataset contains duplicate timestamps")
     if any(int(timestamp.timestamp()) % 300 != 0 for timestamp in timestamps):
         raise ValueError("dataset contains a non-aligned M5 timestamp")
+    parity_errors: dict[str, list[float]] = {
+        field: [] for field in ("open", "high", "low", "close")
+    }
+    tick_coverages: list[float] = []
+    parity_mismatches = 0
     for bar in bars:
         if (
             float(bar["high"]) < max(float(bar["open"]), float(bar["close"]))
@@ -64,6 +69,35 @@ def validate_export_bars(
             raise ValueError("dataset executable Ask OHLC is not above Bid")
         if int(bar.get("executable_tick_count", 0)) <= 0:
             raise ValueError("dataset executable-side candle has no source ticks")
+        if int(bar.get("first_tick_msc", 0)) <= 0 or int(
+            bar.get("last_tick_msc", 0)
+        ) < int(bar.get("first_tick_msc", 0)):
+            raise ValueError("dataset executable-side candle has invalid tick boundaries")
+        bar_start_msc = int(
+            datetime.fromisoformat(
+                str(bar["timestamp"]).replace("Z", "+00:00")
+            ).timestamp()
+            * 1000
+        )
+        if not (
+            bar_start_msc <= int(bar["first_tick_msc"]) < bar_start_msc + 300_000
+            and bar_start_msc <= int(bar["last_tick_msc"]) < bar_start_msc + 300_000
+        ):
+            raise ValueError("dataset tick boundaries are outside their normalized M5 bar")
+        tolerance = max(float(bar.get("tick_size", 0.0)), 1e-12)
+        row_mismatch = False
+        for field in parity_errors:
+            error = abs(float(bar[field]) - float(bar[f"bid_{field}"]))
+            parity_errors[field].append(error)
+            row_mismatch = row_mismatch or error > tolerance
+        parity_mismatches += int(row_mismatch)
+        tick_volume = max(float(bar.get("tick_volume", 0.0)), 1.0)
+        tick_coverages.append(
+            min(1.0, int(bar["executable_tick_count"]) / tick_volume)
+        )
+        exact_spread = float(bar["ask_close"]) - float(bar["bid_close"])
+        if abs(float(bar.get("spread_usd", exact_spread)) - exact_spread) > 1e-12:
+            raise ValueError("dataset spread feature is not the exact executable close spread")
 
     reference = now_utc or datetime.now(UTC)
     latest_completed_start = int(reference.timestamp() // 300) * 300 - 300
@@ -77,6 +111,20 @@ def validate_export_bars(
     return {
         "gap_count": len(gaps),
         "max_gap_minutes": max(gaps, default=0),
+        "bid_chart_open_error_max": max(parity_errors["open"], default=0.0),
+        "bid_chart_high_error_max": max(parity_errors["high"], default=0.0),
+        "bid_chart_low_error_max": max(parity_errors["low"], default=0.0),
+        "bid_chart_close_error_max": max(parity_errors["close"], default=0.0),
+        "maximum_parity_error": max(
+            (value for values in parity_errors.values() for value in values),
+            default=0.0,
+        ),
+        "parity_mismatch_rate": parity_mismatches / len(bars),
+        "minimum_tick_coverage_per_bar": min(tick_coverages, default=0.0),
+        "mean_tick_coverage_per_bar": sum(tick_coverages) / len(tick_coverages),
+        "bars_without_full_tick_history": sum(
+            coverage < 0.5 for coverage in tick_coverages
+        ),
     }
 
 
@@ -105,13 +153,13 @@ def write_dataset_manifest(
     bars: list[dict[str, Any]],
     *,
     utc_offset_override_hours: int,
-    validation: dict[str, int],
+    validation: dict[str, int | float],
     chart_mode: str,
 ) -> Path:
     digest = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
     manifest_path = dataset_path.with_suffix(".manifest.json")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "symbol": SYMBOL,
         "timeframe": TIMEFRAME,
         "provider": "MetaTrader5",
@@ -127,6 +175,11 @@ def write_dataset_manifest(
         "utc_offset_override_hours": utc_offset_override_hours,
         "gap_count": validation["gap_count"],
         "max_gap_minutes": validation["max_gap_minutes"],
+        "executable_integrity": {
+            key: value
+            for key, value in validation.items()
+            if key not in {"gap_count", "max_gap_minutes"}
+        },
         "contains_incomplete_bar": False,
     }
     manifest_path.write_text(
@@ -157,6 +210,7 @@ def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int, str]:
             "close": float(rate["close"]),
             "tick_volume": float(rate["tick_volume"]),
             "spread_usd": float(rate["spread"]) * point,
+            "tick_size": float(symbol.trade_tick_size),
             "chart_mode": chart_mode,
         }
         for rate in rates
@@ -173,11 +227,15 @@ def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int, str]:
         end_epoch=raw_end,
         clock=clock,
     )
-    return (
-        overlay_executable_bars(bars, executable),
-        clock.offset_hours,
-        chart_mode,
+    overlaid = overlay_executable_bars(
+        bars,
+        executable,
+        include_tick_path=True,
     )
+    for bar in overlaid:
+        if "ask_close" in bar and "bid_close" in bar:
+            bar["spread_usd"] = float(bar["ask_close"]) - float(bar["bid_close"])
+    return (overlaid, clock.offset_hours, chart_mode)
 
 
 def write_csv(path: Path, bars: list[dict[str, Any]]) -> None:
@@ -206,7 +264,17 @@ def post_chunks(
             "broker_offset_hours": broker_offset_hours,
             "reset": reset and start == 0,
             "bars": [
-                {key: value for key, value in bar.items() if key != "spread_usd"}
+                {
+                    key: value
+                    for key, value in bar.items()
+                    if key
+                    not in {
+                        "spread_usd",
+                        "tick_size",
+                        "chart_mode",
+                        "executable_tick_path_json",
+                    }
+                }
                 for bar in chunk
             ],
         }

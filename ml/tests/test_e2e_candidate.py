@@ -81,6 +81,11 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
                 "git_commit": "synthetic-e2e",
                 "chart_mode": "BID",
                 "executable_side_source": "HISTORICAL_BID_ASK_TICKS",
+                "executable_integrity": {
+                    "parity_mismatch_rate": 0.0,
+                    "bars_without_full_tick_history": 0,
+                    "minimum_tick_coverage_per_bar": 1.0,
+                },
             }
         ),
         encoding="utf-8",
@@ -115,6 +120,8 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
                 "low": row.low,
                 "close": row.close,
                 "tick_volume": row.tick_volume,
+                "bid_close": row.bid_close,
+                "ask_close": row.ask_close,
             }
             for row in latest.itertuples(index=False)
         ],

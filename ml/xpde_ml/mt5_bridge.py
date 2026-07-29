@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from functools import lru_cache
 import json
 import os
 import sys
@@ -10,6 +12,7 @@ import urllib.request
 from datetime import UTC, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any
+import tomllib
 
 from .baseline import forecast_from_snapshot
 from .executable_bars import (
@@ -26,21 +29,86 @@ TIMEFRAME = "M5"
 MAX_TICK_AGE_MS = 10_000
 
 
+@dataclass(frozen=True)
+class MarketCalendar:
+    sessions: dict[int, tuple[tuple[datetime_time, datetime_time], ...]]
+    closed_dates: frozenset[str]
+
+
+def _parse_market_time(value: str) -> datetime_time:
+    hour, minute = (int(part) for part in value.split(":", 1))
+    return datetime_time(hour, minute)
+
+
+@lru_cache(maxsize=4)
+def load_market_calendar(config_path: str) -> MarketCalendar:
+    names = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    default_sessions = {
+        day: ((datetime_time(1, 0), datetime_time(23, 59, 59)),)
+        for day in range(5)
+    }
+    try:
+        config = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
+        raw = config.get("market_session", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        raw = {}
+    sessions: dict[int, tuple[tuple[datetime_time, datetime_time], ...]] = {}
+    for name, day in names.items():
+        configured = raw.get(name)
+        if configured is None:
+            if day in default_sessions:
+                sessions[day] = default_sessions[day]
+            continue
+        sessions[day] = tuple(
+            (_parse_market_time(start), _parse_market_time(end))
+            for start, end in configured
+        )
+    configured_closed = {str(value) for value in raw.get("closed_dates", [])}
+    environment_closed = {
+        value.strip()
+        for value in os.getenv("XPDE_MARKET_CLOSED_DATES", "").split(",")
+        if value.strip()
+    }
+    return MarketCalendar(
+        sessions=sessions,
+        closed_dates=frozenset(configured_closed | environment_closed),
+    )
+
+
 def infer_market_status(
     *,
     now_utc: datetime,
     absolute_tick_age_ms: int,
     terminal_connected: bool,
     market_utc_offset_hours: int = 0,
+    calendar: MarketCalendar | None = None,
+    trade_mode_enabled: bool = True,
 ) -> str:
     if not terminal_connected:
         return "BRIDGE_DISCONNECTED"
+    if not trade_mode_enabled:
+        return "MARKET_CLOSED"
     market_time = now_utc + timedelta(hours=market_utc_offset_hours)
-    within_week = market_time.weekday() < 5
-    within_quote_hours = datetime_time(1, 0) <= market_time.time() <= datetime_time(
-        23, 59, 59
+    calendar = calendar or MarketCalendar(
+        sessions={
+            day: ((datetime_time(1, 0), datetime_time(23, 59, 59)),)
+            for day in range(5)
+        },
+        closed_dates=frozenset(),
     )
-    if not within_week or not within_quote_hours:
+    if market_time.date().isoformat() in calendar.closed_dates:
+        return "MARKET_CLOSED"
+    sessions = calendar.sessions.get(market_time.weekday(), ())
+    within_session = any(start <= market_time.time() <= end for start, end in sessions)
+    if not within_session:
         return "MARKET_CLOSED"
     if absolute_tick_age_ms > MAX_TICK_AGE_MS:
         return "FEED_STALE"
@@ -129,6 +197,42 @@ def build_snapshot(
             margin_buy = None
             margin_sell = None
 
+    trade_mode_enabled = int(getattr(symbol, "trade_mode", -1)) != int(
+        getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
+    )
+    profit_buy = None
+    profit_sell = None
+    pnl_source = "UNAVAILABLE"
+    order_calc_profit = getattr(mt5, "order_calc_profit", None)
+    profit_distance = max(
+        float(getattr(symbol, "trade_tick_size", 0.0)),
+        float(getattr(symbol, "point", 0.0)),
+    )
+    if callable(order_calc_profit) and profit_distance > 0.0:
+        try:
+            buy_value = order_calc_profit(
+                mt5.ORDER_TYPE_BUY,
+                SYMBOL,
+                1.0,
+                float(tick.ask),
+                float(tick.ask) + profit_distance,
+            )
+            sell_value = order_calc_profit(
+                mt5.ORDER_TYPE_SELL,
+                SYMBOL,
+                1.0,
+                float(tick.bid),
+                float(tick.bid) - profit_distance,
+            )
+            if buy_value is not None and sell_value is not None:
+                profit_buy = abs(float(buy_value)) / profit_distance
+                profit_sell = abs(float(sell_value)) / profit_distance
+                if profit_buy > 0.0 and profit_sell > 0.0:
+                    pnl_source = "MT5_ORDER_CALC_PROFIT"
+        except Exception:
+            profit_buy = None
+            profit_sell = None
+
     tick_time_ms = int(getattr(tick, "time_msc", int(tick.time * 1000)))
     clock = broker_clock or BrokerClock()
     reference_now = now_utc or datetime.now(UTC)
@@ -147,6 +251,10 @@ def build_snapshot(
             "MT5_MARKET_UTC_OFFSET_HOURS",
             clock.offset_hours,
         ),
+        calendar=load_market_calendar(
+            os.getenv("XPDE_CONFIG_PATH", "config/default.toml")
+        ),
+        trade_mode_enabled=trade_mode_enabled,
     )
     chart_mode = symbol_chart_mode(mt5, symbol)
     missing_flags: list[str] = []
@@ -160,6 +268,8 @@ def build_snapshot(
         missing_flags.append("CHART_MODE_UNSUPPORTED_FOR_MODEL")
     if signed_tick_age_ms < -MAX_TICK_AGE_MS:
         missing_flags.append("TICK_TIMESTAMP_IN_FUTURE")
+    if not trade_mode_enabled:
+        missing_flags.append("BROKER_TRADE_MODE_DISABLED")
 
     bars = [
         {
@@ -233,7 +343,17 @@ def build_snapshot(
             "digits": int(symbol.digits),
             "chart_mode": chart_mode,
             "quote_currency": str(getattr(symbol, "currency_profit", "") or "USD"),
-            "pnl_currency": str(account.currency),
+            "pnl_currency": str(getattr(symbol, "currency_profit", "") or "USD"),
+            "profit_per_price_unit_per_lot_buy": profit_buy,
+            "profit_per_price_unit_per_lot_sell": profit_sell,
+            "pnl_calculation_source": pnl_source,
+            "conversion_rate": (
+                profit_buy / float(symbol.trade_contract_size)
+                if profit_buy is not None and float(symbol.trade_contract_size) > 0
+                else None
+            ),
+            "conversion_timestamp": tick_timestamp.isoformat(),
+            "trade_mode_enabled": trade_mode_enabled,
             "margin_per_lot_buy": (
                 float(margin_buy)
                 if margin_buy is not None and float(margin_buy) > 0
@@ -422,7 +542,9 @@ def main() -> None:
         broker_clock = BrokerClock(
             environment_integer("MT5_UTC_OFFSET_OVERRIDE_HOURS")
         )
-        executable_tracker = ExecutableBarTracker(retention_bars=24)
+        # Keep more than the 24-bar spread feature window so startup and
+        # maintenance gaps cannot leave the latest inference row underfilled.
+        executable_tracker = ExecutableBarTracker(retention_bars=64)
         candidate = None
         if args.model_dir:
             from .model_inference import (

@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS symbol_specs (
     chart_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
     quote_currency TEXT NOT NULL DEFAULT '',
     pnl_currency TEXT NOT NULL DEFAULT '',
+    profit_per_price_unit_per_lot_buy REAL,
+    profit_per_price_unit_per_lot_sell REAL,
+    pnl_calculation_source TEXT NOT NULL DEFAULT '',
+    conversion_rate REAL,
+    conversion_timestamp TEXT,
+    trade_mode_enabled INTEGER NOT NULL DEFAULT 0,
     captured_at TEXT NOT NULL
 );
 
@@ -48,6 +54,8 @@ CREATE TABLE IF NOT EXISTS market_bars (
     ask_low REAL,
     ask_close REAL,
     executable_tick_count INTEGER NOT NULL DEFAULT 0,
+    first_tick_msc INTEGER,
+    last_tick_msc INTEGER,
     PRIMARY KEY(symbol, timeframe, timestamp)
 );
 
@@ -60,6 +68,49 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     missing_flags_json TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_proposal_instances (
+    proposal_id TEXT PRIMARY KEY,
+    prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+    profile TEXT NOT NULL CHECK(profile IN ('SCALPER', 'SNIPER')),
+    evaluated_at TEXT NOT NULL,
+    quote_timestamp TEXT NOT NULL,
+    proposal_fingerprint TEXT NOT NULL,
+    reference_entry_price REAL,
+    action TEXT NOT NULL CHECK(action IN ('LONG', 'SHORT', 'WAIT', 'NO_PREDICTION')),
+    target_price REAL,
+    stop_price REAL,
+    remaining_reward_account REAL NOT NULL,
+    remaining_risk_account REAL NOT NULL,
+    account_currency TEXT NOT NULL,
+    cost_model_id TEXT NOT NULL,
+    entry_spread REAL NOT NULL,
+    expected_exit_spread REAL NOT NULL,
+    reason_codes_json TEXT NOT NULL,
+    model_health_status TEXT NOT NULL,
+    proposal_json TEXT NOT NULL,
+    evidence_eligible INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_proposal_outcomes (
+    proposal_id TEXT PRIMARY KEY REFERENCES decision_proposal_instances(proposal_id),
+    prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+    profile TEXT NOT NULL,
+    horizon_bars INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    target_price REAL NOT NULL,
+    stop_price REAL NOT NULL,
+    barrier_outcome TEXT NOT NULL CHECK(
+        barrier_outcome IN (
+            'TP_FIRST',
+            'SL_FIRST',
+            'NO_HIT_BEFORE_EXPIRY',
+            'AMBIGUOUS_SAME_BAR'
+        )
+    ),
+    settled_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS model_registry (
@@ -101,6 +152,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     forecast_json TEXT NOT NULL,
     proposal_json TEXT NOT NULL,
     is_duplicate INTEGER NOT NULL DEFAULT 0,
+    settlement_status TEXT NOT NULL DEFAULT 'PENDING',
     created_at TEXT NOT NULL
 );
 
@@ -176,6 +228,7 @@ CREATE TABLE IF NOT EXISTS prediction_outcomes (
 
 CREATE TABLE IF NOT EXISTS human_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id TEXT REFERENCES decision_proposal_instances(proposal_id),
     prediction_id TEXT NOT NULL,
     profile TEXT,
     proposal_action TEXT,
@@ -185,6 +238,27 @@ CREATE TABLE IF NOT EXISTS human_feedback (
     verdict TEXT NOT NULL,
     reason_codes_json TEXT NOT NULL,
     note TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_health_state (
+    model_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    consecutive_severe_failures INTEGER NOT NULL DEFAULT 0,
+    consecutive_successes INTEGER NOT NULL DEFAULT 0,
+    evidence_fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_health_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL,
+    previous_status TEXT NOT NULL,
+    current_status TEXT NOT NULL,
+    evidence_fingerprint TEXT NOT NULL,
+    reason_codes_json TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 
@@ -227,3 +301,9 @@ CREATE INDEX IF NOT EXISTS idx_prediction_proposal_outcomes_time
     ON prediction_proposal_outcomes(settled_at DESC, profile, horizon_bars);
 CREATE INDEX IF NOT EXISTS idx_feedback_prediction
     ON human_feedback(prediction_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_proposal_instances_prediction
+    ON decision_proposal_instances(prediction_id, profile, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_proposal_instances_evidence
+    ON decision_proposal_instances(evidence_eligible, evaluated_at);
+CREATE INDEX IF NOT EXISTS idx_decision_proposal_outcomes_time
+    ON decision_proposal_outcomes(settled_at DESC, profile, horizon_bars);

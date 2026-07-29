@@ -28,10 +28,26 @@ minimum_settled_predictions = 100
 minimum_interval_coverage = 0.70
 maximum_interval_coverage = 0.90
 maximum_direction_brier = 0.26
-maximum_barrier_brier_ratio_to_baseline = 1.05
+maximum_direction_brier_ratio_to_baseline = 1.00
+maximum_barrier_brier_ratio_to_baseline = 1.00
 maximum_barrier_ece = 0.12
 minimum_mae_q90_coverage = 0.80
 maximum_mae_q90_coverage = 0.98
+degrade_after_failed_windows = 2
+suspend_after_severe_windows = 2
+recover_after_healthy_windows = 3
+warming_up_forces_wait = true
+
+[market_session]
+timezone = "broker"
+monday = [["01:00", "23:59"]]
+tuesday = [["01:00", "23:59"]]
+wednesday = [["01:00", "23:59"]]
+thursday = [["01:00", "23:59"]]
+friday = [["01:00", "22:55"]]
+saturday = []
+sunday = [["23:05", "23:59"]]
+closed_dates = []
 
 [policy.scalper]
 max_spread_usd = 0.80
@@ -41,6 +57,10 @@ max_entry_deviation_atr = 0.50
 min_reward_risk_ratio = 1.00
 min_direction_probability = 0.56
 min_barrier_probability = 0.52
+exit_spread_min_samples = 12
+exit_spread_quantile = 0.90
+exit_spread_window = 24
+maximum_decision_age_seconds = 60
 
 [policy.sniper]
 max_spread_usd = 0.55
@@ -50,3 +70,7 @@ max_entry_deviation_atr = 0.35
 min_reward_risk_ratio = 1.25
 min_direction_probability = 0.64
 min_barrier_probability = 0.60
+exit_spread_min_samples = 12
+exit_spread_quantile = 0.90
+exit_spread_window = 24
+maximum_decision_age_seconds = 120

@@ -215,9 +215,18 @@ class CandidateModel:
                     "low": bar.low,
                     "close": bar.close,
                     "tick_volume": bar.tick_volume,
-                    "spread_usd": float(snapshot["ask"]) - float(snapshot["bid"]),
+                    "bid_close": (
+                        float(source["bid_close"])
+                        if source.get("bid_close") is not None
+                        else np.nan
+                    ),
+                    "ask_close": (
+                        float(source["ask_close"])
+                        if source.get("ask_close") is not None
+                        else np.nan
+                    ),
                 }
-                for bar in bars
+                for bar, source in zip(bars, snapshot["bars"], strict=True)
             ]
         )
         features = engineer_features(raw)

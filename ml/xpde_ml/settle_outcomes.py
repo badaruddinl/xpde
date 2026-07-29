@@ -13,6 +13,8 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .dataset import BARRIER_SPEC_ID
+
 BARRIER_OUTCOMES = {
     "TP_FIRST",
     "SL_FIRST",
@@ -56,6 +58,9 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         ("origin_bar_timestamp", "TEXT"),
         ("origin_close", "REAL"),
         ("origin_bar_index", "INTEGER"),
+        ("origin_bid", "REAL"),
+        ("origin_ask", "REAL"),
+        ("barrier_spec_id", "TEXT"),
         ("feature_version", "TEXT"),
         ("direction_probability_up", "REAL"),
         ("barrier_probability_long", "REAL"),
@@ -100,7 +105,24 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         """
-        CREATE TABLE IF NOT EXISTS prediction_proposal_outcomes (
+        CREATE TABLE IF NOT EXISTS decision_proposal_instances (
+            proposal_id TEXT PRIMARY KEY,
+            prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+            profile TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            quote_timestamp TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target_price REAL,
+            stop_price REAL,
+            evidence_eligible INTEGER NOT NULL DEFAULT 0,
+            proposal_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decision_proposal_outcomes (
+            proposal_id TEXT PRIMARY KEY REFERENCES decision_proposal_instances(proposal_id),
             prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
             profile TEXT NOT NULL,
             horizon_bars INTEGER NOT NULL,
@@ -109,7 +131,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             stop_price REAL NOT NULL,
             barrier_outcome TEXT NOT NULL,
             settled_at TEXT NOT NULL,
-            PRIMARY KEY(prediction_id, profile, horizon_bars)
+            UNIQUE(proposal_id)
         )
         """
     )
@@ -125,9 +147,13 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
         FROM predictions p
         WHERE p.origin_bar_timestamp IS NOT NULL
           AND p.origin_close IS NOT NULL
+          AND p.origin_bid IS NOT NULL
+          AND p.origin_ask IS NOT NULL
+          AND p.barrier_spec_id=?
           AND COALESCE(p.is_duplicate, 0)=0
         ORDER BY p.origin_bar_timestamp
-        """
+        """,
+        (BARRIER_SPEC_ID,),
     ).fetchall()
     settled_horizons = 0
     settled_predictions: set[str] = set()
@@ -151,8 +177,13 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
         maximum_horizon = max(int(point["horizon_bars"]) for point in points)
         outcome_bars = connection.execute(
             """
-            SELECT timestamp, high, low, close FROM market_bars
+            SELECT timestamp, bid_high, bid_low, bid_close,
+                   ask_high, ask_low, ask_close
+            FROM market_bars
             WHERE symbol=? AND timeframe=? AND timestamp>?
+              AND bid_high IS NOT NULL AND bid_low IS NOT NULL
+              AND bid_close IS NOT NULL AND ask_high IS NOT NULL
+              AND ask_low IS NOT NULL AND ask_close IS NOT NULL
             ORDER BY timestamp LIMIT ?
             """,
             (
@@ -162,29 +193,31 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 maximum_horizon,
             ),
         ).fetchall()
-        proposals = json.loads(prediction["proposal_json"])
-
         for point in points:
             horizon = int(point["horizon_bars"])
             if horizon <= 0 or len(outcome_bars) < horizon:
                 continue
             bars = outcome_bars[:horizon]
-            final_price = float(bars[-1]["close"])
+            final_price = float(bars[-1]["bid_close"])
             actual_return = math.log(final_price / origin_close)
-            actual_high = max(float(bar["high"]) for bar in bars)
-            actual_low = min(float(bar["low"]) for bar in bars)
+            actual_high = max(float(bar["bid_high"]) for bar in bars)
+            actual_low = min(float(bar["bid_low"]) for bar in bars)
+            actual_ask_high = max(float(bar["ask_high"]) for bar in bars)
+            actual_ask_low = min(float(bar["ask_low"]) for bar in bars)
             interval_hit = int(point["q10"] <= actual_return <= point["q90"])
             direction_hit = int((point["q50"] >= 0) == (actual_return >= 0))
             if point["q50"] >= 0:
                 expected_mfe = float(forecast["expected_mfe_long"])
                 expected_mae = float(forecast["expected_mae_long"])
-                actual_mfe = max(0.0, actual_high - origin_close)
-                actual_mae = max(0.0, origin_close - actual_low)
+                origin_ask = float(prediction["origin_ask"])
+                actual_mfe = max(0.0, actual_high - origin_ask)
+                actual_mae = max(0.0, origin_ask - actual_low)
             else:
                 expected_mfe = float(forecast["expected_mfe_short"])
                 expected_mae = float(forecast["expected_mae_short"])
-                actual_mfe = max(0.0, origin_close - actual_low)
-                actual_mae = max(0.0, actual_high - origin_close)
+                origin_bid = float(prediction["origin_bid"])
+                actual_mfe = max(0.0, origin_bid - actual_ask_low)
+                actual_mae = max(0.0, actual_ask_high - origin_bid)
             barrier_long = None
             barrier_short = None
             barrier = None
@@ -193,51 +226,21 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                     "LONG",
                     float(forecast["target_price_long"]),
                     float(forecast["stop_price_long"]),
-                    bars,
+                    [
+                        {"high": bar["bid_high"], "low": bar["bid_low"]}
+                        for bar in bars
+                    ],
                 )
                 barrier_short = barrier_outcome(
                     "SHORT",
                     float(forecast["target_price_short"]),
                     float(forecast["stop_price_short"]),
-                    bars,
+                    [
+                        {"high": bar["ask_high"], "low": bar["ask_low"]}
+                        for bar in bars
+                    ],
                 )
                 barrier = barrier_long if point["q50"] >= 0 else barrier_short
-                for proposal in proposals:
-                    action = str(proposal.get("action", ""))
-                    target_price = proposal.get("target_price")
-                    stop_price = proposal.get("invalidation_price")
-                    if (
-                        action not in {"LONG", "SHORT"}
-                        or target_price is None
-                        or stop_price is None
-                    ):
-                        continue
-                    proposal_outcome = barrier_outcome(
-                        action,
-                        float(target_price),
-                        float(stop_price),
-                        bars,
-                    )
-                    if proposal_outcome is None:
-                        continue
-                    connection.execute(
-                        """
-                        INSERT OR IGNORE INTO prediction_proposal_outcomes
-                        (prediction_id, profile, horizon_bars, action,
-                         target_price, stop_price, barrier_outcome, settled_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            prediction["prediction_id"],
-                            proposal["profile"],
-                            horizon,
-                            action,
-                            float(target_price),
-                            float(stop_price),
-                            proposal_outcome,
-                            now,
-                        ),
-                    )
             metrics = {
                 "median_error": abs(actual_return - point["q50"]),
                 "interval_miss": not bool(interval_hit),
@@ -276,12 +279,77 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 settled_horizons += 1
                 settled_predictions.add(str(prediction["prediction_id"]))
 
+    settled_proposals = 0
+    proposal_instances = connection.execute(
+        """
+        SELECT dpi.*, p.symbol, p.timeframe
+        FROM decision_proposal_instances dpi
+        JOIN predictions p ON p.prediction_id=dpi.prediction_id
+        WHERE dpi.evidence_eligible=1
+          AND dpi.action IN ('LONG','SHORT')
+          AND dpi.target_price IS NOT NULL
+          AND dpi.stop_price IS NOT NULL
+          AND p.barrier_spec_id=?
+          AND NOT EXISTS (
+            SELECT 1 FROM decision_proposal_outcomes dpo
+            WHERE dpo.proposal_id=dpi.proposal_id
+          )
+        """,
+        (BARRIER_SPEC_ID,),
+    ).fetchall()
+    for proposal in proposal_instances:
+        quote = datetime.fromisoformat(
+            str(proposal["quote_timestamp"]).replace("Z", "+00:00")
+        )
+        bucket_epoch = int(quote.timestamp()) // 300 * 300
+        bucket = datetime.fromtimestamp(bucket_epoch, tz=UTC).isoformat()
+        side_prefix = "bid" if proposal["action"] == "LONG" else "ask"
+        bars = connection.execute(
+            f"""
+            SELECT {side_prefix}_high AS high, {side_prefix}_low AS low
+            FROM market_bars
+            WHERE symbol=? AND timeframe=? AND timestamp>?
+              AND {side_prefix}_high IS NOT NULL AND {side_prefix}_low IS NOT NULL
+            ORDER BY timestamp LIMIT 3
+            """,
+            (proposal["symbol"], proposal["timeframe"], bucket),
+        ).fetchall()
+        if len(bars) < 3:
+            continue
+        outcome = barrier_outcome(
+            str(proposal["action"]),
+            float(proposal["target_price"]),
+            float(proposal["stop_price"]),
+            bars,
+        )
+        if outcome is None:
+            continue
+        settled_proposals += connection.execute(
+            """
+            INSERT OR IGNORE INTO decision_proposal_outcomes
+            (proposal_id, prediction_id, profile, horizon_bars, action,
+             target_price, stop_price, barrier_outcome, settled_at)
+            VALUES (?, ?, ?, 3, ?, ?, ?, ?, ?)
+            """,
+            (
+                proposal["proposal_id"],
+                proposal["prediction_id"],
+                proposal["profile"],
+                proposal["action"],
+                proposal["target_price"],
+                proposal["stop_price"],
+                outcome,
+                now,
+            ),
+        ).rowcount
+
     connection.commit()
     connection.close()
     return {
         "settled": settled_horizons,
         "settled_horizons": settled_horizons,
         "settled_predictions": len(settled_predictions),
+        "settled_proposals": settled_proposals,
     }
 
 

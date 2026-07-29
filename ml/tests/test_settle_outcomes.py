@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from xpde_ml.settle_outcomes import barrier_outcome, settle_with_report
+from xpde_ml.dataset import BARRIER_SPEC_ID
 
 
 def proposal(
@@ -79,6 +80,9 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             timeframe TEXT NOT NULL,
             origin_bar_timestamp TEXT,
             origin_close REAL,
+            origin_bid REAL,
+            origin_ask REAL,
+            barrier_spec_id TEXT,
             origin_bar_index INTEGER,
             generated_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
@@ -95,6 +99,12 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             low REAL NOT NULL,
             close REAL NOT NULL,
             tick_volume REAL NOT NULL,
+            bid_high REAL,
+            bid_low REAL,
+            bid_close REAL,
+            ask_high REAL,
+            ask_low REAL,
+            ask_close REAL,
             PRIMARY KEY(symbol, timeframe, timestamp)
         );
         """
@@ -125,7 +135,11 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
     proposals = [proposal("LONG", 101.0, 99.0)]
     connection.execute(
         """
-        INSERT INTO predictions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO predictions
+        (prediction_id, model_id, symbol, timeframe, origin_bar_timestamp,
+         origin_close, origin_bid, origin_ask, barrier_spec_id, origin_bar_index,
+         generated_at, expires_at, forecast_json, proposal_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             "prediction-1",
@@ -134,6 +148,9 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             "M5",
             origin_text,
             100.0,
+            100.0,
+            100.2,
+            BARRIER_SPEC_ID,
             int(origin.timestamp() // 300),
             (origin + timedelta(minutes=4, seconds=59)).isoformat(),
             (origin + timedelta(minutes=15)).isoformat(),
@@ -146,7 +163,10 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
         timestamp = (origin + timedelta(minutes=5 * index)).isoformat()
         connection.execute(
             """
-            INSERT INTO market_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO market_bars
+            (symbol, timeframe, timestamp, open, high, low, close, tick_volume,
+             bid_high, bid_low, bid_close, ask_high, ask_low, ask_close)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "GOLDm#",
@@ -157,8 +177,48 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
                 99.5,
                 close,
                 100.0,
+                close + 0.2,
+                99.5,
+                close,
+                close + 0.4,
+                99.7,
+                close + 0.2,
             ),
         )
+    connection.execute(
+        """
+        CREATE TABLE decision_proposal_instances (
+            proposal_id TEXT PRIMARY KEY,
+            prediction_id TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            quote_timestamp TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target_price REAL,
+            stop_price REAL,
+            evidence_eligible INTEGER NOT NULL,
+            proposal_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO decision_proposal_instances
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "proposal-1",
+            "prediction-1",
+            "SCALPER",
+            (origin + timedelta(minutes=1)).isoformat(),
+            (origin + timedelta(minutes=1)).isoformat(),
+            "LONG",
+            101.0,
+            99.0,
+            1,
+            json.dumps(proposals[0]),
+        ),
+    )
     connection.commit()
     connection.close()
 
@@ -187,7 +247,7 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
     assert h3_metrics["mfe_error_usd"] is not None
     assert h3_metrics["mae_error_usd"] is not None
     proposal_rows = connection.execute(
-        "SELECT profile, action, barrier_outcome FROM prediction_proposal_outcomes"
+        "SELECT profile, action, barrier_outcome FROM decision_proposal_outcomes"
     ).fetchall()
     assert [tuple(row) for row in proposal_rows] == [
         ("SCALPER", "LONG", "TP_FIRST")

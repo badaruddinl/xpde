@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 from typing import Any, Iterable
 
 from .time_utils import BrokerClock
@@ -58,6 +59,9 @@ def aggregate_executable_ticks(
         ask = _tick_value(tick, "ask")
         if time_msc <= 0 or bid <= 0.0 or ask <= bid:
             continue
+        normalized_time_msc = int(
+            clock.to_utc(time_msc / 1000.0).timestamp() * 1000
+        )
         bar_epoch = (time_msc // 1000) // 300 * 300
         timestamp = clock.iso_utc(float(bar_epoch))
         bar = bars.get(timestamp)
@@ -73,6 +77,9 @@ def aggregate_executable_ticks(
                 "ask_low": ask,
                 "ask_close": ask,
                 "executable_tick_count": 1,
+                "first_tick_msc": normalized_time_msc,
+                "last_tick_msc": normalized_time_msc,
+                "_tick_path": [[normalized_time_msc, bid, ask]],
             }
         else:
             bar["bid_high"] = max(float(bar["bid_high"]), bid)
@@ -82,6 +89,10 @@ def aggregate_executable_ticks(
             bar["ask_low"] = min(float(bar["ask_low"]), ask)
             bar["ask_close"] = ask
             bar["executable_tick_count"] = int(bar["executable_tick_count"]) + 1
+            bar["last_tick_msc"] = normalized_time_msc
+            path = bar["_tick_path"]
+            if path[-1][1] != bid or path[-1][2] != ask:
+                path.append([normalized_time_msc, bid, ask])
         maximum_time_msc = max(maximum_time_msc or 0, time_msc)
     return bars, maximum_time_msc
 
@@ -95,23 +106,47 @@ def merge_executable_bars(
         if current is None:
             destination[timestamp] = dict(addition)
             continue
+        current_first = int(current.get("first_tick_msc", 0))
+        addition_first = int(addition.get("first_tick_msc", 0))
+        current_last = int(current.get("last_tick_msc", 0))
+        addition_last = int(addition.get("last_tick_msc", 0))
+        if addition_first and (not current_first or addition_first < current_first):
+            current["bid_open"] = addition["bid_open"]
+            current["ask_open"] = addition["ask_open"]
+            current["first_tick_msc"] = addition_first
         current["bid_high"] = max(
             float(current["bid_high"]), float(addition["bid_high"])
         )
         current["bid_low"] = min(
             float(current["bid_low"]), float(addition["bid_low"])
         )
-        current["bid_close"] = addition["bid_close"]
+        if addition_last >= current_last:
+            current["bid_close"] = addition["bid_close"]
+            current["ask_close"] = addition["ask_close"]
+            current["last_tick_msc"] = addition_last
         current["ask_high"] = max(
             float(current["ask_high"]), float(addition["ask_high"])
         )
         current["ask_low"] = min(
             float(current["ask_low"]), float(addition["ask_low"])
         )
-        current["ask_close"] = addition["ask_close"]
         current["executable_tick_count"] = int(
             current.get("executable_tick_count", 0)
         ) + int(addition.get("executable_tick_count", 0))
+        combined_path = [
+            *current.get("_tick_path", []),
+            *addition.get("_tick_path", []),
+        ]
+        combined_path.sort(key=lambda item: int(item[0]))
+        compact_path: list[list[float | int]] = []
+        for item in combined_path:
+            if (
+                not compact_path
+                or compact_path[-1][1] != item[1]
+                or compact_path[-1][2] != item[2]
+            ):
+                compact_path.append(item)
+        current["_tick_path"] = compact_path
 
 
 def collect_executable_bars(
@@ -158,19 +193,24 @@ def collect_executable_bars(
 def overlay_executable_bars(
     chart_bars: list[dict[str, Any]],
     executable_bars: dict[str, dict[str, Any]],
+    *,
+    include_tick_path: bool = False,
 ) -> list[dict[str, Any]]:
     result = []
     for chart_bar in chart_bars:
         merged = dict(chart_bar)
         executable = executable_bars.get(str(chart_bar["timestamp"]))
         if executable is not None:
-            merged.update(
-                {
-                    key: value
-                    for key, value in executable.items()
-                    if key != "timestamp"
-                }
-            )
+            merged.update({
+                key: value
+                for key, value in executable.items()
+                if key not in {"timestamp", "_tick_path"}
+            })
+            if include_tick_path:
+                merged["executable_tick_path_json"] = json.dumps(
+                    executable.get("_tick_path", []),
+                    separators=(",", ":"),
+                )
         result.append(merged)
     return result
 

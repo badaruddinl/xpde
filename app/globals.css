@@ -281,11 +281,19 @@ h2 { font-size: .95rem; font-weight: 600; margin-bottom: 0; }
 .gate-row { border-top: 1px solid var(--line-soft); color: var(--muted-bright); font-size: .64rem; justify-content: space-between; padding: .58rem 0; }
 .gate-row > span { align-items: center; display: flex; gap: .45rem; }
 .gate-row strong { font-family: var(--font-mono); font-size: .6rem; font-weight: 500; }
+.gate-row.health-detail { align-items: flex-start; gap: .75rem; }
+.gate-row.health-detail span { max-width: 62%; }
+.gate-row.health-detail strong { max-width: 38%; text-align: right; }
 .gate-row i { border-radius: 50%; height: 6px; width: 6px; }
 .gate-row .ok { background: var(--green); }
 .gate-row .warn { background: var(--gold); }
 .gate-row .bad { background: var(--red); }
 .feedback-panel h2 { margin-bottom: .85rem; }
+.feedback-reason { color: var(--muted); display: grid; font-size: .61rem; gap: .35rem; margin-bottom: .7rem; }
+.feedback-reason select {
+  background: #10161c; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--muted-bright); font: .64rem var(--font-mono); padding: .5rem;
+}
 .feedback-actions { display: grid; gap: .45rem; grid-template-columns: repeat(3, 1fr); margin-bottom: .65rem; }
 .feedback-actions button {
   background: #191f26; border: 1px solid var(--line); border-radius: 4px;

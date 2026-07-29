@@ -20,16 +20,21 @@ records outcomes and feedback, then leaves the final decision to a human.
 - Condition-dependent MFE/MAE models; lot preview remains disabled for the baseline.
 - Scalper and strict Sniper policies use the current bid/ask, reject already-touched
   barriers and require enough remaining reward/risk after costs.
-- Historical ticks are aggregated into separate Bid and Ask OHLC. LONG outcomes
-  use Bid exits; SHORT outcomes use Ask exits. A non-Bid chart mode is rejected.
+- Historical ticks are aggregated into separate Bid and Ask OHLC with first/last
+  tick timestamps and a compact price-change path. LONG outcomes use Bid exits;
+  SHORT outcomes use Ask exits, and same-bar order is resolved from tick order.
 - Absolute provider tick age and local transport age are checked independently;
   market closed, stale feed and disconnected bridge remain distinct states.
 - Side-aware costs use Ask-entry/Bid-exit for LONG and Bid-entry/estimated
-  Ask-exit for SHORT. The exit spread is the rolling median of exact Bid/Ask bars.
-- Live coverage, Brier, ECE and MAE-coverage gates can degrade or suspend new
-  proposals after the minimum settled sample is reached.
+  Ask-exit for SHORT. Exit spread requires at least 12 exact bars and uses the
+  configured conservative quantile instead of an optimistic median.
+- Every material realtime decision is an immutable proposal instance. Feedback
+  and policy outcomes refer to its `proposal_id`, quote, entry and health state.
+- Live coverage, absolute and baseline-relative Brier, ECE and MAE-coverage
+  gates use persisted hysteresis and stop proposals while warming or unhealthy.
 - Dynamic MT5 account, currency and symbol specifications.
-- MT5 `order_calc_margin()` is authoritative for lot-preview margin when available.
+- MT5 `order_calc_margin()` and `order_calc_profit()` are authoritative for
+  margin and account-currency PnL conversion when available.
 - SQLite WAL audit trail, prediction registry and outcome settlement.
 - Rust REST/WebSocket service bound to localhost.
 - Local dashboard with forecast interval, cost gate and feedback.
@@ -164,15 +169,17 @@ predictions. Training artifacts and historical exports are local and ignored by
 Git.
 
 Candidate training is intentionally blocked unless the dataset manifest proves
-that it came from a Bid chart and historical Bid/Ask ticks. Chart OHLC with a
-spread approximation is not silently accepted. Existing artifacts trained on
-the older one-sided contract must be retired and retrained.
+that it came from a Bid chart and historical Bid/Ask ticks, chart Bid matches
+aggregated tick Bid within one tick, and tick coverage is sufficient. Training
+spread features use exact `ask_close - bid_close` plus rolling median/q75/q90
+and spread/ATR. Existing artifacts from the previous feature or barrier
+contract must be retired and retrained.
 
 The backfill command treats the fetched MT5 window as authoritative and replaces
 the local `GOLDm#`/M5 bar cache before importing chunks. Use `--append` only when
 an intentional incremental import is required. Every export also creates a
-sanitized `.manifest.json` containing timestamps, row count, gap summary,
-Git commit and SHA-256.
+sanitized `.manifest.json` containing timestamps, row count, gap and chart/tick
+parity summaries, tick coverage, Git commit and SHA-256.
 
 Candidate training is the promotion path and requires at least 20,000 rows by
 default. For a quick pipeline check that cannot be promoted, use
@@ -216,16 +223,25 @@ candidate cannot load because inference packages are absent, rerun
 
 Forecast barrier evaluation and actionable proposal evaluation are intentionally
 separate. Every settled H3 forecast records counterfactual LONG and SHORT
-TP-before-SL outcomes using the exact forecast target/stop. SCALPER and SNIPER
-proposal outcomes are stored independently, so a `WAIT` decision does not erase
-forecast quality and a proposal metric never masquerades as model coverage.
+TP-before-SL outcomes using the exact forecast target/stop. Realtime SCALPER and
+SNIPER changes are stored in `decision_proposal_instances`. The first actionable
+instance per profile, plus an explicitly accepted instance, is eligible for
+policy settlement over the next three full completed bars. A later `WAIT`
+therefore cannot be confused with the earlier proposal a human actually saw.
+
+Broker sessions come from `[market_session]` in `config/default.toml`, with
+Sunday/Friday hours, maintenance gaps represented as split sessions, holiday
+closures, and the MT5 symbol trade-mode check. `XPDE_MARKET_CLOSED_DATES` can
+add emergency closure dates without changing source.
+Forecast quality and policy outcome remain separate; a proposal metric never
+masquerades as model coverage.
 `tp_first_within_horizon_rate` includes no-hit outcomes in its denominator and is
 the metric comparable to the trained probability; `tp_vs_sl_conditional_rate`
 is reported separately. Live monitoring also exposes direction/barrier Brier,
 reliability bins, expected calibration error, and per-horizon coverage, width and
-pinball loss. Once at least 100 H3 outcomes exist, the live-health policy can
-change from `HEALTHY` to `DEGRADED` or `SUSPENDED`; either unhealthy state forces
-directional proposals to `WAIT` without retraining or mutating the model.
+pinball loss. Warming health already forces `WAIT`. Once at least 100 H3
+outcomes exist, baseline-relative gates and multi-window hysteresis control
+`HEALTHY`, `DEGRADED`, and `SUSPENDED` without retraining or mutating the model.
 
 Rust is the canonical production settlement implementation. The Python
 `xpde-settle` command is retained for offline analysis/replay and must not run as

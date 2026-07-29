@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 pub const SUPPORTED_SYMBOL: &str = "GOLDm#";
 pub const SUPPORTED_TIMEFRAME: &str = "M5";
-pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v2";
-pub const EXECUTABLE_SIDE_CONTRACT_ID: &str = "bid-entry-exit-long-ask-exit-short-v1";
+pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v3";
+pub const EXECUTABLE_SIDE_CONTRACT_ID: &str = "bid-entry-exit-long-ask-exit-short-tick-sequence-v2";
 pub const BARRIER_HORIZON_BARS: u32 = 3;
 pub const M5_BAR_MINUTES: i64 = 5;
 
@@ -36,6 +36,10 @@ pub struct MarketBar {
     pub ask_close: Option<f64>,
     #[serde(default)]
     pub executable_tick_count: u64,
+    #[serde(default)]
+    pub first_tick_msc: Option<i64>,
+    #[serde(default)]
+    pub last_tick_msc: Option<i64>,
 }
 
 impl MarketBar {
@@ -73,6 +77,16 @@ impl MarketBar {
             && ask_low > bid_low
             && ask_close > bid_close
             && self.executable_tick_count > 0
+            && self.first_tick_msc.is_some()
+            && self.last_tick_msc >= self.first_tick_msc
+            && self.first_tick_msc.is_some_and(|value| {
+                value >= self.timestamp.timestamp_millis()
+                    && value < self.timestamp.timestamp_millis() + 300_000
+            })
+            && self.last_tick_msc.is_some_and(|value| {
+                value >= self.timestamp.timestamp_millis()
+                    && value < self.timestamp.timestamp_millis() + 300_000
+            })
     }
 }
 
@@ -150,6 +164,18 @@ pub struct SymbolSpec {
     pub quote_currency: String,
     #[serde(default)]
     pub pnl_currency: String,
+    #[serde(default)]
+    pub profit_per_price_unit_per_lot_buy: Option<f64>,
+    #[serde(default)]
+    pub profit_per_price_unit_per_lot_sell: Option<f64>,
+    #[serde(default)]
+    pub pnl_calculation_source: String,
+    #[serde(default)]
+    pub conversion_rate: Option<f64>,
+    #[serde(default)]
+    pub conversion_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub trade_mode_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -202,7 +228,7 @@ impl MarketSnapshot {
         (self.ask + self.bid) / 2.0
     }
 
-    pub fn rolling_exit_spread(&self, maximum_bars: usize) -> Option<f64> {
+    pub fn rolling_exit_spread(&self, maximum_bars: usize, quantile: f64) -> Option<(f64, usize)> {
         let mut recent = self
             .bars
             .iter()
@@ -220,12 +246,10 @@ impl MarketSnapshot {
             return None;
         }
         spreads.sort_by(f64::total_cmp);
-        let middle = spreads.len() / 2;
-        Some(if spreads.len() % 2 == 0 {
-            (spreads[middle - 1] + spreads[middle]) / 2.0
-        } else {
-            spreads[middle]
-        })
+        let sample_size = spreads.len();
+        let index =
+            ((sample_size.saturating_sub(1)) as f64 * quantile.clamp(0.0, 1.0)).ceil() as usize;
+        Some((spreads[index.min(sample_size - 1)], sample_size))
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
@@ -416,6 +440,8 @@ pub enum DecisionAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DecisionProposal {
+    #[serde(default)]
+    pub proposal_id: Option<Uuid>,
     pub prediction_id: Uuid,
     pub profile: TradingProfile,
     #[serde(default)]
@@ -428,19 +454,33 @@ pub struct DecisionProposal {
     pub quote_currency: String,
     #[serde(default)]
     pub pnl_currency: String,
+    #[serde(default)]
+    pub pnl_calculation_source: String,
+    #[serde(default)]
+    pub conversion_rate: Option<f64>,
+    #[serde(default)]
+    pub conversion_timestamp: Option<DateTime<Utc>>,
     pub action: DecisionAction,
     pub generated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub evaluated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub quote_timestamp: Option<DateTime<Utc>>,
     pub decision_valid_until: DateTime<Utc>,
     pub outcome_matures_at: DateTime<Utc>,
-    #[serde(alias = "expected_edge_after_cost_usd")]
-    pub median_move_after_cost_usd: f64,
+    #[serde(
+        default,
+        alias = "expected_edge_after_cost_usd",
+        alias = "median_move_after_cost_usd"
+    )]
+    pub median_move_after_cost_account: f64,
     pub reference_lot: f64,
     #[serde(default)]
     pub reference_entry_price: Option<f64>,
-    #[serde(default)]
-    pub remaining_reward_usd: f64,
-    #[serde(default)]
-    pub remaining_risk_usd: f64,
+    #[serde(default, alias = "remaining_reward_usd")]
+    pub remaining_reward_account: f64,
+    #[serde(default, alias = "remaining_risk_usd")]
+    pub remaining_risk_account: f64,
     #[serde(default)]
     pub reward_risk_ratio: f64,
     #[serde(default)]
@@ -450,9 +490,25 @@ pub struct DecisionProposal {
     #[serde(default)]
     pub expected_exit_spread: f64,
     #[serde(default)]
+    pub exit_spread_sample_size: usize,
+    #[serde(default)]
+    pub exit_spread_quantile: f64,
+    #[serde(default)]
+    pub exit_spread_window: usize,
+    #[serde(default)]
     pub slippage_assumption: f64,
     #[serde(default)]
     pub commission: f64,
+    #[serde(default)]
+    pub decision_age_seconds: u64,
+    #[serde(default)]
+    pub remaining_horizon_seconds: u64,
+    #[serde(default)]
+    pub maximum_decision_age_seconds: u64,
+    #[serde(default)]
+    pub model_health_status: String,
+    #[serde(default)]
+    pub evidence_eligible: bool,
     pub invalidation_price: Option<f64>,
     pub target_price: Option<f64>,
     pub reason_codes: Vec<String>,
@@ -476,6 +532,10 @@ pub struct DecisionPolicy {
     pub max_entry_deviation_atr: f64,
     pub min_reward_risk_ratio: f64,
     pub max_spread_atr_ratio: f64,
+    pub exit_spread_min_samples: usize,
+    pub exit_spread_quantile: f64,
+    pub exit_spread_window: usize,
+    pub maximum_decision_age_seconds: u64,
 }
 
 impl DecisionPolicy {
@@ -496,6 +556,10 @@ impl DecisionPolicy {
             max_entry_deviation_atr: 0.50,
             min_reward_risk_ratio: 1.0,
             max_spread_atr_ratio: 0.50,
+            exit_spread_min_samples: 12,
+            exit_spread_quantile: 0.90,
+            exit_spread_window: 24,
+            maximum_decision_age_seconds: 60,
         }
     }
 
@@ -516,6 +580,10 @@ impl DecisionPolicy {
             max_entry_deviation_atr: 0.35,
             min_reward_risk_ratio: 1.25,
             max_spread_atr_ratio: 0.35,
+            exit_spread_min_samples: 12,
+            exit_spread_quantile: 0.90,
+            exit_spread_window: 24,
+            maximum_decision_age_seconds: 120,
         }
     }
 }
@@ -539,6 +607,7 @@ pub fn decide_at(
     let fallback_matures_at = generated_at
         + chrono::Duration::minutes((BARRIER_HORIZON_BARS as i64 + 1) * M5_BAR_MINUTES);
     let no_prediction = |reason: &str, decision_valid_until, outcome_matures_at| DecisionProposal {
+        proposal_id: None,
         prediction_id: forecast.prediction_id,
         profile: policy.profile,
         broker_policy_id: policy.broker_policy_id.clone(),
@@ -546,21 +615,40 @@ pub fn decide_at(
         account_currency: snapshot.account.currency.clone(),
         quote_currency: snapshot.symbol_spec.quote_currency.clone(),
         pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
+        pnl_calculation_source: snapshot.symbol_spec.pnl_calculation_source.clone(),
+        conversion_rate: snapshot.symbol_spec.conversion_rate,
+        conversion_timestamp: snapshot.symbol_spec.conversion_timestamp,
         action: DecisionAction::NoPrediction,
         generated_at,
+        evaluated_at: Some(decision_time),
+        quote_timestamp: Some(snapshot.timestamp),
         decision_valid_until,
         outcome_matures_at,
-        median_move_after_cost_usd: 0.0,
+        median_move_after_cost_account: 0.0,
         reference_lot: snapshot.symbol_spec.volume_min,
         reference_entry_price: None,
-        remaining_reward_usd: 0.0,
-        remaining_risk_usd: 0.0,
+        remaining_reward_account: 0.0,
+        remaining_risk_account: 0.0,
         reward_risk_ratio: 0.0,
         entry_deviation_from_origin: 0.0,
         entry_spread: snapshot.spread_usd(),
         expected_exit_spread: policy.expected_exit_spread_usd,
+        exit_spread_sample_size: 0,
+        exit_spread_quantile: policy.exit_spread_quantile,
+        exit_spread_window: policy.exit_spread_window,
         slippage_assumption: policy.slippage_buffer_usd,
         commission: policy.commission_usd_per_lot * snapshot.symbol_spec.volume_min,
+        decision_age_seconds: decision_time
+            .signed_duration_since(generated_at)
+            .num_seconds()
+            .max(0) as u64,
+        remaining_horizon_seconds: outcome_matures_at
+            .signed_duration_since(decision_time)
+            .num_seconds()
+            .max(0) as u64,
+        maximum_decision_age_seconds: policy.maximum_decision_age_seconds,
+        model_health_status: String::new(),
+        evidence_eligible: false,
         invalidation_price: None,
         target_price: None,
         reason_codes: vec![reason.to_owned()],
@@ -602,6 +690,14 @@ pub fn decide_at(
     if decision_time > decision_valid_until {
         return no_prediction("FORECAST_EXPIRED", decision_valid_until, outcome_matures_at);
     }
+    let decision_age_seconds = decision_time
+        .signed_duration_since(forecast.generated_at)
+        .num_seconds()
+        .max(0) as u64;
+    let remaining_horizon_seconds = outcome_matures_at
+        .signed_duration_since(decision_time)
+        .num_seconds()
+        .max(0) as u64;
     let horizon = forecast
         .points
         .iter()
@@ -686,10 +782,11 @@ pub fn decide_at(
         _ => unreachable!("selected side is always directional"),
     };
     let median_price = forecast.origin_close * horizon.q50.exp();
-    let expected_exit_spread = snapshot
-        .rolling_exit_spread(24)
-        .unwrap_or(policy.expected_exit_spread_usd)
-        .max(0.0);
+    let exit_spread_estimate =
+        snapshot.rolling_exit_spread(policy.exit_spread_window, policy.exit_spread_quantile);
+    let (expected_exit_spread, exit_spread_sample_size) =
+        exit_spread_estimate.unwrap_or((policy.expected_exit_spread_usd, 0));
+    let expected_exit_spread = expected_exit_spread.max(0.0);
     let median_exit_price = match selected_side {
         DecisionAction::Long => median_price,
         DecisionAction::Short => median_price + expected_exit_spread,
@@ -700,15 +797,36 @@ pub fn decide_at(
         DecisionAction::Short => reference_entry_price - median_exit_price,
         _ => unreachable!("selected side is always directional"),
     };
-    let slippage_cost =
-        policy.slippage_buffer_usd * snapshot.symbol_spec.contract_size * reference_lot;
+    let authoritative_factor = match selected_side {
+        DecisionAction::Long => snapshot.symbol_spec.profit_per_price_unit_per_lot_buy,
+        DecisionAction::Short => snapshot.symbol_spec.profit_per_price_unit_per_lot_sell,
+        _ => None,
+    }
+    .filter(|value| value.is_finite() && *value > 0.0);
+    let same_currency = snapshot
+        .account
+        .currency
+        .eq_ignore_ascii_case(&snapshot.symbol_spec.pnl_currency);
+    let (pnl_factor, pnl_calculation_source) = if let Some(factor) = authoritative_factor {
+        (
+            Some(factor),
+            snapshot.symbol_spec.pnl_calculation_source.clone(),
+        )
+    } else if same_currency {
+        (
+            Some(snapshot.symbol_spec.contract_size),
+            "CONTRACT_SIZE_SAME_CURRENCY".to_owned(),
+        )
+    } else {
+        (None, "CURRENCY_CONVERSION_UNAVAILABLE".to_owned())
+    };
+    let pnl_factor_value = pnl_factor.unwrap_or(0.0);
+    let slippage_cost = policy.slippage_buffer_usd * pnl_factor_value * reference_lot;
     let commission_cost = policy.commission_usd_per_lot * reference_lot;
     let median_move_after_cost =
-        median_move_price * snapshot.symbol_spec.contract_size * reference_lot
-            - slippage_cost
-            - commission_cost;
+        median_move_price * pnl_factor_value * reference_lot - slippage_cost - commission_cost;
     let non_spread_cost_price = policy.slippage_buffer_usd
-        + policy.commission_usd_per_lot / snapshot.symbol_spec.contract_size;
+        + policy.commission_usd_per_lot / pnl_factor_value.max(f64::EPSILON);
     let (remaining_reward_price, remaining_risk_price, entry_inside_barrier) = match selected_side {
         DecisionAction::Long => (
             target_price - reference_entry_price,
@@ -722,12 +840,11 @@ pub fn decide_at(
         ),
         _ => unreachable!("selected side is always directional"),
     };
-    let remaining_reward_usd =
-        remaining_reward_price.max(0.0) * snapshot.symbol_spec.contract_size * reference_lot;
-    let remaining_risk_usd =
-        remaining_risk_price.max(0.0) * snapshot.symbol_spec.contract_size * reference_lot;
-    let reward_risk_ratio = if remaining_risk_usd > 0.0 {
-        remaining_reward_usd / remaining_risk_usd
+    let remaining_reward_account =
+        remaining_reward_price.max(0.0) * pnl_factor_value * reference_lot;
+    let remaining_risk_account = remaining_risk_price.max(0.0) * pnl_factor_value * reference_lot;
+    let reward_risk_ratio = if remaining_risk_account > 0.0 {
+        remaining_reward_account / remaining_risk_account
     } else {
         0.0
     };
@@ -786,6 +903,23 @@ pub fn decide_at(
     {
         reasons.push("REMAINING_EDGE_TOO_SMALL".to_owned());
     }
+    if pnl_factor.is_none() {
+        reasons.push("CURRENCY_CONVERSION_UNAVAILABLE".to_owned());
+    }
+    if exit_spread_sample_size < policy.exit_spread_min_samples {
+        reasons.push("EXIT_SPREAD_ESTIMATE_UNAVAILABLE".to_owned());
+    }
+    if decision_age_seconds > policy.maximum_decision_age_seconds {
+        reasons.push("ENTRY_WINDOW_EXPIRED".to_owned());
+    }
+    let minimum_stop_distance =
+        snapshot.symbol_spec.stops_level_points as f64 * snapshot.symbol_spec.tick_size;
+    if minimum_stop_distance > 0.0
+        && ((target_price - reference_entry_price).abs() < minimum_stop_distance
+            || (stop_price - reference_entry_price).abs() < minimum_stop_distance)
+    {
+        reasons.push("BROKER_STOPS_LEVEL_VIOLATION".to_owned());
+    }
     if !direction_ok {
         reasons.push("DIRECTION_PROBABILITY_TOO_LOW".to_owned());
     }
@@ -813,6 +947,7 @@ pub fn decide_at(
     };
 
     DecisionProposal {
+        proposal_id: None,
         prediction_id: forecast.prediction_id,
         profile: policy.profile,
         broker_policy_id: policy.broker_policy_id.clone(),
@@ -820,21 +955,34 @@ pub fn decide_at(
         account_currency: snapshot.account.currency.clone(),
         quote_currency: snapshot.symbol_spec.quote_currency.clone(),
         pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
+        pnl_calculation_source,
+        conversion_rate: snapshot.symbol_spec.conversion_rate,
+        conversion_timestamp: snapshot.symbol_spec.conversion_timestamp,
         action,
         generated_at,
+        evaluated_at: Some(decision_time),
+        quote_timestamp: Some(snapshot.timestamp),
         decision_valid_until,
         outcome_matures_at,
-        median_move_after_cost_usd: median_move_after_cost,
+        median_move_after_cost_account: median_move_after_cost,
         reference_lot,
         reference_entry_price: Some(reference_entry_price),
-        remaining_reward_usd,
-        remaining_risk_usd,
+        remaining_reward_account,
+        remaining_risk_account,
         reward_risk_ratio,
         entry_deviation_from_origin,
         entry_spread: snapshot.spread_usd(),
         expected_exit_spread,
+        exit_spread_sample_size,
+        exit_spread_quantile: policy.exit_spread_quantile,
+        exit_spread_window: policy.exit_spread_window,
         slippage_assumption: policy.slippage_buffer_usd,
         commission: commission_cost,
+        decision_age_seconds,
+        remaining_horizon_seconds,
+        maximum_decision_age_seconds: policy.maximum_decision_age_seconds,
+        model_health_status: String::new(),
+        evidence_eligible: false,
         invalidation_price: invalidation,
         target_price: target,
         reason_codes: reasons,
@@ -844,6 +992,7 @@ pub fn decide_at(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HumanFeedback {
+    pub proposal_id: Uuid,
     pub prediction_id: Uuid,
     pub profile: TradingProfile,
     pub proposal_action: DecisionAction,
@@ -934,6 +1083,12 @@ mod tests {
                     ask_low: Some(3329.24),
                     ask_close: Some(3330.74),
                     executable_tick_count: 100,
+                    first_tick_msc: Some(
+                        (now - chrono::Duration::minutes(offset * 5)).timestamp() * 1000,
+                    ),
+                    last_tick_msc: Some(
+                        (now - chrono::Duration::minutes(offset * 5)).timestamp() * 1000 + 299_000,
+                    ),
                 })
                 .collect(),
             current_bar: Some(MarketBar {
@@ -952,6 +1107,8 @@ mod tests {
                 ask_low: Some(3330.44),
                 ask_close: Some(3330.84),
                 executable_tick_count: 10,
+                first_tick_msc: Some(now.timestamp() * 1000),
+                last_tick_msc: Some(now.timestamp() * 1000 + 1_000),
             }),
             account: AccountSnapshot {
                 login: 1,
@@ -977,6 +1134,12 @@ mod tests {
                 chart_mode: ChartMode::Bid,
                 quote_currency: "USD".to_owned(),
                 pnl_currency: "USD".to_owned(),
+                profit_per_price_unit_per_lot_buy: Some(1.0),
+                profit_per_price_unit_per_lot_sell: Some(1.0),
+                pnl_calculation_source: "MT5_ORDER_CALC_PROFIT".to_owned(),
+                conversion_rate: Some(1.0),
+                conversion_timestamp: Some(now),
+                trade_mode_enabled: true,
             },
             data_quality: DataQuality {
                 completeness: 1.0,
@@ -1041,7 +1204,7 @@ mod tests {
             &DecisionPolicy::scalper(),
         );
         assert_eq!(decision.action, DecisionAction::Long);
-        assert!(decision.median_move_after_cost_usd > 0.0);
+        assert!(decision.median_move_after_cost_account > 0.0);
         assert!(
             decision
                 .risk_warnings
@@ -1076,8 +1239,8 @@ mod tests {
         assert_eq!(decision.target_price, Some(forecast.target_price_long));
         assert_eq!(decision.invalidation_price, Some(forecast.stop_price_long));
         assert_eq!(decision.reference_entry_price, Some(sample_snapshot().ask));
-        assert!(decision.remaining_reward_usd > 0.0);
-        assert!(decision.remaining_risk_usd > 0.0);
+        assert!(decision.remaining_reward_account > 0.0);
+        assert!(decision.remaining_risk_account > 0.0);
         assert!(decision.reward_risk_ratio >= 1.0);
         assert_eq!(
             decision.decision_valid_until,
@@ -1102,7 +1265,7 @@ mod tests {
             - policy.slippage_buffer_usd
                 * snapshot.symbol_spec.contract_size
                 * snapshot.symbol_spec.volume_min;
-        assert!((proposal.median_move_after_cost_usd - expected).abs() < 1e-10);
+        assert!((proposal.median_move_after_cost_account - expected).abs() < 1e-10);
     }
 
     #[test]
@@ -1132,7 +1295,7 @@ mod tests {
             - policy.slippage_buffer_usd
                 * snapshot.symbol_spec.contract_size
                 * snapshot.symbol_spec.volume_min;
-        assert!((proposal.median_move_after_cost_usd - expected_move).abs() < 1e-10);
+        assert!((proposal.median_move_after_cost_account - expected_move).abs() < 1e-10);
     }
 
     #[test]
@@ -1155,6 +1318,8 @@ mod tests {
             ask_low: Some(forecast.origin_close + 0.24),
             ask_close: Some(forecast.origin_close + 0.24),
             executable_tick_count: 10,
+            first_tick_msc: Some(snapshot.timestamp.timestamp() * 1000),
+            last_tick_msc: Some(snapshot.timestamp.timestamp() * 1000 + 1_000),
         });
         let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
         assert_eq!(decision.action, DecisionAction::Wait);
@@ -1162,6 +1327,47 @@ mod tests {
             decision
                 .reason_codes
                 .contains(&"BARRIER_ALREADY_TOUCHED".to_owned())
+        );
+    }
+
+    #[test]
+    fn non_account_currency_requires_authoritative_profit_conversion() {
+        let forecast = sample_forecast();
+        let mut snapshot = sample_snapshot();
+        snapshot.account.currency = "IDR".to_owned();
+        snapshot.symbol_spec.pnl_currency = "USD".to_owned();
+        snapshot.symbol_spec.profit_per_price_unit_per_lot_buy = None;
+        snapshot.symbol_spec.profit_per_price_unit_per_lot_sell = None;
+        snapshot.symbol_spec.pnl_calculation_source = "UNAVAILABLE".to_owned();
+
+        let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+
+        assert_eq!(decision.action, DecisionAction::Wait);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"CURRENCY_CONVERSION_UNAVAILABLE".to_owned())
+        );
+    }
+
+    #[test]
+    fn expired_entry_window_forces_wait_before_forecast_expiry() {
+        let mut forecast = sample_forecast();
+        let snapshot = sample_snapshot();
+        forecast.generated_at = snapshot.timestamp - chrono::Duration::seconds(61);
+        let decision = decide_at(
+            &snapshot,
+            &forecast,
+            &DecisionPolicy::scalper(),
+            snapshot.timestamp,
+        );
+
+        assert_eq!(decision.action, DecisionAction::Wait);
+        assert_eq!(decision.decision_age_seconds, 61);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"ENTRY_WINDOW_EXPIRED".to_owned())
         );
     }
 
@@ -1246,6 +1452,8 @@ mod tests {
             bar.ask_high = Some(bar.high + 0.24);
             bar.ask_low = Some(bar.low + 0.24);
             bar.ask_close = Some(bar.close + 0.24);
+            bar.first_tick_msc = Some(bar.timestamp.timestamp_millis());
+            bar.last_tick_msc = Some(bar.timestamp.timestamp_millis() + 299_000);
         }
         if let Some(current) = snapshot.current_bar.as_mut() {
             current.timestamp = forecast.origin_bar_timestamp + chrono::Duration::minutes(5);
@@ -1261,6 +1469,8 @@ mod tests {
             current.ask_high = Some(current.high + 0.24);
             current.ask_low = Some(current.low + 0.24);
             current.ask_close = Some(current.close + 0.24);
+            current.first_tick_msc = Some(current.timestamp.timestamp_millis());
+            current.last_tick_msc = Some(current.timestamp.timestamp_millis() + 1_000);
         }
         let proposal = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
         assert_eq!(proposal.action, DecisionAction::Long);

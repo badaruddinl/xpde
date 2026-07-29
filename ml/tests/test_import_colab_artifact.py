@@ -20,7 +20,7 @@ def make_artifact(path: Path, *, eligible: bool = True) -> Path:
     manifest = {
         "schema_version": 3,
         "model_id": "candidate-test-v3",
-        "feature_version": "goldm-m5-v3",
+        "feature_version": "goldm-m5-v4",
         "eligible_for_shadow": eligible,
         "eligibility_gate_version": 3,
         "training_mode": "candidate",
@@ -30,11 +30,11 @@ def make_artifact(path: Path, *, eligible: bool = True) -> Path:
         },
         "artifact_files": artifact_files,
         "barrier_spec": {
-            "id": "atr-1.25tp-1.00sl-h3-executable-v2",
+            "id": "atr-1.25tp-1.00sl-h3-executable-v3",
             "horizon_bars": 3,
         },
         "executable_side_contract": {
-            "id": "bid-entry-exit-long-ask-exit-short-v1",
+            "id": "bid-entry-exit-long-ask-exit-short-tick-sequence-v2",
             "chart_mode": "BID",
             "long_exit_ohlc": "BID",
             "short_exit_ohlc": "ASK",
@@ -72,7 +72,7 @@ class FakeCandidateModel:
             "direction_probability_up": 0.55,
             "barrier_probability_long": 0.54,
             "barrier_probability_short": 0.46,
-            "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v2",
+            "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v3",
             "barrier_horizon_bars": 3,
             "target_price_long": origin["close"] + 1.25,
             "stop_price_long": origin["close"] - 1.0,

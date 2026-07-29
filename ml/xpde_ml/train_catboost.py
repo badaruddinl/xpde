@@ -358,19 +358,30 @@ def train(args) -> dict[str, Any]:
             raise ValueError("dataset manifest timeframe is incompatible")
         if int(source_manifest.get("row_count", -1)) != len(raw):
             raise ValueError("dataset row count does not match its manifest")
+    executable_integrity = (
+        source_manifest.get("executable_integrity", {})
+        if source_manifest is not None
+        else {}
+    )
     dataset_integrity_ok = bool(
         source_manifest is not None
+        and int(source_manifest.get("schema_version", 0)) >= 2
         and source_manifest.get("contains_incomplete_bar") is False
         and source_manifest.get("git_dirty") is False
         and source_manifest.get("chart_mode") == "BID"
         and source_manifest.get("executable_side_source")
         == "HISTORICAL_BID_ASK_TICKS"
+        and float(executable_integrity.get("parity_mismatch_rate", 1.0)) == 0.0
+        and int(executable_integrity.get("bars_without_full_tick_history", 1)) == 0
+        and float(executable_integrity.get("minimum_tick_coverage_per_bar", 0.0))
+        >= 0.5
     )
     training_mode = getattr(args, "training_mode", "candidate")
     if training_mode == "candidate" and not dataset_integrity_ok:
         raise ValueError(
             "candidate training requires a clean dataset manifest with BID chart "
-            "mode and exact HISTORICAL_BID_ASK_TICKS executable sides"
+            "mode, chart/tick Bid parity, sufficient tick coverage, and exact "
+            "HISTORICAL_BID_ASK_TICKS executable sides"
         )
     frame = build_training_frame(raw)
     required = list(FEATURE_COLUMNS) + [
@@ -854,6 +865,8 @@ def train(args) -> dict[str, Any]:
             "long_exit_ohlc": "BID",
             "short_exit_ohlc": "ASK",
             "source": "HISTORICAL_BID_ASK_TICKS",
+            "first_passage": "ORDERED_PRICE_CHANGE_TICKS",
+            "spread_features": "EXACT_BID_ASK_CLOSE_WINDOW",
         },
         "quantiles": list(QUANTILES),
         "purge_gap": METADATA.purge_gap,
@@ -869,6 +882,7 @@ def train(args) -> dict[str, Any]:
             ),
             "manifest_verified": source_manifest is not None,
             "integrity_gate_passed": dataset_integrity_ok,
+            "executable_integrity": executable_integrity,
             "export_git_commit": (
                 source_manifest.get("git_commit")
                 if source_manifest is not None

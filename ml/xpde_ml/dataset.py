@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 from .contracts import HORIZONS
 
-FEATURE_VERSION = "goldm-m5-v3"
+FEATURE_VERSION = "goldm-m5-v4"
 FEATURE_COLUMNS = (
     "return_1",
     "return_3",
@@ -21,7 +22,11 @@ FEATURE_COLUMNS = (
     "upper_wick",
     "lower_wick",
     "volume_z24",
-    "spread_pct",
+    "spread_close_pct",
+    "spread_median_24_pct",
+    "spread_q75_24_pct",
+    "spread_q90_24_pct",
+    "spread_atr_ratio",
     "hour_sin",
     "hour_cos",
     "weekday_sin",
@@ -45,8 +50,8 @@ METADATA = DatasetMetadata(
 )
 
 BARRIER_HORIZON = 3
-BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v2"
-EXECUTABLE_SIDE_CONTRACT_ID = "bid-entry-exit-long-ask-exit-short-v1"
+BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v3"
+EXECUTABLE_SIDE_CONTRACT_ID = "bid-entry-exit-long-ask-exit-short-tick-sequence-v2"
 BARRIER_TP_ATR_MULTIPLIER = 1.25
 BARRIER_SL_ATR_MULTIPLIER = 1.0
 BARRIER_CLASS = {
@@ -105,8 +110,18 @@ def engineer_features(frame):
     volume_mean = volume.rolling(24).mean()
     volume_std = volume.rolling(24).std().replace(0.0, np.nan)
     result["volume_z24"] = (volume - volume_mean) / volume_std
-    result["spread_usd"] = result.get("spread_usd", 0.0)
-    result["spread_pct"] = result["spread_usd"].astype(float) / close
+    if {"ask_close", "bid_close"}.issubset(result.columns):
+        result["spread_usd"] = (
+            result["ask_close"].astype(float) - result["bid_close"].astype(float)
+        )
+    else:
+        result["spread_usd"] = result.get("spread_usd", 0.0)
+    spread = result["spread_usd"].astype(float)
+    result["spread_close_pct"] = spread / close
+    result["spread_median_24_pct"] = spread.rolling(24).median() / close
+    result["spread_q75_24_pct"] = spread.rolling(24).quantile(0.75) / close
+    result["spread_q90_24_pct"] = spread.rolling(24).quantile(0.90) / close
+    result["spread_atr_ratio"] = spread / result["atr_24"].replace(0.0, np.nan)
     hour = result["timestamp"].dt.hour + result["timestamp"].dt.minute / 60.0
     weekday = result["timestamp"].dt.weekday
     result["hour_sin"] = np.sin(2 * np.pi * hour / 24)
@@ -153,6 +168,8 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
     barrier_short_outcome: list[str | None] = []
     barrier_long_class: list[float] = []
     barrier_short_class: list[float] = []
+    barrier_long_first_touch_time: list[float] = []
+    barrier_short_first_touch_time: list[float] = []
     mfe_long: list[float] = []
     mae_long: list[float] = []
     mfe_short: list[float] = []
@@ -164,8 +181,29 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
         target: float,
         stop: float,
         side: str,
-    ) -> str:
+    ) -> tuple[str, int | None]:
         for _, future_bar in future.iterrows():
+            raw_path = future_bar.get("executable_tick_path_json")
+            if isinstance(raw_path, str) and raw_path.strip():
+                try:
+                    path = json.loads(raw_path)
+                except json.JSONDecodeError:
+                    path = []
+                for tick in path:
+                    if not isinstance(tick, list) or len(tick) < 3:
+                        continue
+                    time_msc = int(tick[0])
+                    price = float(tick[1] if side == "long" else tick[2])
+                    if side == "long":
+                        if price >= target:
+                            return "TP_FIRST", time_msc
+                        if price <= stop:
+                            return "SL_FIRST", time_msc
+                    else:
+                        if price <= target:
+                            return "TP_FIRST", time_msc
+                        if price >= stop:
+                            return "SL_FIRST", time_msc
             if side == "long":
                 high = float(future_bar["bid_high"])
                 low = float(future_bar["bid_low"])
@@ -175,12 +213,12 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
                 low = float(future_bar["ask_low"])
                 tp_hit, sl_hit = low <= target, high >= stop
             if tp_hit and sl_hit:
-                return "AMBIGUOUS_SAME_BAR"
+                return "AMBIGUOUS_SAME_BAR", None
             if tp_hit:
-                return "TP_FIRST"
+                return "TP_FIRST", None
             if sl_hit:
-                return "SL_FIRST"
-        return "NO_HIT_BEFORE_EXPIRY"
+                return "SL_FIRST", None
+        return "NO_HIT_BEFORE_EXPIRY", None
 
     for index, row in result.iterrows():
         future = result.iloc[index + 1 : index + 1 + barrier_horizon]
@@ -191,6 +229,8 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
             barrier_short_outcome.append(None)
             barrier_long_class.append(np.nan)
             barrier_short_class.append(np.nan)
+            barrier_long_first_touch_time.append(np.nan)
+            barrier_short_first_touch_time.append(np.nan)
             mfe_long.append(np.nan)
             mae_long.append(np.nan)
             mfe_short.append(np.nan)
@@ -198,13 +238,13 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
             continue
 
         prices = barrier_prices(start, atr)
-        long_outcome = classify_barrier(
+        long_outcome, long_touch_time = classify_barrier(
             future,
             target=prices["target_price_long"],
             stop=prices["stop_price_long"],
             side="long",
         )
-        short_outcome = classify_barrier(
+        short_outcome, short_touch_time = classify_barrier(
             future,
             target=prices["target_price_short"],
             stop=prices["stop_price_short"],
@@ -214,6 +254,12 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
         barrier_short_outcome.append(short_outcome)
         barrier_long_class.append(BARRIER_CLASS.get(long_outcome, np.nan))
         barrier_short_class.append(BARRIER_CLASS.get(short_outcome, np.nan))
+        barrier_long_first_touch_time.append(
+            float(long_touch_time) if long_touch_time is not None else np.nan
+        )
+        barrier_short_first_touch_time.append(
+            float(short_touch_time) if short_touch_time is not None else np.nan
+        )
         future_bid_high = float(future["bid_high"].max())
         future_bid_low = float(future["bid_low"].min())
         future_ask_high = float(future["ask_high"].max())
@@ -229,6 +275,8 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
     result["barrier_short_outcome"] = barrier_short_outcome
     result["barrier_long_class"] = barrier_long_class
     result["barrier_short_class"] = barrier_short_class
+    result["barrier_long_first_touch_time_msc"] = barrier_long_first_touch_time
+    result["barrier_short_first_touch_time_msc"] = barrier_short_first_touch_time
     result["mfe_long_usd"] = mfe_long
     result["mae_long_usd"] = mae_long
     result["mfe_short_usd"] = mfe_short
