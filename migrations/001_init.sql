@@ -76,6 +76,52 @@ CREATE TABLE IF NOT EXISTS market_tick_paths (
     PRIMARY KEY(symbol, timeframe, timestamp)
 );
 
+CREATE TABLE IF NOT EXISTS market_backfill_staging (
+    import_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    tick_volume REAL NOT NULL,
+    bid_open REAL NOT NULL,
+    bid_high REAL NOT NULL,
+    bid_low REAL NOT NULL,
+    bid_close REAL NOT NULL,
+    ask_open REAL NOT NULL,
+    ask_high REAL NOT NULL,
+    ask_low REAL NOT NULL,
+    ask_close REAL NOT NULL,
+    executable_tick_count INTEGER NOT NULL CHECK(executable_tick_count > 0),
+    first_tick_msc INTEGER NOT NULL,
+    last_tick_msc INTEGER NOT NULL CHECK(last_tick_msc >= first_tick_msc),
+    tick_path_json TEXT NOT NULL,
+    path_point_count INTEGER NOT NULL CHECK(path_point_count > 0),
+    provider TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(import_id, symbol, timeframe, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_backfill_staging_created
+    ON market_backfill_staging(created_at);
+
+CREATE TABLE IF NOT EXISTS market_backfill_import_chunks (
+    import_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL CHECK(chunk_index >= 0),
+    total_chunks INTEGER NOT NULL CHECK(
+        total_chunks > 0 AND chunk_index < total_chunks
+    ),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(import_id, symbol, timeframe, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_backfill_import_chunks_created
+    ON market_backfill_import_chunks(created_at);
+
 CREATE TABLE IF NOT EXISTS feature_snapshots (
     id TEXT PRIMARY KEY,
     symbol TEXT NOT NULL,
@@ -109,6 +155,8 @@ CREATE TABLE IF NOT EXISTS decision_proposal_instances (
     proposal_json TEXT NOT NULL,
     evidence_eligible INTEGER NOT NULL DEFAULT 0,
     evidence_source TEXT NOT NULL DEFAULT 'DIAGNOSTIC',
+    settlement_status TEXT NOT NULL DEFAULT 'PENDING',
+    settlement_reason TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -137,7 +185,8 @@ CREATE TABLE IF NOT EXISTS decision_proposal_outcomes (
             'TP_FIRST',
             'SL_FIRST',
             'NO_HIT_BEFORE_EXPIRY',
-            'AMBIGUOUS_SAME_BAR'
+            'AMBIGUOUS_SAME_BAR',
+            'AMBIGUOUS_SAME_TIMESTAMP'
         )
     ),
     first_touch_time_msc INTEGER,
@@ -186,6 +235,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     proposal_json TEXT NOT NULL,
     is_duplicate INTEGER NOT NULL DEFAULT 0,
     settlement_status TEXT NOT NULL DEFAULT 'PENDING',
+    settlement_reason TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -204,7 +254,8 @@ CREATE TABLE IF NOT EXISTS prediction_horizon_outcomes (
             'TP_FIRST',
             'SL_FIRST',
             'NO_HIT_BEFORE_EXPIRY',
-            'AMBIGUOUS_SAME_BAR'
+            'AMBIGUOUS_SAME_BAR',
+            'AMBIGUOUS_SAME_TIMESTAMP'
         )
     ),
     barrier_long_outcome TEXT CHECK(
@@ -212,7 +263,8 @@ CREATE TABLE IF NOT EXISTS prediction_horizon_outcomes (
             'TP_FIRST',
             'SL_FIRST',
             'NO_HIT_BEFORE_EXPIRY',
-            'AMBIGUOUS_SAME_BAR'
+            'AMBIGUOUS_SAME_BAR',
+            'AMBIGUOUS_SAME_TIMESTAMP'
         )
     ),
     barrier_short_outcome TEXT CHECK(
@@ -220,7 +272,8 @@ CREATE TABLE IF NOT EXISTS prediction_horizon_outcomes (
             'TP_FIRST',
             'SL_FIRST',
             'NO_HIT_BEFORE_EXPIRY',
-            'AMBIGUOUS_SAME_BAR'
+            'AMBIGUOUS_SAME_BAR',
+            'AMBIGUOUS_SAME_TIMESTAMP'
         )
     ),
     error_metrics_json TEXT NOT NULL,
@@ -240,7 +293,8 @@ CREATE TABLE IF NOT EXISTS prediction_proposal_outcomes (
             'TP_FIRST',
             'SL_FIRST',
             'NO_HIT_BEFORE_EXPIRY',
-            'AMBIGUOUS_SAME_BAR'
+            'AMBIGUOUS_SAME_BAR',
+            'AMBIGUOUS_SAME_TIMESTAMP'
         )
     ),
     settled_at TEXT NOT NULL,

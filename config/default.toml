@@ -20,7 +20,7 @@ minimum_lot = 0.1
 maximum_lot = 100.0
 minimum_price_fluctuation = 0.01
 advertised_min_spread_usd = 0.24
-commission_usd_per_lot = 0.0
+commission_account_currency_per_lot = 0.0
 expected_exit_spread_usd = 0.34
 
 [model_health]
@@ -39,7 +39,7 @@ recover_after_healthy_windows = 3
 warming_up_forces_wait = true
 
 [market_session]
-timezone = "broker"
+timezone = "fixed_broker_utc_offset"
 monday = [["01:00", "23:59"]]
 tuesday = [["01:00", "23:59"]]
 wednesday = [["01:00", "23:59"]]
@@ -61,6 +61,7 @@ exit_spread_min_samples = 12
 exit_spread_quantile = 0.90
 exit_spread_window = 24
 maximum_decision_age_seconds = 60
+maximum_forecast_generation_delay_ms = 10000
 
 [policy.sniper]
 max_spread_usd = 0.55
@@ -74,3 +75,4 @@ exit_spread_min_samples = 12
 exit_spread_quantile = 0.90
 exit_spread_window = 24
 maximum_decision_age_seconds = 120
+maximum_forecast_generation_delay_ms = 10000

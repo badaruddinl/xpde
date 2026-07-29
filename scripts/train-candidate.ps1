@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
-$barsCsv = Join-Path $repoRoot "data\goldm_m5.csv"
+$barsCsv = Join-Path $repoRoot "data\goldm_m5.csv.gz"
 
 Push-Location $repoRoot
 try {

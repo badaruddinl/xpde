@@ -27,6 +27,7 @@ from .dataset import (
     build_training_frame,
     postprocess_quantiles,
 )
+from .dataset_files import dataset_manifest_path
 
 
 def _training_environment() -> dict[str, Any]:
@@ -344,7 +345,7 @@ def train(args) -> dict[str, Any]:
     if args.output is None:
         args.output = Path("artifacts/catboost/runs") / model_id
     source_sha256 = hashlib.sha256(args.bars_csv.read_bytes()).hexdigest()
-    source_manifest_path = args.bars_csv.with_suffix(".manifest.json")
+    source_manifest_path = dataset_manifest_path(args.bars_csv)
     source_manifest = None
     if source_manifest_path.is_file():
         source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
@@ -660,13 +661,18 @@ def train(args) -> dict[str, Any]:
                 outcome_counts.get("NO_HIT_BEFORE_EXPIRY", 0)
             ),
             "ambiguous_same_bar": float(
-                outcome_counts.get("AMBIGUOUS_SAME_BAR", 0)
+        outcome_counts.get("AMBIGUOUS_SAME_BAR", 0)
+        + outcome_counts.get("AMBIGUOUS_SAME_TIMESTAMP", 0)
             ),
             "no_hit_rate": float(
                 outcome_counts.get("NO_HIT_BEFORE_EXPIRY", 0) / labelled_count
             ),
             "ambiguity_rate": float(
-                outcome_counts.get("AMBIGUOUS_SAME_BAR", 0) / labelled_count
+        (
+            outcome_counts.get("AMBIGUOUS_SAME_BAR", 0)
+            + outcome_counts.get("AMBIGUOUS_SAME_TIMESTAMP", 0)
+        )
+        / labelled_count
             ),
         }
         barrier_calibration[side] = calibrator_payload

@@ -9,11 +9,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime, time as datetime_time, timedelta
+from datetime import UTC, date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any
 import tomllib
 
+from .backfill_transport import post_backfill_payloads
 from .baseline import forecast_from_snapshot
 from .executable_bars import (
     CHART_MODE_BID,
@@ -27,6 +28,7 @@ from .time_utils import BrokerClock, environment_integer
 SYMBOL = "GOLDm#"
 TIMEFRAME = "M5"
 MAX_TICK_AGE_MS = 10_000
+MAX_FORECAST_GENERATION_DELAY_MS = 10_000
 
 
 @dataclass(frozen=True)
@@ -57,9 +59,15 @@ def load_market_calendar(config_path: str) -> MarketCalendar:
     }
     try:
         config = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
-        raw = config.get("market_session", {})
-    except (OSError, tomllib.TOMLDecodeError):
-        raw = {}
+    except OSError as error:
+        raise RuntimeError(f"market-session config is unavailable: {config_path}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError(f"market-session config is invalid: {config_path}") from error
+    raw = config.get("market_session", {})
+    if raw.get("timezone") != "fixed_broker_utc_offset":
+        raise RuntimeError(
+            "market_session.timezone must be 'fixed_broker_utc_offset'"
+        )
     sessions: dict[int, tuple[tuple[datetime_time, datetime_time], ...]] = {}
     for name, day in names.items():
         configured = raw.get(name)
@@ -77,9 +85,15 @@ def load_market_calendar(config_path: str) -> MarketCalendar:
         for value in os.getenv("XPDE_MARKET_CLOSED_DATES", "").split(",")
         if value.strip()
     }
+    closed_dates = configured_closed | environment_closed
+    for value in closed_dates:
+        try:
+            date.fromisoformat(value)
+        except ValueError as error:
+            raise RuntimeError(f"invalid market closed date: {value}") from error
     return MarketCalendar(
         sessions=sessions,
-        closed_dates=frozenset(configured_closed | environment_closed),
+        closed_dates=frozenset(closed_dates),
     )
 
 
@@ -96,7 +110,6 @@ def infer_market_status(
         return "BRIDGE_DISCONNECTED"
     if not trade_mode_enabled:
         return "MARKET_CLOSED"
-    market_time = now_utc + timedelta(hours=market_utc_offset_hours)
     calendar = calendar or MarketCalendar(
         sessions={
             day: ((datetime_time(1, 0), datetime_time(23, 59, 59)),)
@@ -104,15 +117,43 @@ def infer_market_status(
         },
         closed_dates=frozenset(),
     )
-    if market_time.date().isoformat() in calendar.closed_dates:
-        return "MARKET_CLOSED"
-    sessions = calendar.sessions.get(market_time.weekday(), ())
-    within_session = any(start <= market_time.time() <= end for start, end in sessions)
-    if not within_session:
+    if market_session_open_until(
+        now_utc=now_utc,
+        market_utc_offset_hours=market_utc_offset_hours,
+        calendar=calendar,
+    ) is None:
         return "MARKET_CLOSED"
     if absolute_tick_age_ms > MAX_TICK_AGE_MS:
         return "FEED_STALE"
     return "OPEN"
+
+
+def market_session_open_until(
+    *,
+    now_utc: datetime,
+    market_utc_offset_hours: int,
+    calendar: MarketCalendar,
+) -> datetime | None:
+    """Return the UTC end of the broker session containing ``now_utc``."""
+
+    market_time = now_utc + timedelta(hours=market_utc_offset_hours)
+    if market_time.date().isoformat() in calendar.closed_dates:
+        return None
+    candidates: list[tuple[datetime, datetime]] = []
+    for day_delta in (-1, 0):
+        local_day = market_time.date() + timedelta(days=day_delta)
+        if local_day.isoformat() in calendar.closed_dates:
+            continue
+        for start, end in calendar.sessions.get(local_day.weekday(), ()):
+            local_start = datetime.combine(local_day, start, tzinfo=UTC)
+            local_end_day = local_day + timedelta(days=1) if end < start else local_day
+            local_end = datetime.combine(local_end_day, end, tzinfo=UTC)
+            candidates.append((local_start, local_end))
+    local_now = market_time
+    for local_start, local_end in candidates:
+        if local_start <= local_now <= local_end:
+            return local_end - timedelta(hours=market_utc_offset_hours)
+    return None
 
 
 class PayloadRejected(RuntimeError):
@@ -250,18 +291,27 @@ def build_snapshot(
     absolute_tick_age_ms = max(0, signed_tick_age_ms)
     terminal = mt5.terminal_info()
     terminal_connected = bool(terminal and getattr(terminal, "connected", False))
+    market_utc_offset_hours = environment_integer(
+        "MT5_MARKET_UTC_OFFSET_HOURS",
+        clock.offset_hours,
+    )
+    if not -23 <= market_utc_offset_hours <= 23:
+        raise RuntimeError("MT5_MARKET_UTC_OFFSET_HOURS must be between -23 and +23")
+    market_calendar = load_market_calendar(
+        os.getenv("XPDE_CONFIG_PATH", "config/default.toml")
+    )
     market_status = infer_market_status(
         now_utc=reference_now,
         absolute_tick_age_ms=absolute_tick_age_ms,
         terminal_connected=terminal_connected,
-        market_utc_offset_hours=environment_integer(
-            "MT5_MARKET_UTC_OFFSET_HOURS",
-            clock.offset_hours,
-        ),
-        calendar=load_market_calendar(
-            os.getenv("XPDE_CONFIG_PATH", "config/default.toml")
-        ),
+        market_utc_offset_hours=market_utc_offset_hours,
+        calendar=market_calendar,
         trade_mode_enabled=trade_mode_enabled,
+    )
+    session_open_until = market_session_open_until(
+        now_utc=reference_now,
+        market_utc_offset_hours=market_utc_offset_hours,
+        calendar=market_calendar,
     )
     chart_mode = symbol_chart_mode(mt5, symbol)
     missing_flags: list[str] = []
@@ -358,7 +408,6 @@ def build_snapshot(
             "digits": int(symbol.digits),
             "chart_mode": chart_mode,
             "quote_currency": str(getattr(symbol, "currency_profit", "") or "USD"),
-            "pnl_currency": str(account.currency),
             "symbol_profit_currency": str(
                 getattr(symbol, "currency_profit", "") or "USD"
             ),
@@ -391,6 +440,9 @@ def build_snapshot(
             "absolute_tick_age_ms": absolute_tick_age_ms,
             "transport_tick_age_ms": max(0, transport_tick_age_ms),
             "market_status": market_status,
+            "market_session_open_until": (
+                session_open_until.isoformat() if session_open_until else None
+            ),
             "missing_flags": missing_flags,
             "reason_codes": (
                 [f"UTC_PROVIDER_OVERRIDE_HOURS_{clock.offset_hours}"]
@@ -474,7 +526,11 @@ def fetch_catchup_bars(
             end_epoch=max(float(rate["time"]) for rate in rates) + 300.0,
             clock=clock,
         )
-        bars = overlay_executable_bars(bars, executable)
+        bars = overlay_executable_bars(
+            bars,
+            executable,
+            include_tick_path=True,
+        )
     return sorted(
         {
             bar["timestamp"]: bar
@@ -493,25 +549,32 @@ def post_catchup(
     *,
     clock: BrokerClock,
 ) -> None:
-    for start in range(0, len(bars), 5_000):
-        post_payload(
-            api_url,
-            {
-                "symbol": SYMBOL,
-                "timeframe": TIMEFRAME,
-                "provider": "MetaTrader5",
-                "broker_offset_hours": clock.offset_hours,
-                "reset": False,
-                "bars": bars[start : start + 5_000],
-            },
-            expected_status=201,
-        )
+    post_backfill_payloads(
+        api_url,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        provider="MetaTrader5",
+        broker_offset_hours=clock.offset_hours,
+        bars=bars,
+        reset=False,
+    )
 
 
 def completed_bar_distance(earlier: str, later: str) -> int:
     earlier_time = datetime.fromisoformat(earlier.replace("Z", "+00:00"))
     later_time = datetime.fromisoformat(later.replace("Z", "+00:00"))
     return max(0, int((later_time - earlier_time).total_seconds() // 300))
+
+
+def forecast_generation_delay_ms(
+    origin_bar_timestamp: str,
+    *,
+    now_utc: datetime | None = None,
+) -> int:
+    origin = datetime.fromisoformat(origin_bar_timestamp.replace("Z", "+00:00"))
+    expected = origin + timedelta(minutes=5)
+    reference = now_utc or datetime.now(UTC)
+    return max(0, int((reference - expected).total_seconds() * 1000))
 
 
 def main() -> None:
@@ -625,6 +688,8 @@ def main() -> None:
                     and not startup_had_gap
                     and startup_snapshot["data_quality"]["market_status"] == "OPEN"
                     and not startup_snapshot["data_quality"]["missing_flags"]
+                    and forecast_generation_delay_ms(latest_completed_bar)
+                    <= MAX_FORECAST_GENERATION_DELAY_MS
                 ):
                     if (
                         pending_startup_forecast is None
@@ -643,6 +708,17 @@ def main() -> None:
                     )
                     print(
                         f"XPDE startup forecast posted for {latest_completed_bar}",
+                        flush=True,
+                    )
+                elif (
+                    not args.snapshot_only
+                    and not startup_had_gap
+                    and forecast_generation_delay_ms(latest_completed_bar)
+                    > MAX_FORECAST_GENERATION_DELAY_MS
+                ):
+                    print(
+                        "XPDE skipped a late startup forecast and will wait for "
+                        "the next completed M5 candle",
                         flush=True,
                     )
                 break
@@ -747,6 +823,19 @@ def main() -> None:
                     and not snapshot["data_quality"]["missing_flags"]
                     and latest_bar != last_forecast_bar
                 ):
+                    if (
+                        forecast_generation_delay_ms(latest_bar)
+                        > MAX_FORECAST_GENERATION_DELAY_MS
+                    ):
+                        last_forecast_bar = latest_bar
+                        pending_forecast = None
+                        pending_forecast_bar = None
+                        print(
+                            "XPDE skipped a late live forecast and will wait for "
+                            "the next completed M5 candle",
+                            flush=True,
+                        )
+                        continue
                     if pending_forecast is None or pending_forecast_bar != latest_bar:
                         pending_forecast = (
                             candidate.forecast(snapshot)

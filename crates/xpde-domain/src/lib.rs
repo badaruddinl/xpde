@@ -5,8 +5,9 @@ use uuid::Uuid;
 
 pub const SUPPORTED_SYMBOL: &str = "GOLDm#";
 pub const SUPPORTED_TIMEFRAME: &str = "M5";
-pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v4";
-pub const EXECUTABLE_SIDE_CONTRACT_ID: &str = "bid-entry-exit-long-ask-exit-short-tick-sequence-v3";
+pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v5";
+pub const EXECUTABLE_SIDE_CONTRACT_ID: &str =
+    "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4";
 pub const BARRIER_HORIZON_BARS: u32 = 3;
 pub const M5_BAR_MINUTES: i64 = 5;
 
@@ -152,6 +153,14 @@ impl MarketBar {
             .zip(actual)
             .all(|(expected, actual)| expected.is_some_and(|value| (value - actual).abs() <= 1e-8))
     }
+
+    pub fn has_complete_tick_coverage(&self, minimum_ratio: f64) -> bool {
+        minimum_ratio.is_finite()
+            && (0.0..=1.0).contains(&minimum_ratio)
+            && self.tick_volume.is_finite()
+            && self.tick_volume > 0.0
+            && self.executable_tick_count as f64 / self.tick_volume >= minimum_ratio
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,8 +270,6 @@ pub struct SymbolSpec {
     #[serde(default)]
     pub quote_currency: String,
     #[serde(default)]
-    pub pnl_currency: String,
-    #[serde(default)]
     pub symbol_profit_currency: String,
     #[serde(default)]
     pub calculated_pnl_currency: String,
@@ -292,6 +299,8 @@ pub struct DataQuality {
     pub transport_tick_age_ms: u64,
     #[serde(default)]
     pub market_status: MarketStatus,
+    #[serde(default)]
+    pub market_session_open_until: Option<DateTime<Utc>>,
     pub missing_flags: Vec<String>,
     pub reason_codes: Vec<String>,
 }
@@ -365,6 +374,11 @@ impl MarketSnapshot {
         }
         if !(self.bid.is_finite() && self.ask.is_finite() && self.ask > self.bid) {
             return Err(ContractError::InvalidQuote);
+        }
+        if self.data_quality.market_status == MarketStatus::Open
+            && self.data_quality.market_session_open_until.is_none()
+        {
+            return Err(ContractError::MissingMarketSessionBoundary);
         }
         if self.account.leverage == 0 {
             return Err(ContractError::InvalidLeverage);
@@ -576,8 +590,6 @@ pub struct DecisionProposal {
     #[serde(default)]
     pub quote_currency: String,
     #[serde(default)]
-    pub pnl_currency: String,
-    #[serde(default)]
     pub symbol_profit_currency: String,
     #[serde(default)]
     pub calculated_pnl_currency: String,
@@ -633,6 +645,10 @@ pub struct DecisionProposal {
     #[serde(default)]
     pub maximum_decision_age_seconds: u64,
     #[serde(default)]
+    pub forecast_generation_delay_ms: u64,
+    #[serde(default)]
+    pub maximum_forecast_generation_delay_ms: u64,
+    #[serde(default)]
     pub model_health_status: String,
     #[serde(default)]
     pub evidence_eligible: bool,
@@ -651,7 +667,7 @@ pub struct DecisionPolicy {
     pub cost_model_id: String,
     pub max_tick_age_ms: u64,
     pub max_spread_usd: f64,
-    pub commission_usd_per_lot: f64,
+    pub commission_account_currency_per_lot: f64,
     pub expected_exit_spread_usd: f64,
     pub slippage_buffer_usd: f64,
     pub min_direction_probability: f64,
@@ -665,6 +681,7 @@ pub struct DecisionPolicy {
     pub exit_spread_quantile: f64,
     pub exit_spread_window: usize,
     pub maximum_decision_age_seconds: u64,
+    pub maximum_forecast_generation_delay_ms: u64,
 }
 
 impl DecisionPolicy {
@@ -675,7 +692,7 @@ impl DecisionPolicy {
             cost_model_id: "executable-side-v1".to_owned(),
             max_tick_age_ms: 10_000,
             max_spread_usd: 0.80,
-            commission_usd_per_lot: 0.0,
+            commission_account_currency_per_lot: 0.0,
             expected_exit_spread_usd: 0.34,
             slippage_buffer_usd: 0.08,
             min_direction_probability: 0.56,
@@ -689,6 +706,7 @@ impl DecisionPolicy {
             exit_spread_quantile: 0.90,
             exit_spread_window: 24,
             maximum_decision_age_seconds: 60,
+            maximum_forecast_generation_delay_ms: 10_000,
         }
     }
 
@@ -699,7 +717,7 @@ impl DecisionPolicy {
             cost_model_id: "executable-side-v1".to_owned(),
             max_tick_age_ms: 5_000,
             max_spread_usd: 0.55,
-            commission_usd_per_lot: 0.0,
+            commission_account_currency_per_lot: 0.0,
             expected_exit_spread_usd: 0.34,
             slippage_buffer_usd: 0.08,
             min_direction_probability: 0.64,
@@ -713,6 +731,7 @@ impl DecisionPolicy {
             exit_spread_quantile: 0.90,
             exit_spread_window: 24,
             maximum_decision_age_seconds: 120,
+            maximum_forecast_generation_delay_ms: 10_000,
         }
     }
 }
@@ -732,6 +751,12 @@ pub fn decide_at(
     decision_time: DateTime<Utc>,
 ) -> DecisionProposal {
     let generated_at = forecast.generated_at;
+    let expected_generation_time =
+        forecast.origin_bar_timestamp + chrono::Duration::minutes(M5_BAR_MINUTES);
+    let forecast_generation_delay_ms = generated_at
+        .signed_duration_since(expected_generation_time)
+        .num_milliseconds()
+        .max(0) as u64;
     let fallback_valid_until = generated_at + chrono::Duration::minutes(M5_BAR_MINUTES);
     let fallback_matures_at = generated_at
         + chrono::Duration::minutes((BARRIER_HORIZON_BARS as i64 + 1) * M5_BAR_MINUTES);
@@ -743,7 +768,6 @@ pub fn decide_at(
         cost_model_id: policy.cost_model_id.clone(),
         account_currency: snapshot.account.currency.clone(),
         quote_currency: snapshot.symbol_spec.quote_currency.clone(),
-        pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
         symbol_profit_currency: snapshot.symbol_spec.symbol_profit_currency.clone(),
         calculated_pnl_currency: snapshot.symbol_spec.calculated_pnl_currency.clone(),
         pnl_calculation_source: snapshot.symbol_spec.pnl_calculation_source.clone(),
@@ -768,7 +792,7 @@ pub fn decide_at(
         exit_spread_quantile: policy.exit_spread_quantile,
         exit_spread_window: policy.exit_spread_window,
         slippage_assumption: policy.slippage_buffer_usd,
-        commission: policy.commission_usd_per_lot * snapshot.symbol_spec.volume_min,
+        commission: policy.commission_account_currency_per_lot * snapshot.symbol_spec.volume_min,
         decision_age_seconds: decision_time
             .signed_duration_since(generated_at)
             .num_seconds()
@@ -778,6 +802,8 @@ pub fn decide_at(
             .num_seconds()
             .max(0) as u64,
         maximum_decision_age_seconds: policy.maximum_decision_age_seconds,
+        forecast_generation_delay_ms,
+        maximum_forecast_generation_delay_ms: policy.maximum_forecast_generation_delay_ms,
         model_health_status: String::new(),
         evidence_eligible: false,
         evidence_source: "DIAGNOSTIC".to_owned(),
@@ -787,12 +813,12 @@ pub fn decide_at(
         risk_warnings: Vec::new(),
     };
 
-    if snapshot.validate().is_err() {
-        return no_prediction(
-            "CONTRACT_INVALID",
-            fallback_valid_until,
-            fallback_matures_at,
-        );
+    if let Err(error) = snapshot.validate() {
+        let reason = match error {
+            ContractError::MissingMarketSessionBoundary => "MARKET_SESSION_BOUNDARY_UNAVAILABLE",
+            _ => "CONTRACT_INVALID",
+        };
+        return no_prediction(reason, fallback_valid_until, fallback_matures_at);
     }
     if forecast.validate().is_err() {
         return no_prediction(
@@ -857,6 +883,30 @@ pub fn decide_at(
     }
     if forecast.drift_detected {
         return no_prediction("DRIFT_DETECTED", decision_valid_until, outcome_matures_at);
+    }
+    if forecast_generation_delay_ms > policy.maximum_forecast_generation_delay_ms {
+        return no_prediction(
+            "FORECAST_GENERATION_LATE",
+            decision_valid_until,
+            outcome_matures_at,
+        );
+    }
+    match snapshot.data_quality.market_session_open_until {
+        None => {
+            return no_prediction(
+                "MARKET_SESSION_BOUNDARY_UNAVAILABLE",
+                decision_valid_until,
+                outcome_matures_at,
+            );
+        }
+        Some(session_end) if session_end < outcome_matures_at => {
+            return no_prediction(
+                "HORIZON_CROSSES_MARKET_CLOSE",
+                decision_valid_until,
+                outcome_matures_at,
+            );
+        }
+        Some(_) => {}
     }
 
     if forecast.calibration.observed_coverage < policy.min_coverage
@@ -948,7 +998,7 @@ pub fn decide_at(
     let same_currency = snapshot
         .account
         .currency
-        .eq_ignore_ascii_case(&snapshot.symbol_spec.pnl_currency);
+        .eq_ignore_ascii_case(&snapshot.symbol_spec.symbol_profit_currency);
     let (pnl_factor, pnl_calculation_source) = if let Some(factor) = authoritative_factor {
         (
             Some(factor),
@@ -964,11 +1014,11 @@ pub fn decide_at(
     };
     let pnl_factor_value = pnl_factor.unwrap_or(0.0);
     let slippage_cost = policy.slippage_buffer_usd * pnl_factor_value * reference_lot;
-    let commission_cost = policy.commission_usd_per_lot * reference_lot;
+    let commission_cost = policy.commission_account_currency_per_lot * reference_lot;
     let median_move_after_cost =
         median_move_price * pnl_factor_value * reference_lot - slippage_cost - commission_cost;
     let non_spread_cost_price = policy.slippage_buffer_usd
-        + policy.commission_usd_per_lot / pnl_factor_value.max(f64::EPSILON);
+        + policy.commission_account_currency_per_lot / pnl_factor_value.max(f64::EPSILON);
     let (remaining_reward_price, remaining_risk_price, entry_inside_barrier) = match selected_side {
         DecisionAction::Long => (
             target_price - reference_entry_price,
@@ -1096,7 +1146,6 @@ pub fn decide_at(
         cost_model_id: policy.cost_model_id.clone(),
         account_currency: snapshot.account.currency.clone(),
         quote_currency: snapshot.symbol_spec.quote_currency.clone(),
-        pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
         symbol_profit_currency: snapshot.symbol_spec.symbol_profit_currency.clone(),
         calculated_pnl_currency: snapshot.symbol_spec.calculated_pnl_currency.clone(),
         pnl_calculation_source,
@@ -1125,6 +1174,8 @@ pub fn decide_at(
         decision_age_seconds,
         remaining_horizon_seconds,
         maximum_decision_age_seconds: policy.maximum_decision_age_seconds,
+        forecast_generation_delay_ms,
+        maximum_forecast_generation_delay_ms: policy.maximum_forecast_generation_delay_ms,
         model_health_status: String::new(),
         evidence_eligible: false,
         evidence_source: "DIAGNOSTIC".to_owned(),
@@ -1166,6 +1217,8 @@ pub enum ContractError {
     UnsupportedTimeframe(String),
     #[error("invalid bid/ask quote")]
     InvalidQuote,
+    #[error("open market snapshot requires an authoritative session boundary")]
+    MissingMarketSessionBoundary,
     #[error("invalid account leverage")]
     InvalidLeverage,
     #[error("invalid symbol specification")]
@@ -1280,7 +1333,6 @@ mod tests {
                 margin_per_lot_sell: Some(3.34),
                 chart_mode: ChartMode::Bid,
                 quote_currency: "USD".to_owned(),
-                pnl_currency: "USD".to_owned(),
                 symbol_profit_currency: "USD".to_owned(),
                 calculated_pnl_currency: "USD".to_owned(),
                 profit_per_price_unit_per_lot_buy: Some(1.0),
@@ -1297,6 +1349,7 @@ mod tests {
                 absolute_tick_age_ms: 100,
                 transport_tick_age_ms: 100,
                 market_status: MarketStatus::Open,
+                market_session_open_until: Some(Utc::now() + chrono::Duration::hours(8)),
                 missing_flags: Vec::new(),
                 reason_codes: Vec::new(),
             },
@@ -1505,7 +1558,8 @@ mod tests {
         let forecast = sample_forecast();
         let mut snapshot = sample_snapshot();
         snapshot.account.currency = "IDR".to_owned();
-        snapshot.symbol_spec.pnl_currency = "USD".to_owned();
+        snapshot.symbol_spec.calculated_pnl_currency = "IDR".to_owned();
+        snapshot.symbol_spec.symbol_profit_currency = "USD".to_owned();
         snapshot.symbol_spec.profit_per_price_unit_per_lot_buy = None;
         snapshot.symbol_spec.profit_per_price_unit_per_lot_sell = None;
         snapshot.symbol_spec.pnl_calculation_source = "UNAVAILABLE".to_owned();
@@ -1518,6 +1572,77 @@ mod tests {
                 .reason_codes
                 .contains(&"CURRENCY_CONVERSION_UNAVAILABLE".to_owned())
         );
+    }
+
+    #[test]
+    fn late_forecast_generation_is_never_actionable() {
+        let mut forecast = sample_forecast();
+        let snapshot = sample_snapshot();
+        forecast.generated_at = forecast.origin_bar_timestamp
+            + chrono::Duration::minutes(5)
+            + chrono::Duration::seconds(11);
+        let decision = decide_at(
+            &snapshot,
+            &forecast,
+            &DecisionPolicy::scalper(),
+            forecast.generated_at,
+        );
+
+        assert_eq!(decision.action, DecisionAction::NoPrediction);
+        assert_eq!(decision.forecast_generation_delay_ms, 11_000);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"FORECAST_GENERATION_LATE".to_owned())
+        );
+    }
+
+    #[test]
+    fn horizon_crossing_session_end_is_never_actionable() {
+        let forecast = sample_forecast();
+        let mut snapshot = sample_snapshot();
+        snapshot.data_quality.market_session_open_until =
+            Some(forecast.origin_bar_timestamp + chrono::Duration::minutes(19));
+
+        let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+
+        assert_eq!(decision.action, DecisionAction::NoPrediction);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"HORIZON_CROSSES_MARKET_CLOSE".to_owned())
+        );
+    }
+
+    #[test]
+    fn missing_session_boundary_is_never_actionable() {
+        let forecast = sample_forecast();
+        let mut snapshot = sample_snapshot();
+        snapshot.data_quality.market_session_open_until = None;
+
+        assert!(matches!(
+            snapshot.validate(),
+            Err(ContractError::MissingMarketSessionBoundary)
+        ));
+        let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+
+        assert_eq!(decision.action, DecisionAction::NoPrediction);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"MARKET_SESSION_BOUNDARY_UNAVAILABLE".to_owned())
+        );
+    }
+
+    #[test]
+    fn historical_tick_coverage_requires_the_configured_ratio() {
+        let mut bar = sample_snapshot().bars[0].clone();
+        bar.tick_volume = 100.0;
+        bar.executable_tick_count = 94;
+        assert!(!bar.has_complete_tick_coverage(0.95));
+        bar.executable_tick_count = 95;
+        assert!(bar.has_complete_tick_coverage(0.95));
+        assert!(!bar.has_complete_tick_coverage(f64::NAN));
     }
 
     #[test]

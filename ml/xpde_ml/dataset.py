@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import groupby
 import json
 
 from .contracts import HORIZONS
@@ -50,8 +51,10 @@ METADATA = DatasetMetadata(
 )
 
 BARRIER_HORIZON = 3
-BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v4"
-EXECUTABLE_SIDE_CONTRACT_ID = "bid-entry-exit-long-ask-exit-short-tick-sequence-v3"
+BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v5"
+EXECUTABLE_SIDE_CONTRACT_ID = (
+    "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v4"
+)
 BARRIER_TP_ATR_MULTIPLIER = 1.25
 BARRIER_SL_ATR_MULTIPLIER = 1.0
 BARRIER_CLASS = {
@@ -189,21 +192,32 @@ def add_objective_labels(frame, *, barrier_horizon: int = BARRIER_HORIZON):
                     path = json.loads(raw_path)
                 except json.JSONDecodeError:
                     path = []
-                for tick in path:
-                    if not isinstance(tick, list) or len(tick) < 3:
-                        continue
-                    time_msc = int(tick[0])
-                    price = float(tick[1] if side == "long" else tick[2])
-                    if side == "long":
-                        if price >= target:
-                            return "TP_FIRST", time_msc
-                        if price <= stop:
-                            return "SL_FIRST", time_msc
-                    else:
-                        if price <= target:
-                            return "TP_FIRST", time_msc
-                        if price >= stop:
-                            return "SL_FIRST", time_msc
+                normalized = [
+                    (int(tick[0]), float(tick[1]), float(tick[2]))
+                    for tick in path
+                    if isinstance(tick, list) and len(tick) >= 3
+                ]
+                for time_msc, grouped in groupby(
+                    normalized, key=lambda tick: tick[0]
+                ):
+                    prices = [
+                        tick[1] if side == "long" else tick[2]
+                        for tick in grouped
+                    ]
+                    tp_hit = any(
+                        price >= target if side == "long" else price <= target
+                        for price in prices
+                    )
+                    sl_hit = any(
+                        price <= stop if side == "long" else price >= stop
+                        for price in prices
+                    )
+                    if tp_hit and sl_hit:
+                        return "AMBIGUOUS_SAME_TIMESTAMP", time_msc
+                    if tp_hit:
+                        return "TP_FIRST", time_msc
+                    if sl_hit:
+                        return "SL_FIRST", time_msc
             if side == "long":
                 high = float(future_bar["bid_high"])
                 low = float(future_bar["bid_low"])

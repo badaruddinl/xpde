@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import hashlib
 import json
 import os
 import subprocess
-import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .mt5_bridge import SYMBOL, TIMEFRAME, initialize_mt5, load_local_env
+from .backfill_transport import post_backfill_payloads
+from .dataset_files import dataset_manifest_path
 from .executable_bars import (
     collect_executable_bars,
     overlay_executable_bars,
@@ -197,7 +199,7 @@ def write_dataset_manifest(
     chart_mode: str,
 ) -> Path:
     digest = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
-    manifest_path = dataset_path.with_suffix(".manifest.json")
+    manifest_path = dataset_manifest_path(dataset_path)
     manifest = {
         "schema_version": 2,
         "symbol": SYMBOL,
@@ -282,7 +284,12 @@ def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int, str]:
 def write_csv(path: Path, bars: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [field for field in bars[0] if field != "executable_tick_path"]
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    handle = (
+        gzip.open(path, "wt", newline="", encoding="utf-8")
+        if path.suffix.lower() == ".gz"
+        else path.open("w", newline="", encoding="utf-8")
+    )
+    with handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(bars)
@@ -296,47 +303,23 @@ def post_chunks(
     *,
     reset: bool,
 ) -> int:
-    accepted = 0
-    for start in range(0, len(bars), chunk_size):
-        chunk = bars[start : start + chunk_size]
-        payload = {
-            "symbol": SYMBOL,
-            "timeframe": TIMEFRAME,
-            "provider": "MetaTrader5",
-            "broker_offset_hours": broker_offset_hours,
-            "reset": reset and start == 0,
-            "bars": [
-                {
-                    key: value
-                    for key, value in bar.items()
-                    if key
-                    not in {
-                        "spread_usd",
-                        "tick_size",
-                        "chart_mode",
-                        "executable_tick_path_json",
-                    }
-                }
-                for bar in chunk
-            ],
-        }
-        request = urllib.request.Request(
-            api_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.load(response)
-            accepted += int(result["inserted"])
-    return accepted
+    return post_backfill_payloads(
+        api_url,
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        provider="MetaTrader5",
+        broker_offset_hours=broker_offset_hours,
+        bars=bars,
+        reset=reset,
+        max_bars_per_request=chunk_size,
+    )
 
 
 def main() -> None:
     load_local_env()
     parser = argparse.ArgumentParser(description="Backfill completed GOLDm# M5 bars from MT5")
     parser.add_argument("--bars", type=int, default=50_000)
-    parser.add_argument("--output", type=Path, default=Path("data/goldm_m5.csv"))
+    parser.add_argument("--output", type=Path, default=Path("data/goldm_m5.csv.gz"))
     parser.add_argument(
         "--api-url",
         default="http://127.0.0.1:8787/api/v1/market/backfill",
@@ -347,7 +330,12 @@ def main() -> None:
         action="store_true",
         help="do not replace the existing GOLDm# M5 history before importing",
     )
-    parser.add_argument("--chunk-size", type=int, default=2_000)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=250,
+        help="maximum bars per request; byte and tick-point limits are also enforced",
+    )
     args = parser.parse_args()
 
     try:

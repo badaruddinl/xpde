@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from xpde_ml.settle_outcomes import (
+    _is_exact_m5_horizon,
     barrier_outcome,
     settle_with_report,
     tick_sequence_barrier_outcome,
@@ -55,6 +56,19 @@ def test_barrier_outcome_keeps_same_bar_ambiguity_explicit() -> None:
     )
 
 
+def test_price_horizons_require_every_exact_m5_bucket() -> None:
+    origin = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
+    exact = [
+        (origin + timedelta(minutes=minutes)).isoformat()
+        for minutes in (5, 10, 15)
+    ]
+
+    assert _is_exact_m5_horizon(origin, exact)
+    assert not _is_exact_m5_horizon(origin, [exact[0], exact[2]])
+    assert not _is_exact_m5_horizon(origin, [exact[0], exact[0]])
+    assert not _is_exact_m5_horizon(origin, [])
+
+
 def test_barrier_outcome_requires_directional_proposal() -> None:
     proposals = [proposal("NO_PREDICTION", None, None)]
     bars = [{"high": 102.0, "low": 98.0, "close": 101.0}]
@@ -87,6 +101,38 @@ def test_tick_sequence_starts_after_exact_quote_inside_current_candle() -> None:
     )
 
     assert result == ("TP_FIRST", 3_000, 101.2)
+
+
+def test_tick_sequence_does_not_guess_order_inside_one_millisecond() -> None:
+    result = tick_sequence_barrier_outcome(
+        "LONG",
+        101.0,
+        99.0,
+        [
+            (2_000, 101.2, 101.4),
+            (2_000, 98.8, 99.0),
+        ],
+        start_exclusive_msc=1_500,
+        end_exclusive_msc=4_000,
+    )
+
+    assert result == ("AMBIGUOUS_SAME_TIMESTAMP", 2_000, None)
+
+
+def test_tick_sequence_does_not_guess_touch_at_exact_quote_millisecond() -> None:
+    result = tick_sequence_barrier_outcome(
+        "LONG",
+        101.0,
+        99.0,
+        [
+            (2_000, 101.2, 101.4),
+            (3_000, 100.0, 100.2),
+        ],
+        start_exclusive_msc=2_000,
+        end_exclusive_msc=4_000,
+    )
+
+    assert result == ("AMBIGUOUS_SAME_TIMESTAMP", 2_000, None)
 
 
 def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
@@ -267,8 +313,8 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             "proposal-1",
             "prediction-1",
             "SCALPER",
-            (origin + timedelta(minutes=1)).isoformat(),
-            (origin + timedelta(minutes=1)).isoformat(),
+            (origin + timedelta(minutes=5)).isoformat(),
+            (origin + timedelta(minutes=5)).isoformat(),
             "LONG",
             101.0,
             99.0,
@@ -281,11 +327,76 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             ),
         ),
     )
+    missing_timestamp = (origin + timedelta(minutes=10)).isoformat()
+    missing_path = connection.execute(
+        """
+        SELECT symbol, timeframe, timestamp, tick_path_json, path_point_count,
+               first_tick_msc, last_tick_msc, path_valid, source, updated_at
+        FROM market_tick_paths WHERE timestamp=?
+        """,
+        (missing_timestamp,),
+    ).fetchone()
+    assert missing_path is not None
+    connection.execute(
+        "DELETE FROM market_tick_paths WHERE timestamp=?",
+        (missing_timestamp,),
+    )
     connection.commit()
     connection.close()
 
-    report = settle_with_report(database)
-    assert report["settled_horizons"] == 2
+    incomplete_report = settle_with_report(database)
+    assert incomplete_report["settled_horizons"] == 2
+
+    connection = sqlite3.connect(database)
+    prediction_state = connection.execute(
+        "SELECT settlement_status, settlement_reason FROM predictions"
+    ).fetchone()
+    proposal_state = connection.execute(
+        """
+        SELECT settlement_status, settlement_reason
+        FROM decision_proposal_instances
+        """
+    ).fetchone()
+    assert prediction_state == ("TICK_PATH_INCOMPLETE", "TICK_PATH_INCOMPLETE")
+    assert proposal_state == ("TICK_PATH_INCOMPLETE", "TICK_PATH_INCOMPLETE")
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM decision_proposal_outcomes"
+        ).fetchone()[0]
+        == 0
+    )
+    partial_path = list(missing_path)
+    partial_path[8] = "LIVE_CURRENT"
+    connection.execute(
+        "INSERT INTO market_tick_paths VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        tuple(partial_path),
+    )
+    connection.commit()
+    connection.close()
+
+    partial_report = settle_with_report(database)
+    assert partial_report["settled_proposals"] == 0
+
+    connection = sqlite3.connect(database)
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM decision_proposal_outcomes"
+        ).fetchone()[0]
+        == 0
+    )
+    connection.execute(
+        """
+        UPDATE market_tick_paths
+        SET source='TEST'
+        WHERE timestamp=?
+        """,
+        (missing_timestamp,),
+    )
+    connection.commit()
+    connection.close()
+
+    recovered_report = settle_with_report(database)
+    assert recovered_report["settled_proposals"] == 1
 
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row

@@ -3,15 +3,19 @@ from __future__ import annotations
 import io
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 
 import pytest
 
 from xpde_ml.mt5_bridge import (
     PayloadRejected,
     completed_bar_distance,
+    fetch_catchup_bars,
+    forecast_generation_delay_ms,
     next_retry_delay,
     post_payload,
 )
+from xpde_ml.time_utils import BrokerClock
 
 
 def test_http_error_includes_api_response_body(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,4 +81,61 @@ def test_completed_bar_distance_detects_downtime_without_string_format_bias() ->
             "2026-07-28T19:05:00Z",
         )
         == 1
+    )
+
+
+def test_catchup_keeps_ordered_tick_paths_for_every_recovered_bar() -> None:
+    base = datetime(2026, 7, 28, 7, 5, tzinfo=UTC)
+
+    class Mt5:
+        TIMEFRAME_M5 = 5
+        COPY_TICKS_ALL = 0
+
+        @staticmethod
+        def copy_rates_range(*_args):
+            return [
+                {
+                    "time": base.timestamp(),
+                    "open": 4000.0,
+                    "high": 4001.0,
+                    "low": 3999.0,
+                    "close": 4000.5,
+                    "tick_volume": 2,
+                }
+            ]
+
+        @staticmethod
+        def copy_ticks_range(*_args):
+            start = int(base.timestamp() * 1000)
+            return [
+                {"time_msc": start, "bid": 4000.0, "ask": 4000.2},
+                {"time_msc": start + 299_000, "bid": 4000.5, "ask": 4000.7},
+            ]
+
+        @staticmethod
+        def last_error():
+            return 0, "ok"
+
+    bars = fetch_catchup_bars(
+        Mt5(),
+        after_timestamp="2026-07-28T07:00:00+00:00",
+        through_timestamp="2026-07-28T07:05:00+00:00",
+        clock=BrokerClock(),
+    )
+
+    assert len(bars) == 1
+    assert bars[0]["executable_tick_path"] == [
+        [int(base.timestamp() * 1000), 4000.0, 4000.2],
+        [int(base.timestamp() * 1000) + 299_000, 4000.5, 4000.7],
+    ]
+    assert bars[0]["first_tick_msc"] < bars[0]["last_tick_msc"]
+
+
+def test_generation_delay_is_measured_from_expected_m5_boundary() -> None:
+    assert (
+        forecast_generation_delay_ms(
+            "2026-07-28T10:00:00+00:00",
+            now_utc=datetime(2026, 7, 28, 10, 5, 9, tzinfo=UTC),
+        )
+        == 9_000
     )

@@ -34,8 +34,18 @@ records outcomes and feedback, then leaves the final decision to a human.
   configured conservative quantile instead of an optimistic median.
 - Every material realtime decision is an immutable proposal instance. Feedback
   and policy outcomes refer to its `proposal_id`, quote, entry and health state.
-  Instances are emitted only by forecast/snapshot events; HTTP GET and WebSocket
-  serialization are read-only.
+  Instances are emitted only by forecast/snapshot events or the authoritative
+  one-second policy clock; HTTP GET and WebSocket serialization are read-only.
+- Downtime catch-up restores complete ordered `COPY_TICKS_ALL` paths as well as
+  OHLC. Gzip requests are split by encoded bytes, bar count and tick-point count.
+  Full resets stage strictly ordered, single-use chunks under an import ID and
+  replace live history atomically only after every expected chunk is present.
+- Settlement verifies every expected M5 bucket, path metadata and completed-path
+  source. Missing or partial windows remain `TICK_PATH_INCOMPLETE` or
+  `SESSION_INTERRUPTED`; they can never become a false no-hit or enter
+  Brier/ECE/model-health evidence.
+- A one-second policy clock keeps disconnect, feed age, session close, forecast
+  expiry and entry-window expiry authoritative even when MT5 sends no new event.
 - Live coverage, absolute and baseline-relative Brier, ECE and MAE-coverage
   gates use persisted hysteresis and stop proposals while warming or unhealthy.
 - Dynamic MT5 account, currency and symbol specifications.
@@ -110,8 +120,11 @@ and waits until a fresh MT5 snapshot reaches the core.
 
 On startup or reconnect, the bridge asks the core for the latest locally stored
 completed M5 candle and uses `copy_rates_range()` to append the missing range.
+The same range is rebuilt from `COPY_TICKS_ALL`; each completed bar must carry a
+valid ordered Bid/Ask path with at least 95% chart tick-volume coverage.
 Backfilled bars can settle earlier forecasts, but the bridge deliberately waits
 for a genuinely new completed candle before emitting another live forecast.
+Incomplete recovery remains pending and can be retried safely.
 
 Alternatively, keep the bridge visible in terminal three:
 
@@ -172,7 +185,9 @@ golden forecast, then atomically promoted to the local `latest` shadow slot.
 It remains registered as `candidate`;
 promotion to champion is deliberately manual and requires enough settled shadow
 predictions. Training artifacts and historical exports are local and ignored by
-Git.
+Git. The default historical export is `data/goldm_m5.csv.gz`; pandas reads it
+directly and the compressed stream avoids storing or uploading the large
+tick-path CSV uncompressed.
 
 Candidate training is intentionally blocked unless the dataset manifest proves
 that it came from a Bid chart and historical Bid/Ask ticks, chart Bid matches
@@ -233,7 +248,8 @@ Forecast barrier evaluation and actionable proposal evaluation are intentionally
 separate. Every settled H3 forecast records counterfactual LONG and SHORT
 TP-before-SL outcomes using ordered executable ticks and the exact forecast
 target/stop. Realtime SCALPER and SNIPER changes are stored in
-`decision_proposal_instances` from authoritative market events. Material change
+`decision_proposal_instances` from authoritative market or policy-clock events.
+Material change
 fingerprints quantize prices to the broker tick and reward/risk to policy bands,
 so floating-point noise does not create evidence. Evidence memberships are
 reported separately as `FIRST_ACTIONABLE`, `HUMAN_ACCEPTED` and
@@ -245,10 +261,16 @@ Broker sessions come from `[market_session]` in `config/default.toml`, with
 Sunday/Friday hours, maintenance gaps represented as split sessions, holiday
 closures, and the MT5 symbol trade-mode check. `XPDE_MARKET_CLOSED_DATES` can
 add emergency closure dates without changing source.
-The MVP still uses the configured integer broker UTC offset; DST changes must be
-updated operationally until an authoritative broker timezone source is available.
+`market_session.timezone = "fixed_broker_utc_offset"` states the limitation
+explicitly. The integer broker UTC offset must be updated operationally for DST
+until an authoritative broker timezone source is available.
 Forecast quality and policy outcome remain separate; a proposal metric never
 masquerades as model coverage.
+
+Prediction settlement is an explicit state machine. Price horizons may settle
+first, but a prediction is not `SETTLED` until both H3 LONG and SHORT barrier
+outcomes exist. Recoverable states (`BARRIER_PENDING`, `TICK_PATH_INCOMPLETE`,
+and `SESSION_INTERRUPTED`) remain eligible for later replay after catch-up.
 `tp_first_within_horizon_rate` includes no-hit outcomes in its denominator and is
 the metric comparable to the trained probability; `tp_vs_sl_conditional_rate`
 is reported separately. Live monitoring also exposes direction/barrier Brier,

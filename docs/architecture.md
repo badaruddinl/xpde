@@ -98,13 +98,28 @@ tolerance, `COPY_TICKS_ALL`, at least 95% tick-volume coverage, a parseable path
 for every bar, and exact path-to-OHLC reconstruction. The path is authoritative
 for first passage; OHLC is not used as a live ambiguity fallback.
 LONG and SHORT retain `TP_FIRST`, `SL_FIRST`,
-`NO_HIT_BEFORE_EXPIRY`, and `AMBIGUOUS_SAME_BAR`. A disagreement between q50,
+`NO_HIT_BEFORE_EXPIRY`, `AMBIGUOUS_SAME_BAR`, and
+`AMBIGUOUS_SAME_TIMESTAMP`. Multiple executable prices sharing one millisecond
+are not assigned an invented order. A disagreement between q50,
 the direction classifier, and the stronger barrier side yields
 `FORECAST_SIDE_CONFLICT` and therefore `WAIT`.
 
-After downtime, market bars are backfilled from the last local completed candle.
-Predictions are never generated retroactively: the bridge waits for the next
-new completed M5 candle after catch-up.
+After downtime, market bars and their ordered `COPY_TICKS_ALL` paths are
+backfilled from the last local completed candle. Requests are gzip-compressed
+and bounded by bytes, bars and tick points. A reset import accepts strictly
+ascending, single-use chunks and is promoted atomically only when every declared
+chunk is present, so an interrupted import cannot erase the last usable history.
+Predictions are never generated retroactively:
+the bridge waits for the next new completed M5 candle after catch-up.
+
+Settlement constructs an expected M5-bucket window. Every bucket must have a
+completed path whose JSON count, first/last timestamp, ordering and executable
+prices validate. A `LIVE_CURRENT` partial path is never sufficient. Missing
+paths remain recoverable as `TICK_PATH_INCOMPLETE`; missing market buckets are
+`SESSION_INTERRUPTED`. `NO_HIT_BEFORE_EXPIRY` is legal only for a complete
+window, and a prediction cannot become `SETTLED` while either H3 directional
+barrier is null. Price-return horizons also require their exact consecutive M5
+buckets, so a missing candle is never silently replaced by a later candle.
 
 Dashboard evaluation scopes are deliberately separate:
 
@@ -138,8 +153,8 @@ Proposal records include every currency, conversion metadata and cost assumption
 `predictions` owns the immutable forecast. Every material decision change is
 stored separately in `decision_proposal_instances` with an exact `proposal_id`,
 quote timestamp, entry, action, target, stop, cost assumptions and model-health
-state. Instances are persisted by forecast and market snapshot events; GET and
-WebSocket reads never create evidence. Human feedback refers to this ID and is
+state. Instances are persisted by forecast, market snapshot and material
+policy-clock events; GET and WebSocket reads never create evidence. Human feedback refers to this ID and is
 rejected unless it is still the latest instance within its entry-age and health
 gate. A tick-quantized material-change fingerprint suppresses floating-point
 churn.
@@ -152,6 +167,8 @@ remaining portion of its current candle, and ends at `outcome_matures_at`.
 Decision age is bounded independently of forecast expiry. Warming, degraded or
 suspended model health forces `WAIT`; health transitions use persisted
 multi-window hysteresis and are recorded as events.
+The internal one-second policy clock also advances bridge/tick age, entry expiry,
+forecast expiry and market-session transitions when the provider is silent.
 
 ## Market and executable storage
 
@@ -163,14 +180,16 @@ Compact ordered tick paths live in `market_tick_paths`, independent from OHLC,
 and are replaced only by a path spanning at least the stored boundaries.
 Directional MT5 modes (`FULL`, `LONG_ONLY`, `SHORT_ONLY`, `CLOSE_ONLY`,
 `DISABLED`) gate each proposal side independently. Broker DST remains an
-explicit operational configuration risk because the MVP uses an integer UTC
-offset rather than a timezone database identifier.
+explicit operational configuration risk: `fixed_broker_utc_offset` uses an
+integer UTC offset rather than pretending to resolve a timezone database
+identifier.
 Legacy predictions without executable origin sides or the current barrier
 contract are quarantined as `LEGACY_UNSETTLEABLE`.
 
 ## Reproducible training boundary
 
-MT5 dataset exports receive a sidecar manifest with symbol, timeframe, UTC
+MT5 dataset exports default to streaming gzip CSV and receive a sidecar manifest
+with symbol, timeframe, UTC
 range, row count, gap summary, repository commit and SHA-256. Colab copies the
 dataset from Drive to ephemeral `/content`, verifies the hash, checks out the
 exact repository commit and runs the test suite before training.

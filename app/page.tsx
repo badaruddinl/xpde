@@ -46,7 +46,6 @@ interface Proposal {
   cost_model_id: string;
   account_currency: string;
   quote_currency: string;
-  pnl_currency: string;
   symbol_profit_currency?: string;
   calculated_pnl_currency?: string;
   pnl_calculation_source?: string;
@@ -74,6 +73,8 @@ interface Proposal {
   decision_age_seconds?: number;
   remaining_horizon_seconds?: number;
   maximum_decision_age_seconds?: number;
+  forecast_generation_delay_ms?: number;
+  maximum_forecast_generation_delay_ms?: number;
   model_health_status?: string;
   evidence_source?: string;
   invalidation_price: number | null;
@@ -86,6 +87,7 @@ interface DashboardState {
   mode: string;
   connection_status: string;
   updated_at: string;
+  last_market_snapshot_at?: string;
   forecast_status: ForecastStatus;
   snapshot: {
     symbol: string;
@@ -114,7 +116,6 @@ interface DashboardState {
       margin_per_lot_sell?: number | null;
       chart_mode: "BID" | "LAST" | "UNKNOWN";
       quote_currency: string;
-      pnl_currency: string;
       symbol_profit_currency?: string;
       calculated_pnl_currency?: string;
       pnl_calculation_source?: string;
@@ -132,6 +133,7 @@ interface DashboardState {
         | "FEED_STALE"
         | "BRIDGE_DISCONNECTED"
         | "UNKNOWN";
+      market_session_open_until?: string | null;
       missing_flags: string[];
       reason_codes: string[];
     };
@@ -297,7 +299,8 @@ function buildDemoState(): DashboardState {
   return {
     mode: "DEMO_SHADOW",
     connection_status: "WAITING_FOR_MT5",
-    updated_at: now,
+  updated_at: now,
+  last_market_snapshot_at: now,
     forecast_status: "DEMO",
     snapshot: {
       symbol: "GOLDm#",
@@ -326,7 +329,6 @@ function buildDemoState(): DashboardState {
         margin_per_lot_sell: 3.34,
         chart_mode: "BID",
         quote_currency: "USD",
-        pnl_currency: "USD",
       },
       data_quality: {
         completeness: 1,
@@ -351,7 +353,7 @@ function buildDemoState(): DashboardState {
       direction_probability_up: 0.57,
       barrier_probability_long: 0.54,
       barrier_probability_short: 0.46,
-      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v4",
+      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v5",
       barrier_horizon_bars: 3,
       target_price_long: bars[bars.length - 1].close + 1.25,
       stop_price_long: bars[bars.length - 1].close - 1,
@@ -383,7 +385,6 @@ function buildDemoState(): DashboardState {
         cost_model_id: "executable-side-rolling-spread-v1",
         account_currency: "USD",
         quote_currency: "USD",
-        pnl_currency: "USD",
         action: "WAIT",
         generated_at: now,
         decision_valid_until: decisionValidUntil,
@@ -411,7 +412,6 @@ function buildDemoState(): DashboardState {
         cost_model_id: "executable-side-rolling-spread-v1",
         account_currency: "USD",
         quote_currency: "USD",
-        pnl_currency: "USD",
         action: "WAIT",
         generated_at: now,
         decision_valid_until: decisionValidUntil,
@@ -519,6 +519,10 @@ function reasonLabel(reason: string) {
     CURRENCY_CONVERSION_UNAVAILABLE: "Konversi PnL ke mata uang account tidak tersedia",
     EXIT_SPREAD_ESTIMATE_UNAVAILABLE: "Sampel estimasi spread exit belum mencukupi",
     ENTRY_WINDOW_EXPIRED: "Jendela entry forecast sudah berakhir",
+    FORECAST_GENERATION_LATE: "Forecast dibuat terlalu terlambat setelah candle selesai",
+    HORIZON_CROSSES_MARKET_CLOSE: "Horizon melewati penutupan atau maintenance market",
+    TICK_PATH_INCOMPLETE: "Urutan tick horizon belum lengkap",
+    SESSION_INTERRUPTED: "Sesi market terputus sebelum horizon selesai",
     BROKER_STOPS_LEVEL_VIOLATION: "Target atau stop melanggar minimum stops broker",
     BROKER_LONG_ONLY: "Broker hanya mengizinkan entry LONG",
     BROKER_SHORT_ONLY: "Broker hanya mengizinkan entry SHORT",
@@ -720,6 +724,32 @@ export default function Home() {
   const maxPrice = Math.max(...prices);
   const range = Math.max(maxPrice - minPrice, 0.01);
   const lastPrice = (state.snapshot.bid + state.snapshot.ask) / 2;
+  const profileTickAgeLimit = profile === "SCALPER" ? 10_000 : 5_000;
+  const marketContextActionable =
+    state.connection_status === "MT5_CONNECTED" &&
+    state.snapshot.data_quality.market_status === "OPEN" &&
+    state.snapshot.data_quality.tick_age_ms <= profileTickAgeLimit &&
+    state.snapshot.data_quality.absolute_tick_age_ms <= profileTickAgeLimit &&
+    state.snapshot.data_quality.transport_tick_age_ms <= profileTickAgeLimit &&
+    state.snapshot.data_quality.missing_flags.length === 0 &&
+    state.forecast_status === "CURRENT" &&
+    state.model_health.status === "HEALTHY" &&
+    (proposal.decision_age_seconds ?? Number.POSITIVE_INFINITY) <=
+      (proposal.maximum_decision_age_seconds ?? 0);
+  const frozenOverlay =
+    state.connection_status === "BRIDGE_DISCONNECTED"
+      ? ["BRIDGE DISCONNECTED — PROPOSAL FROZEN", "Tunggu tick MT5 baru sebelum menilai entry."]
+      : proposal.reason_codes.includes("ENTRY_WINDOW_EXPIRED")
+        ? ["ENTRY WINDOW EXPIRED", "Proposal lama tidak boleh digunakan untuk entry."]
+        : proposal.reason_codes.includes("HORIZON_CROSSES_MARKET_CLOSE")
+          ? ["HORIZON CROSSES MARKET CLOSE", "Horizon tidak mempunyai sesi eksekusi utuh."]
+          : proposal.reason_codes.includes("MARKET_SESSION_BOUNDARY_UNAVAILABLE")
+            ? ["MARKET SESSION UNKNOWN", "Batas sesi broker belum tersedia."]
+          : state.snapshot.data_quality.missing_flags.some((flag) =>
+                flag.includes("TICK_PATH"),
+              )
+            ? ["TICK PATH INCOMPLETE", "First-touch evidence belum lengkap."]
+            : null;
 
   const riskPreview = useMemo(() => {
     if (proposal.action !== "LONG" && proposal.action !== "SHORT") {
@@ -727,6 +757,12 @@ export default function Home() {
     }
     if (!state.forecast.excursion_modelled || state.forecast_status !== "CURRENT") {
       return { lot: null, reason: "Forecast current dan model excursion diperlukan." };
+    }
+    if (!marketContextActionable) {
+      return {
+        lot: null,
+        reason: "Koneksi, market, tick, entry age, dan model health harus actionable.",
+      };
     }
     if (
       proposal.reference_entry_price === null ||
@@ -738,7 +774,7 @@ export default function Home() {
     ) {
       return { lot: null, reason: "Entry atau barrier proposal tidak valid." };
     }
-    const riskUsd = state.snapshot.account.equity * (riskPercent / 100);
+    const riskAccount = state.snapshot.account.equity * (riskPercent / 100);
     const stopDistance = Math.abs(
       proposal.reference_entry_price - proposal.invalidation_price,
     );
@@ -752,7 +788,7 @@ export default function Home() {
     if (!Number.isFinite(riskPerReferenceLot) || riskPerReferenceLot <= 0) {
       return { lot: null, reason: "Risk account-currency proposal tidak valid." };
     }
-    const raw = (riskUsd / riskPerReferenceLot) * referenceLot;
+    const raw = (riskAccount / riskPerReferenceLot) * referenceLot;
     const minimumLot = state.snapshot.symbol_spec.volume_min;
     if (raw < minimumLot) {
       return { lot: null, reason: "MIN_LOT_EXCEEDS_RISK" };
@@ -778,11 +814,13 @@ export default function Home() {
       return { lot: null, reason: "FREE_MARGIN_INSUFFICIENT" };
     }
     return { lot, reason: "" };
-  }, [lastPrice, proposal, riskPercent, state]);
+  }, [lastPrice, marketContextActionable, proposal, riskPercent, state]);
 
   async function submitFeedback(verdict: "ACCEPTED" | "REJECTED" | "UNCERTAIN") {
-    if (state.safety.feed_is_demo || state.forecast_status !== "CURRENT") {
-      setFeedbackStatus("Feedback hanya aktif untuk forecast live yang current.");
+    if (state.safety.feed_is_demo || !marketContextActionable) {
+      setFeedbackStatus(
+        "Feedback dinonaktifkan karena market/feed/forecast/model tidak lagi actionable.",
+      );
       return;
     }
     if (!proposal.proposal_id) {
@@ -810,10 +848,20 @@ export default function Home() {
           created_at: new Date().toISOString(),
         }),
       });
-      if (!response.ok) throw new Error("feedback rejected");
+      if (!response.ok) {
+        const errorBody = (await response.json().catch(() => null)) as
+          | { error?: string }
+          | null;
+        throw new Error(errorBody?.error ?? "feedback rejected");
+      }
       setFeedbackStatus("Feedback tersimpan pada audit trail.");
-    } catch {
-      setFeedbackStatus("API lokal belum aktif; feedback belum disimpan.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "feedback rejected";
+      setFeedbackStatus(
+        message.includes("latest published instance")
+          ? "Proposal berubah sejak terakhir ditampilkan. Periksa instance terbaru."
+          : `Feedback belum disimpan: ${message}`,
+      );
     }
   }
 
@@ -912,6 +960,13 @@ export default function Home() {
         <div>
           <span>Entry age / limit</span>
           <strong>{proposal.decision_age_seconds ?? 0}s / {proposal.maximum_decision_age_seconds ?? 0}s</strong>
+        </div>
+        <div>
+          <span>Forecast generation delay</span>
+          <strong>
+            {proposal.forecast_generation_delay_ms ?? 0} ms /{" "}
+            {proposal.maximum_forecast_generation_delay_ms ?? 0} ms
+          </strong>
         </div>
         <div>
           <span>Proposal instance</span>
@@ -1037,6 +1092,12 @@ export default function Home() {
                 <div className="stale-forecast-overlay" role="alert">
                   <strong>MODEL SUSPENDED</strong>
                   <span>Forecast hanya untuk diagnostik; proposal entry dihentikan.</span>
+                </div>
+              ) : null}
+              {frozenOverlay ? (
+                <div className="stale-forecast-overlay" role="alert">
+                  <strong>{frozenOverlay[0]}</strong>
+                  <span>{frozenOverlay[1]}</span>
                 </div>
               ) : null}
               <div className="price-axis">
@@ -1296,11 +1357,11 @@ export default function Home() {
               </select>
             </label>
             <div className="feedback-actions">
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("ACCEPTED")}>
+              <button disabled={state.safety.feed_is_demo || !marketContextActionable || !proposal.proposal_id} type="button" onClick={() => submitFeedback("ACCEPTED")}>
                 {proposal.action === "WAIT" ? "Setuju tidak entry" : "Layak dipertimbangkan"}
               </button>
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("UNCERTAIN")}>Tidak yakin</button>
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("REJECTED")}>
+              <button disabled={state.safety.feed_is_demo || !marketContextActionable || !proposal.proposal_id} type="button" onClick={() => submitFeedback("UNCERTAIN")}>Tidak yakin</button>
+              <button disabled={state.safety.feed_is_demo || !marketContextActionable || !proposal.proposal_id} type="button" onClick={() => submitFeedback("REJECTED")}>
                 {proposal.action === "WAIT" ? "Seharusnya actionable" : "Tolak"}
               </button>
             </div>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -78,6 +79,30 @@ def test_dataset_manifest_matches_export_hash(tmp_path) -> None:
     assert manifest["sha256"] == hashlib.sha256(dataset.read_bytes()).hexdigest()
     with dataset.open(newline="", encoding="utf-8") as handle:
         assert len(list(csv.DictReader(handle))) == 3
+
+
+def test_large_tick_path_export_can_be_written_as_streaming_gzip(tmp_path) -> None:
+    dataset = tmp_path / "goldm_m5.csv.gz"
+    write_csv(dataset, sample_bars())
+    validation = validate_export_bars(
+        sample_bars(),
+        now_utc=datetime(2026, 7, 28, 11, 0, tzinfo=UTC),
+    )
+    manifest = write_dataset_manifest(
+        dataset,
+        sample_bars(),
+        utc_offset_override_hours=0,
+        validation=validation,
+        chart_mode="BID",
+    )
+
+    with gzip.open(dataset, "rt", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 3
+    assert json.loads(rows[0]["executable_tick_path_json"])
+    assert "executable_tick_path" not in rows[0]
+    assert manifest.name == "goldm_m5.manifest.json"
 
 
 def test_dataset_validation_rejects_duplicate_timestamp() -> None:

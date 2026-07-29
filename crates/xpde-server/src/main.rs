@@ -1,4 +1,6 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -8,19 +10,20 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        State,
+        DefaultBodyLimit, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::RwLock};
 use tower_http::{
     cors::CorsLayer,
+    decompression::RequestDecompressionLayer,
     trace::{DefaultMakeSpan, TraceLayer},
 };
 use tracing::{info, warn};
@@ -29,10 +32,13 @@ use xpde_domain::{
     AccountSnapshot, BARRIER_HORIZON_BARS, BARRIER_SPEC_ID, CalibrationStatus, ChartMode,
     DataQuality, DecisionAction, DecisionPolicy, DecisionProposal, EXECUTABLE_SIDE_CONTRACT_ID,
     ForecastEnvelope, ForecastPoint, HumanFeedback, MarketBar, MarketSnapshot, MarketStatus,
-    SymbolSpec, TradeMode, decide,
+    SymbolSpec, TradeMode, TradingProfile, decide, decide_at,
 };
 
 const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
+const BACKFILL_BODY_LIMIT_BYTES: usize = 2_000_000;
+const BACKFILL_MAX_BARS: usize = 250;
+const BACKFILL_MAX_TICK_POINTS: usize = 20_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -47,6 +53,7 @@ struct PolicySet {
     scalper: DecisionPolicy,
     sniper: DecisionPolicy,
     model_health: ModelHealthPolicy,
+    market_session: MarketSessionPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,14 +61,136 @@ struct PolicyFile {
     broker_profile: BrokerPolicyFile,
     policy: ProfilePoliciesFile,
     model_health: ModelHealthPolicy,
+    market_session: MarketSessionFile,
 }
 
 #[derive(Debug, Deserialize)]
 struct BrokerPolicyFile {
     broker_policy_id: String,
     cost_model_id: String,
-    commission_usd_per_lot: f64,
+    commission_account_currency_per_lot: f64,
     expected_exit_spread_usd: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarketSessionFile {
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    monday: Vec<[String; 2]>,
+    #[serde(default)]
+    tuesday: Vec<[String; 2]>,
+    #[serde(default)]
+    wednesday: Vec<[String; 2]>,
+    #[serde(default)]
+    thursday: Vec<[String; 2]>,
+    #[serde(default)]
+    friday: Vec<[String; 2]>,
+    #[serde(default)]
+    saturday: Vec<[String; 2]>,
+    #[serde(default)]
+    sunday: Vec<[String; 2]>,
+    #[serde(default)]
+    closed_dates: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MarketSessionPolicy {
+    sessions: BTreeMap<u32, Vec<(NaiveTime, NaiveTime)>>,
+    closed_dates: BTreeSet<String>,
+    utc_offset_hours: i32,
+}
+
+impl MarketSessionPolicy {
+    fn parse(config: &MarketSessionFile) -> Result<Self, String> {
+        if config.timezone != "fixed_broker_utc_offset" {
+            return Err("market_session.timezone must be 'fixed_broker_utc_offset'".to_owned());
+        }
+        let mut sessions = BTreeMap::new();
+        for (day, configured) in [
+            (0, &config.monday),
+            (1, &config.tuesday),
+            (2, &config.wednesday),
+            (3, &config.thursday),
+            (4, &config.friday),
+            (5, &config.saturday),
+            (6, &config.sunday),
+        ] {
+            let parsed = configured
+                .iter()
+                .map(|values| {
+                    let start = NaiveTime::parse_from_str(&values[0], "%H:%M")
+                        .map_err(|error| format!("invalid market-session start: {error}"))?;
+                    let end = NaiveTime::parse_from_str(&values[1], "%H:%M")
+                        .map_err(|error| format!("invalid market-session end: {error}"))?;
+                    Ok((start, end))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            sessions.insert(day, parsed);
+        }
+        let environment_closed = env::var("XPDE_MARKET_CLOSED_DATES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let closed_dates = config
+            .closed_dates
+            .iter()
+            .cloned()
+            .chain(environment_closed)
+            .collect::<BTreeSet<_>>();
+        for date in &closed_dates {
+            NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .map_err(|error| format!("invalid market closed date {date}: {error}"))?;
+        }
+        let utc_offset_hours = match env::var("MT5_MARKET_UTC_OFFSET_HOURS") {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<i32>()
+                .map_err(|error| format!("invalid broker UTC offset: {error}"))?,
+            _ => 0,
+        };
+        if !(-23..=23).contains(&utc_offset_hours) {
+            return Err("broker UTC offset must be between -23 and +23 hours".to_owned());
+        }
+        Ok(Self {
+            sessions,
+            closed_dates,
+            utc_offset_hours,
+        })
+    }
+
+    fn session_open_until(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let local_now = now + chrono::Duration::hours(self.utc_offset_hours.into());
+        if self
+            .closed_dates
+            .contains(&local_now.date_naive().to_string())
+        {
+            return None;
+        }
+        for day_delta in [-1_i64, 0] {
+            let local_date = local_now.date_naive() + chrono::Duration::days(day_delta);
+            if self.closed_dates.contains(&local_date.to_string()) {
+                continue;
+            }
+            let day = local_date.weekday().num_days_from_monday();
+            for (start, end) in self.sessions.get(&day).into_iter().flatten() {
+                let local_start = local_date.and_time(*start).and_utc();
+                let end_date = if end < start {
+                    local_date + chrono::Duration::days(1)
+                } else {
+                    local_date
+                };
+                let local_end = end_date.and_time(*end).and_utc();
+                if local_start <= local_now && local_now <= local_end {
+                    return Some(local_end - chrono::Duration::hours(self.utc_offset_hours.into()));
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +229,8 @@ struct ProfilePolicyFile {
     exit_spread_quantile: f64,
     exit_spread_window: usize,
     maximum_decision_age_seconds: u64,
+    #[serde(default)]
+    maximum_forecast_generation_delay_ms: Option<u64>,
 }
 
 fn load_policy_set() -> Result<PolicySet, String> {
@@ -111,7 +242,8 @@ fn load_policy_set() -> Result<PolicySet, String> {
     let apply = |mut policy: DecisionPolicy, values: &ProfilePolicyFile| {
         policy.broker_policy_id = config.broker_profile.broker_policy_id.clone();
         policy.cost_model_id = config.broker_profile.cost_model_id.clone();
-        policy.commission_usd_per_lot = config.broker_profile.commission_usd_per_lot;
+        policy.commission_account_currency_per_lot =
+            config.broker_profile.commission_account_currency_per_lot;
         policy.expected_exit_spread_usd = config.broker_profile.expected_exit_spread_usd;
         policy.max_spread_usd = values.max_spread_usd;
         policy.max_spread_atr_ratio = values.max_spread_atr_ratio;
@@ -124,12 +256,16 @@ fn load_policy_set() -> Result<PolicySet, String> {
         policy.exit_spread_quantile = values.exit_spread_quantile;
         policy.exit_spread_window = values.exit_spread_window;
         policy.maximum_decision_age_seconds = values.maximum_decision_age_seconds;
+        if let Some(maximum) = values.maximum_forecast_generation_delay_ms {
+            policy.maximum_forecast_generation_delay_ms = maximum;
+        }
         policy
     };
     Ok(PolicySet {
         scalper: apply(DecisionPolicy::scalper(), &config.policy.scalper),
         sniper: apply(DecisionPolicy::sniper(), &config.policy.sniper),
         model_health: config.model_health.clone(),
+        market_session: MarketSessionPolicy::parse(&config.market_session)?,
     })
 }
 
@@ -138,6 +274,7 @@ struct RuntimeState {
     mode: &'static str,
     connection_status: &'static str,
     updated_at: DateTime<Utc>,
+    last_market_snapshot_at: DateTime<Utc>,
     forecast_status: ForecastStatus,
     snapshot: MarketSnapshot,
     forecast: ForecastEnvelope,
@@ -275,7 +412,22 @@ struct BackfillRequest {
     broker_offset_hours: i32,
     #[serde(default)]
     reset: bool,
+    #[serde(default)]
+    import_id: Option<String>,
+    #[serde(default)]
+    final_chunk: bool,
+    #[serde(default)]
+    chunk_index: Option<usize>,
+    #[serde(default)]
+    total_chunks: Option<usize>,
     bars: Vec<MarketBar>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackfillImportProgress {
+    received_chunks: usize,
+    expected_chunks: usize,
+    last_staged_timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -303,6 +455,7 @@ enum BarrierOutcome {
     NoHitBeforeExpiry,
     #[cfg(test)]
     AmbiguousSameBar,
+    AmbiguousSameTimestamp,
 }
 
 impl BarrierOutcome {
@@ -313,6 +466,7 @@ impl BarrierOutcome {
             Self::NoHitBeforeExpiry => "NO_HIT_BEFORE_EXPIRY",
             #[cfg(test)]
             Self::AmbiguousSameBar => "AMBIGUOUS_SAME_BAR",
+            Self::AmbiguousSameTimestamp => "AMBIGUOUS_SAME_TIMESTAMP",
         }
     }
 }
@@ -352,6 +506,26 @@ struct TickBarrierOutcome {
 
 type ExecutableTick = (i64, f64, f64);
 
+#[derive(Debug, Clone, PartialEq)]
+struct TickPathWindow {
+    ticks: Vec<ExecutableTick>,
+    expected_buckets: Vec<DateTime<Utc>>,
+    present_buckets: Vec<DateTime<Utc>>,
+    missing_buckets: Vec<DateTime<Utc>>,
+    missing_market_buckets: Vec<DateTime<Utc>>,
+    complete: bool,
+}
+
+impl TickPathWindow {
+    fn incomplete_reason(&self) -> &'static str {
+        if !self.missing_market_buckets.is_empty() {
+            "SESSION_INTERRUPTED"
+        } else {
+            "TICK_PATH_INCOMPLETE"
+        }
+    }
+}
+
 fn tick_sequence_barrier_outcome(
     action: DecisionAction,
     target: f64,
@@ -363,33 +537,74 @@ fn tick_sequence_barrier_outcome(
     if !target.is_finite() || !stop.is_finite() || end_exclusive_msc <= start_exclusive_msc {
         return None;
     }
-    let mut observed = false;
-    for &(time_msc, bid, ask) in ticks {
-        if time_msc <= start_exclusive_msc || time_msc >= end_exclusive_msc {
-            continue;
-        }
-        observed = true;
-        let executable_price = match action {
-            DecisionAction::Long => bid,
-            DecisionAction::Short => ask,
-            _ => return None,
-        };
-        let outcome = match action {
-            DecisionAction::Long if executable_price >= target => Some(BarrierOutcome::TpFirst),
-            DecisionAction::Long if executable_price <= stop => Some(BarrierOutcome::SlFirst),
-            DecisionAction::Short if executable_price <= target => Some(BarrierOutcome::TpFirst),
-            DecisionAction::Short if executable_price >= stop => Some(BarrierOutcome::SlFirst),
-            _ => None,
-        };
-        if let Some(outcome) = outcome {
-            return Some(TickBarrierOutcome {
-                outcome,
-                first_touch_time_msc: Some(time_msc),
-                first_touch_price: Some(executable_price),
-            });
+    let boundary_touched = ticks
+        .iter()
+        .filter(|(time_msc, _, _)| {
+            *time_msc == start_exclusive_msc && *time_msc < end_exclusive_msc
+        })
+        .any(|(_, bid, ask)| match action {
+            DecisionAction::Long => *bid >= target || *bid <= stop,
+            DecisionAction::Short => *ask <= target || *ask >= stop,
+            _ => false,
+        });
+    if boundary_touched {
+        return Some(TickBarrierOutcome {
+            outcome: BarrierOutcome::AmbiguousSameTimestamp,
+            first_touch_time_msc: Some(start_exclusive_msc),
+            first_touch_price: None,
+        });
+    }
+    let filtered = ticks
+        .iter()
+        .copied()
+        .filter(|(time_msc, _, _)| *time_msc > start_exclusive_msc && *time_msc < end_exclusive_msc)
+        .collect::<Vec<_>>();
+    for group in filtered.chunk_by(|left, right| left.0 == right.0) {
+        let prices = group
+            .iter()
+            .map(|(_, bid, ask)| match action {
+                DecisionAction::Long => Some(*bid),
+                DecisionAction::Short => Some(*ask),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let tp_price = prices.iter().copied().find(|price| match action {
+            DecisionAction::Long => *price >= target,
+            DecisionAction::Short => *price <= target,
+            _ => false,
+        });
+        let sl_price = prices.iter().copied().find(|price| match action {
+            DecisionAction::Long => *price <= stop,
+            DecisionAction::Short => *price >= stop,
+            _ => false,
+        });
+        let time_msc = group[0].0;
+        match (tp_price, sl_price) {
+            (Some(_), Some(_)) => {
+                return Some(TickBarrierOutcome {
+                    outcome: BarrierOutcome::AmbiguousSameTimestamp,
+                    first_touch_time_msc: Some(time_msc),
+                    first_touch_price: None,
+                });
+            }
+            (Some(price), None) => {
+                return Some(TickBarrierOutcome {
+                    outcome: BarrierOutcome::TpFirst,
+                    first_touch_time_msc: Some(time_msc),
+                    first_touch_price: Some(price),
+                });
+            }
+            (None, Some(price)) => {
+                return Some(TickBarrierOutcome {
+                    outcome: BarrierOutcome::SlFirst,
+                    first_touch_time_msc: Some(time_msc),
+                    first_touch_price: Some(price),
+                });
+            }
+            (None, None) => {}
         }
     }
-    observed.then_some(TickBarrierOutcome {
+    (!filtered.is_empty()).then_some(TickBarrierOutcome {
         outcome: BarrierOutcome::NoHitBeforeExpiry,
         first_touch_time_msc: None,
         first_touch_price: None,
@@ -434,6 +649,153 @@ fn ensure_column(
         ))?;
     }
     Ok(())
+}
+
+fn ensure_same_timestamp_outcome_contract(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT name, sql FROM sqlite_master
+         WHERE type='table' AND name IN (
+           'prediction_horizon_outcomes',
+           'decision_proposal_outcomes',
+           'prediction_proposal_outcomes'
+         )",
+    )?;
+    let schemas = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if schemas.len() == 3
+        && schemas
+            .values()
+            .all(|schema| schema.contains("AMBIGUOUS_SAME_TIMESTAMP"))
+    {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         CREATE TABLE prediction_horizon_outcomes_v5 (
+           prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+           horizon_bars INTEGER NOT NULL,
+           origin_bar_timestamp TEXT NOT NULL,
+           outcome_bar_timestamp TEXT NOT NULL,
+           actual_return REAL NOT NULL,
+           actual_high REAL NOT NULL,
+           actual_low REAL NOT NULL,
+           interval_hit INTEGER NOT NULL,
+           direction_hit INTEGER NOT NULL,
+           barrier_outcome TEXT CHECK(
+             barrier_outcome IS NULL OR barrier_outcome IN (
+               'TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY',
+               'AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP'
+             )
+           ),
+           barrier_long_outcome TEXT CHECK(
+             barrier_long_outcome IS NULL OR barrier_long_outcome IN (
+               'TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY',
+               'AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP'
+             )
+           ),
+           barrier_short_outcome TEXT CHECK(
+             barrier_short_outcome IS NULL OR barrier_short_outcome IN (
+               'TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY',
+               'AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP'
+             )
+           ),
+           error_metrics_json TEXT NOT NULL,
+           settled_at TEXT NOT NULL,
+           PRIMARY KEY(prediction_id, horizon_bars)
+         );
+         INSERT INTO prediction_horizon_outcomes_v5
+         (prediction_id, horizon_bars, origin_bar_timestamp, outcome_bar_timestamp,
+          actual_return, actual_high, actual_low, interval_hit, direction_hit,
+          barrier_outcome, barrier_long_outcome, barrier_short_outcome,
+          error_metrics_json, settled_at)
+         SELECT prediction_id, horizon_bars, origin_bar_timestamp, outcome_bar_timestamp,
+                actual_return, actual_high, actual_low, interval_hit, direction_hit,
+                barrier_outcome, barrier_long_outcome, barrier_short_outcome,
+                error_metrics_json, settled_at
+         FROM prediction_horizon_outcomes;
+         DROP TABLE prediction_horizon_outcomes;
+         ALTER TABLE prediction_horizon_outcomes_v5 RENAME TO prediction_horizon_outcomes;
+
+         CREATE TABLE decision_proposal_outcomes_v5 (
+           proposal_id TEXT PRIMARY KEY REFERENCES decision_proposal_instances(proposal_id),
+           prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+           profile TEXT NOT NULL,
+           horizon_bars INTEGER NOT NULL,
+           action TEXT NOT NULL,
+           target_price REAL NOT NULL,
+           stop_price REAL NOT NULL,
+           barrier_outcome TEXT NOT NULL CHECK(
+             barrier_outcome IN (
+               'TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY',
+               'AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP'
+             )
+           ),
+           first_touch_time_msc INTEGER,
+           first_touch_price REAL,
+           settlement_source TEXT NOT NULL DEFAULT 'TICK_SEQUENCE',
+           settled_at TEXT NOT NULL
+         );
+         INSERT INTO decision_proposal_outcomes_v5
+         (proposal_id, prediction_id, profile, horizon_bars, action, target_price,
+          stop_price, barrier_outcome, first_touch_time_msc, first_touch_price,
+          settlement_source, settled_at)
+         SELECT proposal_id, prediction_id, profile, horizon_bars, action, target_price,
+                stop_price, barrier_outcome, first_touch_time_msc, first_touch_price,
+                settlement_source, settled_at
+         FROM decision_proposal_outcomes;
+         DROP TABLE decision_proposal_outcomes;
+         ALTER TABLE decision_proposal_outcomes_v5 RENAME TO decision_proposal_outcomes;
+
+         CREATE TABLE prediction_proposal_outcomes_v5 (
+           prediction_id TEXT NOT NULL REFERENCES predictions(prediction_id),
+           profile TEXT NOT NULL CHECK(profile IN ('SCALPER','SNIPER')),
+           horizon_bars INTEGER NOT NULL,
+           action TEXT NOT NULL CHECK(action IN ('LONG','SHORT')),
+           target_price REAL NOT NULL,
+           stop_price REAL NOT NULL,
+           barrier_outcome TEXT NOT NULL CHECK(
+             barrier_outcome IN (
+               'TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY',
+               'AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP'
+             )
+           ),
+           settled_at TEXT NOT NULL,
+           PRIMARY KEY(prediction_id, profile, horizon_bars)
+         );
+         INSERT INTO prediction_proposal_outcomes_v5
+         (prediction_id, profile, horizon_bars, action, target_price, stop_price,
+          barrier_outcome, settled_at)
+         SELECT prediction_id, profile, horizon_bars, action, target_price, stop_price,
+                barrier_outcome, settled_at
+         FROM prediction_proposal_outcomes;
+         DROP TABLE prediction_proposal_outcomes;
+         ALTER TABLE prediction_proposal_outcomes_v5 RENAME TO prediction_proposal_outcomes;
+
+         CREATE INDEX IF NOT EXISTS idx_prediction_horizon_outcomes_time
+           ON prediction_horizon_outcomes(settled_at DESC, horizon_bars);
+         CREATE INDEX IF NOT EXISTS idx_prediction_horizon_outcomes_prediction
+           ON prediction_horizon_outcomes(prediction_id, horizon_bars);
+         CREATE INDEX IF NOT EXISTS idx_prediction_proposal_outcomes_time
+           ON prediction_proposal_outcomes(settled_at DESC, profile, horizon_bars);
+         CREATE INDEX IF NOT EXISTS idx_decision_proposal_outcomes_time
+           ON decision_proposal_outcomes(settled_at DESC, profile, horizon_bars);
+         PRAGMA foreign_keys=ON;",
+    )
+}
+
+fn is_exact_m5_horizon(origin: DateTime<Utc>, timestamps: &[String]) -> bool {
+    !timestamps.is_empty()
+        && timestamps.iter().enumerate().all(|(index, timestamp)| {
+            DateTime::parse_from_rfc3339(timestamp)
+                .map(|value| {
+                    value.with_timezone(&Utc)
+                        == origin + chrono::Duration::minutes((index as i64 + 1) * 5)
+                })
+                .unwrap_or(false)
+        })
 }
 
 fn brier_score(probabilities: &[f64], outcomes: &[f64]) -> Option<f64> {
@@ -514,7 +876,68 @@ fn apply_model_health_gate(
     }
 }
 
+fn feedback_context_is_actionable(runtime: &RuntimeState, policy: &DecisionPolicy) -> bool {
+    runtime.connection_status == "MT5_CONNECTED"
+        && runtime.snapshot.data_quality.market_status == MarketStatus::Open
+        && runtime
+            .snapshot
+            .data_quality
+            .is_valid(policy.max_tick_age_ms)
+        && runtime.forecast_status == ForecastStatus::Current
+        && runtime.model_health.status == ModelHealthStatus::Healthy
+}
+
 impl Store {
+    fn backfill_import_progress(
+        &self,
+        import_id: &str,
+        symbol: &str,
+        timeframe: &str,
+    ) -> Result<Option<BackfillImportProgress>, rusqlite::Error> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let result = connection.query_row(
+            "SELECT COUNT(*), MIN(total_chunks), MAX(total_chunks),
+                    (
+                      SELECT MAX(timestamp)
+                      FROM market_backfill_staging
+                      WHERE import_id=?1 AND symbol=?2 AND timeframe=?3
+                    )
+             FROM market_backfill_import_chunks
+             WHERE import_id=?1 AND symbol=?2 AND timeframe=?3
+               AND created_at>=?4",
+            params![
+                import_id,
+                symbol,
+                timeframe,
+                (Utc::now() - chrono::Duration::hours(24)).to_rfc3339()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, usize>(0)?,
+                    row.get::<_, Option<usize>>(1)?,
+                    row.get::<_, Option<usize>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )?;
+        match result {
+            (0, _, _, _) => Ok(None),
+            (received, Some(minimum), Some(maximum), Some(last_timestamp))
+                if minimum == maximum =>
+            {
+                let last_staged_timestamp = DateTime::parse_from_rfc3339(&last_timestamp)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?
+                    .with_timezone(&Utc);
+                Ok(Some(BackfillImportProgress {
+                    received_chunks: received,
+                    expected_chunks: minimum,
+                    last_staged_timestamp,
+                }))
+            }
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+
     fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent()
             && let Err(error) = fs::create_dir_all(parent)
@@ -563,6 +986,7 @@ impl Store {
             "settlement_status",
             "TEXT NOT NULL DEFAULT 'PENDING'",
         )?;
+        ensure_column(&connection, "predictions", "settlement_reason", "TEXT")?;
         ensure_column(&connection, "predictions", "decision_valid_until", "TEXT")?;
         ensure_column(&connection, "predictions", "outcome_matures_at", "TEXT")?;
         ensure_column(
@@ -673,6 +1097,18 @@ impl Store {
         )?;
         ensure_column(
             &connection,
+            "decision_proposal_instances",
+            "settlement_status",
+            "TEXT NOT NULL DEFAULT 'PENDING'",
+        )?;
+        ensure_column(
+            &connection,
+            "decision_proposal_instances",
+            "settlement_reason",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
             "decision_proposal_outcomes",
             "first_touch_time_msc",
             "INTEGER",
@@ -689,6 +1125,7 @@ impl Store {
             "settlement_source",
             "TEXT NOT NULL DEFAULT 'TICK_SEQUENCE'",
         )?;
+        ensure_same_timestamp_outcome_contract(&connection)?;
         connection.execute_batch(
             "INSERT OR IGNORE INTO decision_proposal_evidence
              (proposal_id, evidence_source, created_at)
@@ -807,7 +1244,12 @@ impl Store {
                    updated_at=excluded.updated_at
                  WHERE excluded.first_tick_msc<=market_tick_paths.first_tick_msc
                    AND excluded.last_tick_msc>=market_tick_paths.last_tick_msc
-                   AND excluded.path_point_count>=market_tick_paths.path_point_count",
+                   AND excluded.path_point_count>=market_tick_paths.path_point_count
+                   AND (
+                     excluded.source!='LIVE_CURRENT'
+                     OR excluded.path_point_count>=market_tick_paths.path_point_count+5
+                     OR excluded.last_tick_msc>=market_tick_paths.last_tick_msc+5000
+                   )",
                 params![
                     symbol,
                     timeframe,
@@ -825,15 +1267,22 @@ impl Store {
         Ok(())
     }
 
-    fn load_tick_path(
+    fn load_tick_path_window(
         transaction: &rusqlite::Transaction<'_>,
         symbol: &str,
         timeframe: &str,
         first_bucket: DateTime<Utc>,
         end_exclusive: DateTime<Utc>,
-    ) -> Result<Option<Vec<ExecutableTick>>, rusqlite::Error> {
+    ) -> Result<TickPathWindow, rusqlite::Error> {
+        let mut expected_buckets = Vec::new();
+        let mut cursor = first_bucket;
+        while cursor < end_exclusive {
+            expected_buckets.push(cursor);
+            cursor += chrono::Duration::minutes(5);
+        }
         let mut statement = transaction.prepare(
-            "SELECT tick_path_json
+            "SELECT timestamp, tick_path_json, path_point_count,
+                    first_tick_msc, last_tick_msc, source
              FROM market_tick_paths
              WHERE symbol=?1 AND timeframe=?2
                AND timestamp>=?3 AND timestamp<?4 AND path_valid=1
@@ -847,23 +1296,106 @@ impl Store {
                     first_bucket.to_rfc3339(),
                     end_exclusive.to_rfc3339()
                 ],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        if encoded.is_empty() {
-            return Ok(None);
-        }
-        let mut ticks = Vec::new();
-        for path in encoded {
-            let Ok(mut parsed) = serde_json::from_str::<Vec<ExecutableTick>>(&path) else {
-                return Ok(None);
+        let expected = expected_buckets
+            .iter()
+            .map(DateTime::to_rfc3339)
+            .collect::<BTreeSet<_>>();
+        let mut valid_paths = BTreeMap::<String, Vec<ExecutableTick>>::new();
+        for (timestamp, path, path_point_count, first_tick_msc, last_tick_msc, source) in encoded {
+            if !expected.contains(&timestamp) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<Vec<ExecutableTick>>(&path) else {
+                continue;
             };
-            ticks.append(&mut parsed);
+            let Ok(bucket) = DateTime::parse_from_rfc3339(&timestamp) else {
+                continue;
+            };
+            let bucket_start = bucket.timestamp_millis();
+            let bucket_end = bucket_start + 300_000;
+            let valid = !parsed.is_empty()
+                && parsed.len() == path_point_count as usize
+                && source != "LIVE_CURRENT"
+                && parsed.first().map(|tick| tick.0) == Some(first_tick_msc)
+                && parsed.last().map(|tick| tick.0) == Some(last_tick_msc)
+                && parsed.windows(2).all(|pair| pair[0].0 <= pair[1].0)
+                && parsed.iter().all(|(time_msc, bid, ask)| {
+                    *time_msc >= bucket_start
+                        && *time_msc < bucket_end
+                        && bid.is_finite()
+                        && ask.is_finite()
+                        && *bid > 0.0
+                        && *ask > *bid
+                });
+            if valid {
+                valid_paths.insert(timestamp, parsed);
+            }
         }
-        if ticks.is_empty() || ticks.windows(2).any(|pair| pair[0].0 > pair[1].0) {
-            return Ok(None);
+        let present_buckets = expected_buckets
+            .iter()
+            .copied()
+            .filter(|bucket| valid_paths.contains_key(&bucket.to_rfc3339()))
+            .collect::<Vec<_>>();
+        let missing_buckets = expected_buckets
+            .iter()
+            .copied()
+            .filter(|bucket| !valid_paths.contains_key(&bucket.to_rfc3339()))
+            .collect::<Vec<_>>();
+        let market_buckets = {
+            let mut statement = transaction.prepare(
+                "SELECT timestamp
+                 FROM market_bars
+                 WHERE symbol=?1 AND timeframe=?2
+                   AND timestamp>=?3 AND timestamp<?4",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        symbol,
+                        timeframe,
+                        first_bucket.to_rfc3339(),
+                        end_exclusive.to_rfc3339()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<BTreeSet<_>, _>>()?
+        };
+        let missing_market_buckets = expected_buckets
+            .iter()
+            .copied()
+            .filter(|bucket| !market_buckets.contains(&bucket.to_rfc3339()))
+            .collect::<Vec<_>>();
+        let mut ticks = Vec::new();
+        for bucket in &expected_buckets {
+            if let Some(path) = valid_paths.get(&bucket.to_rfc3339()) {
+                ticks.extend(path.iter().copied());
+            }
         }
-        Ok(Some(ticks))
+        let complete = !expected_buckets.is_empty()
+            && missing_buckets.is_empty()
+            && missing_market_buckets.is_empty()
+            && !ticks.is_empty()
+            && ticks.windows(2).all(|pair| pair[0].0 <= pair[1].0);
+        Ok(TickPathWindow {
+            ticks,
+            expected_buckets,
+            present_buckets,
+            missing_buckets,
+            missing_market_buckets,
+            complete,
+        })
     }
 
     fn save_snapshot(&self, snapshot: &MarketSnapshot) -> Result<(), rusqlite::Error> {
@@ -958,7 +1490,7 @@ impl Store {
                 snapshot.symbol_spec.digits,
                 snapshot.symbol_spec.chart_mode.as_str(),
                 snapshot.symbol_spec.quote_currency,
-                snapshot.symbol_spec.pnl_currency,
+                snapshot.symbol_spec.calculated_pnl_currency,
                 snapshot.symbol_spec.symbol_profit_currency,
                 snapshot.symbol_spec.calculated_pnl_currency,
                 snapshot.symbol_spec.profit_per_price_unit_per_lot_buy,
@@ -1041,31 +1573,47 @@ impl Store {
                 .bars
                 .iter()
                 .max_by_key(|bar| bar.timestamp)
-                .into_iter()
-                .chain(snapshot.current_bar.iter()),
-            "LIVE_SNAPSHOT",
+                .into_iter(),
+            "LIVE_COMPLETED",
         )?;
+        Self::save_tick_paths(
+            &transaction,
+            &snapshot.symbol,
+            &snapshot.timeframe,
+            snapshot.current_bar.iter(),
+            "LIVE_CURRENT",
+        )?;
+        let audit_payload = serde_json::json!({
+            "provider": snapshot.provider,
+            "timestamp": snapshot.timestamp,
+            "timeframe": snapshot.timeframe,
+            "bid": snapshot.bid,
+            "ask": snapshot.ask,
+            "completed_bar_count_received": snapshot.bars.len(),
+            "latest_completed_bar_timestamp": snapshot
+                .bars
+                .iter()
+                .max_by_key(|bar| bar.timestamp)
+                .map(|bar| bar.timestamp),
+            "data_quality": snapshot.data_quality,
+        })
+        .to_string();
         transaction.execute(
             "INSERT INTO audit_events(event_type, entity_id, payload_json, created_at)
-             VALUES ('MARKET_SNAPSHOT_ACCEPTED', ?1, ?2, ?3)",
+             SELECT 'MARKET_SNAPSHOT_ACCEPTED', ?1, ?2, ?3
+             WHERE NOT EXISTS (
+               SELECT 1 FROM audit_events previous
+               WHERE previous.event_type='MARKET_SNAPSHOT_ACCEPTED'
+                 AND previous.entity_id=?1
+                 AND previous.created_at>=?4
+                 AND json_extract(previous.payload_json, '$.data_quality.market_status')
+                     =json_extract(?2, '$.data_quality.market_status')
+             )",
             params![
                 snapshot.symbol,
-                serde_json::json!({
-                    "provider": snapshot.provider,
-                    "timestamp": snapshot.timestamp,
-                    "timeframe": snapshot.timeframe,
-                    "bid": snapshot.bid,
-                    "ask": snapshot.ask,
-                    "completed_bar_count_received": snapshot.bars.len(),
-                    "latest_completed_bar_timestamp": snapshot
-                        .bars
-                        .iter()
-                        .max_by_key(|bar| bar.timestamp)
-                        .map(|bar| bar.timestamp),
-                    "data_quality": snapshot.data_quality,
-                })
-                .to_string(),
+                audit_payload,
                 Utc::now().to_rfc3339(),
+                (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339(),
             ],
         )?;
         transaction.commit()
@@ -1074,6 +1622,195 @@ impl Store {
     fn save_backfill(&self, request: &BackfillRequest) -> Result<usize, rusqlite::Error> {
         let mut connection = self.connection.lock().expect("database mutex poisoned");
         let transaction = connection.transaction()?;
+        if let Some(import_id) = request.import_id.as_deref() {
+            let chunk_index = request.chunk_index.ok_or(rusqlite::Error::InvalidQuery)?;
+            let total_chunks = request.total_chunks.ok_or(rusqlite::Error::InvalidQuery)?;
+            transaction.execute(
+                "DELETE FROM market_backfill_staging WHERE created_at<?1",
+                [(Utc::now() - chrono::Duration::hours(24)).to_rfc3339()],
+            )?;
+            transaction.execute(
+                "DELETE FROM market_backfill_import_chunks WHERE created_at<?1",
+                [(Utc::now() - chrono::Duration::hours(24)).to_rfc3339()],
+            )?;
+            if request.reset {
+                transaction.execute(
+                    "DELETE FROM market_backfill_staging WHERE import_id=?1",
+                    [import_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM market_backfill_import_chunks WHERE import_id=?1",
+                    [import_id],
+                )?;
+            } else {
+                let import_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM market_backfill_staging
+                       WHERE import_id=?1 AND symbol=?2 AND timeframe=?3
+                     )",
+                    params![import_id, request.symbol, request.timeframe],
+                    |row| row.get(0),
+                )?;
+                if !import_exists {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            }
+            transaction.execute(
+                "INSERT INTO market_backfill_import_chunks
+                 (import_id, symbol, timeframe, chunk_index, total_chunks, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(import_id, symbol, timeframe, chunk_index) DO UPDATE SET
+                   total_chunks=excluded.total_chunks,
+                   created_at=excluded.created_at",
+                params![
+                    import_id,
+                    request.symbol,
+                    request.timeframe,
+                    chunk_index,
+                    total_chunks,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            let mut staged = 0;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO market_backfill_staging
+                     (import_id, symbol, timeframe, timestamp, open, high, low, close,
+                      tick_volume, bid_open, bid_high, bid_low, bid_close,
+                      ask_open, ask_high, ask_low, ask_close, executable_tick_count,
+                      first_tick_msc, last_tick_msc, tick_path_json, path_point_count,
+                      provider, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                     ON CONFLICT(import_id, symbol, timeframe, timestamp) DO UPDATE SET
+                       open=excluded.open, high=excluded.high, low=excluded.low,
+                       close=excluded.close, tick_volume=excluded.tick_volume,
+                       bid_open=excluded.bid_open, bid_high=excluded.bid_high,
+                       bid_low=excluded.bid_low, bid_close=excluded.bid_close,
+                       ask_open=excluded.ask_open, ask_high=excluded.ask_high,
+                       ask_low=excluded.ask_low, ask_close=excluded.ask_close,
+                       executable_tick_count=excluded.executable_tick_count,
+                       first_tick_msc=excluded.first_tick_msc,
+                       last_tick_msc=excluded.last_tick_msc,
+                       tick_path_json=excluded.tick_path_json,
+                       path_point_count=excluded.path_point_count,
+                       provider=excluded.provider, created_at=excluded.created_at",
+                )?;
+                for bar in &request.bars {
+                    staged += statement.execute(params![
+                        import_id,
+                        request.symbol,
+                        request.timeframe,
+                        bar.timestamp.to_rfc3339(),
+                        bar.open,
+                        bar.high,
+                        bar.low,
+                        bar.close,
+                        bar.tick_volume,
+                        bar.bid_open,
+                        bar.bid_high,
+                        bar.bid_low,
+                        bar.bid_close,
+                        bar.ask_open,
+                        bar.ask_high,
+                        bar.ask_low,
+                        bar.ask_close,
+                        bar.executable_tick_count,
+                        bar.first_tick_msc,
+                        bar.last_tick_msc,
+                        serde_json::to_string(&bar.executable_tick_path)
+                            .unwrap_or_else(|_| "[]".to_owned()),
+                        bar.executable_tick_path.len(),
+                        request.provider,
+                        Utc::now().to_rfc3339(),
+                    ])?;
+                }
+            }
+            if request.final_chunk {
+                let received_chunks: usize = transaction.query_row(
+                    "SELECT COUNT(*)
+                     FROM market_backfill_import_chunks
+                     WHERE import_id=?1 AND symbol=?2 AND timeframe=?3
+                       AND total_chunks=?4",
+                    params![import_id, request.symbol, request.timeframe, total_chunks,],
+                    |row| row.get(0),
+                )?;
+                if received_chunks != total_chunks {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                transaction.execute(
+                    "DELETE FROM market_bars WHERE symbol=?1 AND timeframe=?2",
+                    params![request.symbol, request.timeframe],
+                )?;
+                transaction.execute(
+                    "DELETE FROM market_tick_paths WHERE symbol=?1 AND timeframe=?2",
+                    params![request.symbol, request.timeframe],
+                )?;
+                transaction.execute(
+                    "INSERT INTO market_bars
+                     (symbol, timeframe, timestamp, open, high, low, close, tick_volume,
+                      bid_open, bid_high, bid_low, bid_close,
+                      ask_open, ask_high, ask_low, ask_close, executable_tick_count,
+                      first_tick_msc, last_tick_msc)
+                     SELECT symbol, timeframe, timestamp, open, high, low, close, tick_volume,
+                            bid_open, bid_high, bid_low, bid_close,
+                            ask_open, ask_high, ask_low, ask_close, executable_tick_count,
+                            first_tick_msc, last_tick_msc
+                     FROM market_backfill_staging
+                     WHERE import_id=?1 AND symbol=?2 AND timeframe=?3
+                     ORDER BY timestamp",
+                    params![import_id, request.symbol, request.timeframe],
+                )?;
+                transaction.execute(
+                    "INSERT INTO market_tick_paths
+                     (symbol, timeframe, timestamp, tick_path_json, path_point_count,
+                      first_tick_msc, last_tick_msc, path_valid, source, updated_at)
+                     SELECT symbol, timeframe, timestamp, tick_path_json, path_point_count,
+                            first_tick_msc, last_tick_msc, 1, 'HISTORICAL_BACKFILL',
+                            ?4
+                     FROM market_backfill_staging
+                     WHERE import_id=?1 AND symbol=?2 AND timeframe=?3
+                     ORDER BY timestamp",
+                    params![
+                        import_id,
+                        request.symbol,
+                        request.timeframe,
+                        Utc::now().to_rfc3339()
+                    ],
+                )?;
+                transaction.execute(
+                    "DELETE FROM market_backfill_staging WHERE import_id=?1",
+                    [import_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM market_backfill_import_chunks WHERE import_id=?1",
+                    [import_id],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO audit_events(event_type, entity_id, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    if request.final_chunk {
+                        "MARKET_BACKFILL_PROMOTED"
+                    } else {
+                        "MARKET_BACKFILL_STAGED"
+                    },
+                    request.symbol,
+                    serde_json::json!({
+                        "provider": request.provider,
+                        "import_id": import_id,
+                        "received": request.bars.len(),
+                        "staged": staged,
+                        "final_chunk": request.final_chunk,
+                    })
+                    .to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(staged);
+        }
         if request.reset {
             transaction.execute(
                 "DELETE FROM market_bars WHERE symbol=?1 AND timeframe=?2",
@@ -1333,14 +2070,10 @@ impl Store {
             let action = proposal.action.as_str();
             let fingerprint = serde_json::json!({
                 "action": action,
-                "reference_entry_tick": price_tick(proposal.reference_entry_price),
                 "target_tick": price_tick(proposal.target_price),
                 "stop_tick": price_tick(proposal.invalidation_price),
                 "reward_risk_band": (proposal.reward_risk_ratio / 0.05).round() as i64,
                 "cost_model_id": proposal.cost_model_id,
-                "entry_spread_ticks": (proposal.entry_spread / tick_size).round() as i64,
-                "expected_exit_spread_ticks":
-                    (proposal.expected_exit_spread / tick_size).round() as i64,
                 "reason_codes": proposal.reason_codes,
                 "model_health_status": proposal.model_health_status,
                 "pnl_calculation_source": proposal.pnl_calculation_source,
@@ -1358,8 +2091,32 @@ impl Store {
                 && latest_fingerprint == fingerprint
                 && let Ok(saved) = serde_json::from_str::<DecisionProposal>(&proposal_json)
             {
-                persisted.push(saved);
-                continue;
+                let entry_delta =
+                    match (saved.reference_entry_price, proposal.reference_entry_price) {
+                        (Some(left), Some(right)) => (left - right).abs(),
+                        (None, None) => 0.0,
+                        _ => f64::INFINITY,
+                    };
+                let target_delta = match (saved.target_price, proposal.target_price) {
+                    (Some(left), Some(right)) => (left - right).abs(),
+                    (None, None) => 0.0,
+                    _ => f64::INFINITY,
+                };
+                let stop_delta = match (saved.invalidation_price, proposal.invalidation_price) {
+                    (Some(left), Some(right)) => (left - right).abs(),
+                    (None, None) => 0.0,
+                    _ => f64::INFINITY,
+                };
+                let below_material_threshold = entry_delta < 3.0 * tick_size
+                    && target_delta < tick_size
+                    && stop_delta < tick_size
+                    && (saved.entry_spread - proposal.entry_spread).abs() < 2.0 * tick_size
+                    && (saved.expected_exit_spread - proposal.expected_exit_spread).abs()
+                        < 2.0 * tick_size;
+                if below_material_threshold {
+                    persisted.push(saved);
+                    continue;
+                }
             }
             let directional = matches!(
                 proposal.action,
@@ -1662,7 +2419,13 @@ impl Store {
                    AND p.origin_bid IS NOT NULL
                    AND p.origin_ask IS NOT NULL
                    AND p.barrier_spec_id=?1
-                   AND p.settlement_status='PENDING'
+                   AND p.settlement_status IN (
+                     'PENDING',
+                     'PRICE_OUTCOMES_SETTLED',
+                     'BARRIER_PENDING',
+                     'TICK_PATH_INCOMPLETE',
+                     'SESSION_INTERRUPTED'
+                   )
                    AND p.is_duplicate=0
                    AND EXISTS (
                      SELECT 1 FROM market_bars b
@@ -1767,6 +2530,11 @@ impl Store {
             {
                 continue;
             }
+            let Ok(origin_time) = DateTime::parse_from_rfc3339(&origin_bar_timestamp) else {
+                continue;
+            };
+            let origin_time = origin_time.with_timezone(&Utc);
+            let mut settlement_reason: Option<&'static str> = None;
             for target in &forecast.points {
                 let horizon = target.horizon_bars as usize;
                 if horizon == 0 || outcome_bars.len() < horizon {
@@ -1782,6 +2550,14 @@ impl Store {
                 )?;
 
                 let horizon_bars = &outcome_bars[..horizon];
+                let horizon_timestamps = horizon_bars
+                    .iter()
+                    .map(|bar| bar.0.clone())
+                    .collect::<Vec<_>>();
+                if !is_exact_m5_horizon(origin_time, &horizon_timestamps) {
+                    settlement_reason = Some("SESSION_INTERRUPTED");
+                    continue;
+                }
                 if horizon_bars.iter().any(|bar| {
                     bar.4.is_none()
                         || bar.5.is_none()
@@ -1793,43 +2569,47 @@ impl Store {
                     continue;
                 }
                 let (barrier_long, barrier_short) = if target.horizon_bars == BARRIER_HORIZON_BARS {
-                    let Ok(origin_time) = DateTime::parse_from_rfc3339(&origin_bar_timestamp)
-                    else {
-                        continue;
-                    };
-                    let first_bucket =
-                        origin_time.with_timezone(&Utc) + chrono::Duration::minutes(5);
-                    let end_exclusive = origin_time.with_timezone(&Utc)
+                    let first_bucket = origin_time + chrono::Duration::minutes(5);
+                    let end_exclusive = origin_time
                         + chrono::Duration::minutes((BARRIER_HORIZON_BARS as i64 + 1) * 5);
-                    let tick_path = Self::load_tick_path(
+                    let tick_window = Self::load_tick_path_window(
                         &transaction,
                         &symbol,
                         &timeframe,
                         first_bucket,
                         end_exclusive,
                     )?;
-                    let long = tick_path.as_deref().and_then(|ticks| {
-                        tick_sequence_barrier_outcome(
-                            DecisionAction::Long,
-                            forecast.target_price_long,
-                            forecast.stop_price_long,
-                            ticks,
-                            first_bucket.timestamp_millis() - 1,
-                            end_exclusive.timestamp_millis(),
-                        )
-                        .map(|result| result.outcome)
-                    });
-                    let short = tick_path.as_deref().and_then(|ticks| {
-                        tick_sequence_barrier_outcome(
-                            DecisionAction::Short,
-                            forecast.target_price_short,
-                            forecast.stop_price_short,
-                            ticks,
-                            first_bucket.timestamp_millis() - 1,
-                            end_exclusive.timestamp_millis(),
-                        )
-                        .map(|result| result.outcome)
-                    });
+                    if !tick_window.complete {
+                        settlement_reason = Some(tick_window.incomplete_reason());
+                    }
+                    let long = tick_window
+                        .complete
+                        .then(|| {
+                            tick_sequence_barrier_outcome(
+                                DecisionAction::Long,
+                                forecast.target_price_long,
+                                forecast.stop_price_long,
+                                &tick_window.ticks,
+                                first_bucket.timestamp_millis() - 1,
+                                end_exclusive.timestamp_millis(),
+                            )
+                            .map(|result| result.outcome)
+                        })
+                        .flatten();
+                    let short = tick_window
+                        .complete
+                        .then(|| {
+                            tick_sequence_barrier_outcome(
+                                DecisionAction::Short,
+                                forecast.target_price_short,
+                                forecast.stop_price_short,
+                                &tick_window.ticks,
+                                first_bucket.timestamp_millis() - 1,
+                                end_exclusive.timestamp_millis(),
+                            )
+                            .map(|result| result.outcome)
+                        })
+                        .flatten();
                     (long, short)
                 } else {
                     (None, None)
@@ -1945,8 +2725,41 @@ impl Store {
                 |row| row.get(0),
             )?;
             if completed_horizons == 4 {
+                let barriers_complete: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM prediction_horizon_outcomes
+                       WHERE prediction_id=?1 AND horizon_bars=3
+                         AND barrier_long_outcome IS NOT NULL
+                         AND barrier_short_outcome IS NOT NULL
+                     )",
+                    [&prediction_id],
+                    |row| row.get(0),
+                )?;
+                let (status, reason) = if barriers_complete {
+                    ("SETTLED", None)
+                } else {
+                    (
+                        settlement_reason.unwrap_or("BARRIER_PENDING"),
+                        settlement_reason,
+                    )
+                };
                 transaction.execute(
-                    "UPDATE predictions SET settlement_status='SETTLED'
+                    "UPDATE predictions
+                     SET settlement_status=?2, settlement_reason=?3
+                     WHERE prediction_id=?1",
+                    params![prediction_id, status, reason],
+                )?;
+            } else if let Some(reason) = settlement_reason {
+                transaction.execute(
+                    "UPDATE predictions
+                     SET settlement_status=?2, settlement_reason=?2
+                     WHERE prediction_id=?1",
+                    params![prediction_id, reason],
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE predictions
+                     SET settlement_status='PENDING', settlement_reason=NULL
                      WHERE prediction_id=?1",
                     [&prediction_id],
                 )?;
@@ -2024,16 +2837,22 @@ impl Store {
             let first_bucket =
                 DateTime::<Utc>::from_timestamp(quote_time.timestamp().div_euclid(300) * 300, 0)
                     .expect("valid M5 proposal bucket");
-            let Some(ticks) = Self::load_tick_path(
+            let tick_window = Self::load_tick_path_window(
                 &transaction,
                 &symbol,
                 &timeframe,
                 first_bucket,
                 proposal.outcome_matures_at,
-            )?
-            else {
+            )?;
+            if !tick_window.complete {
+                transaction.execute(
+                    "UPDATE decision_proposal_instances
+                     SET settlement_status=?2, settlement_reason=?2
+                     WHERE proposal_id=?1",
+                    params![proposal_id, tick_window.incomplete_reason()],
+                )?;
                 continue;
-            };
+            }
             let action = if action_text == "LONG" {
                 DecisionAction::Long
             } else {
@@ -2043,7 +2862,7 @@ impl Store {
                 action,
                 target,
                 stop,
-                &ticks,
+                &tick_window.ticks,
                 quote_time.timestamp_millis(),
                 proposal.outcome_matures_at.timestamp_millis(),
             ) else {
@@ -2070,6 +2889,12 @@ impl Store {
                     Utc::now().to_rfc3339(),
                 ],
             )?;
+            transaction.execute(
+                "UPDATE decision_proposal_instances
+                 SET settlement_status='SETTLED', settlement_reason=NULL
+                 WHERE proposal_id=?1",
+                [&proposal_id],
+            )?;
             settled += 1;
         }
         transaction.commit()?;
@@ -2094,6 +2919,7 @@ impl Store {
                    AND p.model_id=?1
                    AND p.barrier_spec_id=?2
                    AND p.is_duplicate=0
+                   AND p.settlement_status='SETTLED'
                  ORDER BY o.origin_bar_timestamp DESC
                  LIMIT 200",
             )?;
@@ -2412,7 +3238,8 @@ impl Store {
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END),
                     COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome IN
+                      ('AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP') THEN 1 END),
                     COUNT(CASE WHEN o.barrier_outcome IN
                       ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
                     AVG(CASE
@@ -2432,6 +3259,7 @@ impl Store {
              WHERE p.model_id != 'baseline-demo-v1'
                AND p.barrier_spec_id=?1
                AND p.is_duplicate=0
+               AND p.settlement_status='SETTLED'
                AND o.horizon_bars=3",
             [BARRIER_SPEC_ID],
             |row| {
@@ -2459,7 +3287,8 @@ impl Store {
                               WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                             END),
                         COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                        COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                        COUNT(CASE WHEN o.barrier_outcome IN
+                          ('AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP') THEN 1 END),
                         COUNT(CASE WHEN o.barrier_outcome IN
                           ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
                         AVG(CASE
@@ -2478,6 +3307,7 @@ impl Store {
                  JOIN predictions p ON p.prediction_id=o.prediction_id
                  WHERE o.horizon_bars=3 AND p.barrier_spec_id=?1
                    AND p.is_duplicate=0
+                   AND p.settlement_status='SETTLED'
                  GROUP BY p.model_id ORDER BY MAX(o.settled_at) DESC",
             )?;
             statement
@@ -2508,6 +3338,7 @@ impl Store {
                  AND p.model_id=?1
                  AND p.barrier_spec_id=?2
                  AND p.is_duplicate=0
+                 AND p.settlement_status='SETTLED'
                ORDER BY o.origin_bar_timestamp DESC
                LIMIT 200
              )
@@ -2520,7 +3351,8 @@ impl Store {
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END),
                     COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome IN
+                      ('AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP') THEN 1 END),
                     COUNT(CASE WHEN o.barrier_outcome IN
                       ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
                     AVG(CASE
@@ -2565,7 +3397,8 @@ impl Store {
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END),
                     COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome IN
+                      ('AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP') THEN 1 END),
                     COUNT(CASE WHEN o.barrier_outcome IN
                       ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
                     AVG(CASE
@@ -2586,7 +3419,8 @@ impl Store {
                AND p.model_id=?1
                AND p.generated_at>=?2
                AND p.barrier_spec_id=?3
-               AND p.is_duplicate=0",
+               AND p.is_duplicate=0
+               AND p.settlement_status='SETTLED'",
             params![current_model_id, session_started_at_text, BARRIER_SPEC_ID],
             |row| {
                 Ok(serde_json::json!({
@@ -2618,6 +3452,7 @@ impl Store {
                      AND p.model_id=?1
                      AND p.barrier_spec_id=?2
                      AND p.is_duplicate=0
+                     AND p.settlement_status='SETTLED'
                    ORDER BY o.origin_bar_timestamp DESC
                    LIMIT 200
                  ),
@@ -2636,7 +3471,8 @@ impl Store {
                               WHEN outcome='SL_FIRST' THEN 0.0
                             END),
                         COUNT(CASE WHEN outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                        COUNT(CASE WHEN outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                        COUNT(CASE WHEN outcome IN
+                          ('AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP') THEN 1 END),
                         COUNT(CASE WHEN outcome IN
                           ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
                         AVG(CASE
@@ -2683,6 +3519,7 @@ impl Store {
                      AND p.model_id=?1
                      AND p.barrier_spec_id=?2
                      AND p.is_duplicate=0
+                     AND p.settlement_status='SETTLED'
                    ORDER BY o.origin_bar_timestamp DESC
                    LIMIT 200
                  ),
@@ -2810,6 +3647,7 @@ impl Store {
                    FROM predictions p
                    WHERE p.model_id=?1 AND p.barrier_spec_id=?2
                      AND p.is_duplicate=0
+                     AND p.settlement_status='SETTLED'
                    ORDER BY p.origin_bar_timestamp DESC
                    LIMIT 200
                  )
@@ -2821,7 +3659,8 @@ impl Store {
                               WHEN po.barrier_outcome='SL_FIRST' THEN 0.0
                             END),
                         COUNT(CASE WHEN po.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                        COUNT(CASE WHEN po.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                        COUNT(CASE WHEN po.barrier_outcome IN
+                          ('AMBIGUOUS_SAME_BAR','AMBIGUOUS_SAME_TIMESTAMP') THEN 1 END),
                         COUNT(CASE WHEN po.barrier_outcome IN
                           ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
                         AVG(CASE
@@ -2903,6 +3742,48 @@ impl IntoResponse for ApiError {
     }
 }
 
+fn validate_backfill_continuation(
+    progress: BackfillImportProgress,
+    chunk_index: usize,
+    total_chunks: usize,
+    final_chunk: bool,
+    first_timestamp: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    if total_chunks != progress.expected_chunks {
+        return Err(ApiError::bad_request(
+            "backfill total_chunks changed during the staged import",
+        ));
+    }
+    if chunk_index != progress.received_chunks {
+        return Err(ApiError::bad_request(
+            "backfill chunks must arrive exactly once in ascending sequence",
+        ));
+    }
+    if first_timestamp <= progress.last_staged_timestamp {
+        return Err(ApiError::bad_request(
+            "backfill bar timestamps must increase across chunks",
+        ));
+    }
+    if final_chunk && progress.received_chunks + 1 != total_chunks {
+        return Err(ApiError::bad_request(
+            "backfill final chunk arrived before every preceding chunk",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_backfill_bar_order(bars: &[MarketBar]) -> Result<(), ApiError> {
+    if bars
+        .windows(2)
+        .any(|pair| pair[0].timestamp >= pair[1].timestamp)
+    {
+        return Err(ApiError::bad_request(
+            "backfill bars must be strictly ordered without duplicate timestamps",
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -2925,6 +3806,7 @@ async fn main() {
         policies,
     };
     tokio::spawn(settlement_loop(state.store.clone()));
+    tokio::spawn(policy_clock_loop(state.clone()));
 
     let cors = CorsLayer::new()
         .allow_origin([
@@ -2946,7 +3828,12 @@ async fn main() {
         .route("/api/v1/state", get(get_state))
         .route("/api/v1/market/cursor", get(get_market_cursor))
         .route("/api/v1/market/snapshot", post(post_snapshot))
-        .route("/api/v1/market/backfill", post(post_backfill))
+        .route(
+            "/api/v1/market/backfill",
+            post(post_backfill)
+                .layer::<_, Infallible>(RequestDecompressionLayer::new())
+                .layer::<_, Infallible>(DefaultBodyLimit::max(BACKFILL_BODY_LIMIT_BYTES)),
+        )
         .route("/api/v1/forecast", post(post_forecast))
         .route("/api/v1/feedback", post(post_feedback))
         .route("/api/v1/models", get(get_models))
@@ -3008,9 +3895,86 @@ async fn post_backfill(
     if request.timeframe != xpde_domain::SUPPORTED_TIMEFRAME {
         return Err(ApiError::bad_request("unsupported backfill timeframe"));
     }
-    if request.bars.is_empty() || request.bars.len() > 5_000 {
+    if request.bars.is_empty() || request.bars.len() > BACKFILL_MAX_BARS {
         return Err(ApiError::bad_request(
-            "backfill chunk must contain between 1 and 5000 bars",
+            "backfill chunk must contain between 1 and 250 bars",
+        ));
+    }
+    validate_backfill_bar_order(&request.bars)?;
+    if request.reset && request.import_id.is_none() {
+        return Err(ApiError::bad_request(
+            "reset backfill requires an import_id for atomic staging",
+        ));
+    }
+    if request.import_id.is_some() {
+        let Some(chunk_index) = request.chunk_index else {
+            return Err(ApiError::bad_request(
+                "staged backfill requires chunk_index",
+            ));
+        };
+        let Some(total_chunks) = request.total_chunks else {
+            return Err(ApiError::bad_request(
+                "staged backfill requires total_chunks",
+            ));
+        };
+        if total_chunks == 0
+            || chunk_index >= total_chunks
+            || (request.reset && chunk_index != 0)
+            || (request.final_chunk && chunk_index + 1 != total_chunks)
+            || (!request.final_chunk && chunk_index + 1 == total_chunks)
+        {
+            return Err(ApiError::bad_request(
+                "backfill chunk sequence metadata is invalid",
+            ));
+        }
+    } else if request.chunk_index.is_some() || request.total_chunks.is_some() {
+        return Err(ApiError::bad_request(
+            "backfill chunk metadata requires import_id",
+        ));
+    }
+    if request.import_id.as_ref().is_some_and(|import_id| {
+        import_id.len() > 64
+            || import_id.is_empty()
+            || !import_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    }) {
+        return Err(ApiError::bad_request("backfill import_id is invalid"));
+    }
+    if let Some(import_id) = request.import_id.as_deref()
+        && !request.reset
+    {
+        let Some(progress) = state
+            .store
+            .backfill_import_progress(import_id, &request.symbol, &request.timeframe)
+            .map_err(|error| ApiError::internal(error.to_string()))?
+        else {
+            return Err(ApiError::bad_request(
+                "backfill import_id is unknown, expired, or has already been promoted",
+            ));
+        };
+        let chunk_index = request
+            .chunk_index
+            .expect("staged request metadata was validated");
+        let total_chunks = request
+            .total_chunks
+            .expect("staged request metadata was validated");
+        validate_backfill_continuation(
+            progress,
+            chunk_index,
+            total_chunks,
+            request.final_chunk,
+            request.bars[0].timestamp,
+        )?;
+    }
+    let tick_points = request
+        .bars
+        .iter()
+        .map(|bar| bar.executable_tick_path.len())
+        .sum::<usize>();
+    if tick_points > BACKFILL_MAX_TICK_POINTS {
+        return Err(ApiError::bad_request(
+            "backfill chunk exceeds the executable tick-point limit",
         ));
     }
     if request.bars.iter().any(|bar| {
@@ -3022,7 +3986,8 @@ async fn post_backfill(
             || bar.low > bar.open.min(bar.close)
             || bar.timestamp > Utc::now() + chrono::Duration::minutes(5)
             || bar.timestamp.timestamp() % 300 != 0
-            || !bar.has_executable_sides()
+            || !bar.has_valid_tick_path()
+            || !bar.has_complete_tick_coverage(0.95)
     }) {
         return Err(ApiError::bad_request("backfill contains an invalid bar"));
     }
@@ -3064,6 +4029,7 @@ async fn post_snapshot(
     };
     runtime.mode = "LIVE_SHADOW";
     runtime.updated_at = Utc::now();
+    runtime.last_market_snapshot_at = runtime.updated_at;
     runtime.safety.feed_is_demo = false;
     runtime.model_health = model_health;
     runtime.forecast_status = forecast_status(
@@ -3203,6 +4169,9 @@ async fn post_feedback(
     State(state): State<AppState>,
     Json(feedback): Json<HumanFeedback>,
 ) -> Result<StatusCode, ApiError> {
+    refresh_runtime_policy(&state, Utc::now())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     if feedback.note.as_ref().is_some_and(|note| note.len() > 500) {
         return Err(ApiError::bad_request(
             "feedback note exceeds 500 characters",
@@ -3237,18 +4206,13 @@ async fn post_feedback(
                 "feedback rejected because the proposal is not the latest published instance",
             ));
         }
-        if matches!(feedback.verdict, xpde_domain::FeedbackVerdict::Accepted)
-            && matches!(
-                feedback.proposal_action,
-                DecisionAction::Long | DecisionAction::Short
-            )
-            && matches!(
-                runtime.model_health.status,
-                ModelHealthStatus::Degraded | ModelHealthStatus::Suspended
-            )
-        {
+        let selected_policy = match feedback.profile {
+            TradingProfile::Scalper => &state.policies.scalper,
+            TradingProfile::Sniper => &state.policies.sniper,
+        };
+        if !feedback_context_is_actionable(&runtime, selected_policy) {
             return Err(ApiError::bad_request(
-                "feedback rejected because live model health no longer permits entry",
+                "feedback rejected because the market/feed/forecast/model context is no longer actionable",
             ));
         }
     }
@@ -3390,8 +4354,12 @@ async fn public_runtime_state(state: &AppState) -> RuntimeState {
         now,
     );
     if !runtime.safety.feed_is_demo {
-        let bridge_age_ms = Utc::now()
-            .signed_duration_since(runtime.updated_at)
+        let bridge_age_ms = now
+            .signed_duration_since(runtime.last_market_snapshot_at)
+            .num_milliseconds()
+            .max(0) as u64;
+        runtime.snapshot.data_quality.absolute_tick_age_ms = now
+            .signed_duration_since(runtime.snapshot.timestamp)
             .num_milliseconds()
             .max(0) as u64;
         runtime.snapshot.data_quality.transport_tick_age_ms = runtime
@@ -3415,6 +4383,91 @@ async fn public_runtime_state(state: &AppState) -> RuntimeState {
         }
     }
     runtime
+}
+
+async fn refresh_runtime_policy(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> Result<(), rusqlite::Error> {
+    let mut runtime = state.runtime.write().await;
+    if runtime.safety.feed_is_demo {
+        return Ok(());
+    }
+    let bridge_age_ms = now
+        .signed_duration_since(runtime.last_market_snapshot_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    let absolute_tick_age_ms = now
+        .signed_duration_since(runtime.snapshot.timestamp)
+        .num_milliseconds()
+        .max(0) as u64;
+    runtime.snapshot.data_quality.absolute_tick_age_ms = absolute_tick_age_ms;
+    runtime.snapshot.data_quality.transport_tick_age_ms = runtime
+        .snapshot
+        .data_quality
+        .transport_tick_age_ms
+        .max(bridge_age_ms);
+    runtime.snapshot.data_quality.tick_age_ms =
+        absolute_tick_age_ms.max(runtime.snapshot.data_quality.transport_tick_age_ms);
+    let provider_reported_closed =
+        runtime.snapshot.data_quality.market_status == MarketStatus::MarketClosed;
+    let session_open_until = state.policies.market_session.session_open_until(now);
+    runtime.snapshot.data_quality.market_session_open_until = session_open_until;
+    runtime.snapshot.data_quality.market_status = if session_open_until.is_none()
+        || provider_reported_closed
+    {
+        MarketStatus::MarketClosed
+    } else if bridge_age_ms > state.policies.scalper.max_tick_age_ms {
+        MarketStatus::BridgeDisconnected
+    } else if runtime.snapshot.data_quality.tick_age_ms > state.policies.scalper.max_tick_age_ms {
+        MarketStatus::FeedStale
+    } else {
+        MarketStatus::Open
+    };
+    runtime.connection_status = match runtime.snapshot.data_quality.market_status {
+        MarketStatus::Open if runtime.snapshot.data_quality.is_valid(10_000) => "MT5_CONNECTED",
+        MarketStatus::MarketClosed => "MARKET_CLOSED",
+        MarketStatus::BridgeDisconnected => "BRIDGE_DISCONNECTED",
+        _ => "MT5_STALE",
+    };
+    runtime.forecast_status = forecast_status(
+        &runtime.snapshot,
+        &runtime.forecast,
+        runtime.safety.feed_is_demo,
+        now,
+    );
+    let mut proposals = vec![
+        decide_at(
+            &runtime.snapshot,
+            &runtime.forecast,
+            &state.policies.scalper,
+            now,
+        ),
+        decide_at(
+            &runtime.snapshot,
+            &runtime.forecast,
+            &state.policies.sniper,
+            now,
+        ),
+    ];
+    apply_model_health_gate(
+        &mut proposals,
+        &runtime.model_health,
+        state.policies.model_health.warming_up_forces_wait,
+    );
+    runtime.proposals = state.store.save_proposal_instances(&proposals)?;
+    runtime.updated_at = now;
+    Ok(())
+}
+
+async fn policy_clock_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        if let Err(error) = refresh_runtime_policy(&state, Utc::now()).await {
+            warn!(%error, "policy clock failed");
+        }
+    }
 }
 
 async fn settlement_loop(store: Arc<Store>) {
@@ -3514,7 +4567,6 @@ fn demo_state() -> RuntimeState {
             margin_per_lot_sell: Some(3.34),
             chart_mode: ChartMode::Bid,
             quote_currency: "USD".to_owned(),
-            pnl_currency: "USD".to_owned(),
             symbol_profit_currency: "USD".to_owned(),
             calculated_pnl_currency: "USD".to_owned(),
             profit_per_price_unit_per_lot_buy: Some(1.0),
@@ -3531,6 +4583,7 @@ fn demo_state() -> RuntimeState {
             absolute_tick_age_ms: 0,
             transport_tick_age_ms: 0,
             market_status: MarketStatus::Open,
+            market_session_open_until: Some(now + chrono::Duration::hours(8)),
             missing_flags: Vec::new(),
             reason_codes: vec!["DEMO_DATA".to_owned()],
         },
@@ -3613,6 +4666,7 @@ fn demo_state() -> RuntimeState {
         mode: "DEMO_SHADOW",
         connection_status: "WAITING_FOR_MT5",
         updated_at: now,
+        last_market_snapshot_at: now,
         forecast_status: ForecastStatus::Demo,
         snapshot,
         forecast,
@@ -3629,6 +4683,125 @@ fn demo_state() -> RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn always_open_policy_set() -> PolicySet {
+        PolicySet {
+            scalper: DecisionPolicy::scalper(),
+            sniper: DecisionPolicy::sniper(),
+            model_health: ModelHealthPolicy {
+                minimum_settled_predictions: 100,
+                minimum_interval_coverage: 0.70,
+                maximum_interval_coverage: 0.90,
+                maximum_direction_brier: 0.26,
+                maximum_direction_brier_ratio_to_baseline: 1.0,
+                maximum_barrier_brier_ratio_to_baseline: 1.0,
+                maximum_barrier_ece: 0.12,
+                minimum_mae_q90_coverage: 0.80,
+                maximum_mae_q90_coverage: 0.98,
+                degrade_after_failed_windows: 2,
+                suspend_after_severe_windows: 2,
+                recover_after_healthy_windows: 3,
+                warming_up_forces_wait: true,
+            },
+            market_session: MarketSessionPolicy {
+                sessions: (0..7)
+                    .map(|day| {
+                        (
+                            day,
+                            vec![(
+                                NaiveTime::from_hms_opt(0, 0, 0).expect("time"),
+                                NaiveTime::from_hms_opt(23, 59, 59).expect("time"),
+                            )],
+                        )
+                    })
+                    .collect(),
+                closed_dates: BTreeSet::new(),
+                utc_offset_hours: 0,
+            },
+        }
+    }
+
+    fn executable_backfill_bar(timestamp: DateTime<Utc>, close: f64) -> MarketBar {
+        let start = timestamp.timestamp_millis();
+        MarketBar {
+            timestamp,
+            open: close - 0.1,
+            high: close + 0.2,
+            low: close - 0.2,
+            close,
+            tick_volume: 4.0,
+            bid_open: Some(close - 0.1),
+            bid_high: Some(close + 0.2),
+            bid_low: Some(close - 0.2),
+            bid_close: Some(close),
+            ask_open: Some(close + 0.1),
+            ask_high: Some(close + 0.4),
+            ask_low: Some(close),
+            ask_close: Some(close + 0.2),
+            executable_tick_count: 4,
+            first_tick_msc: Some(start),
+            last_tick_msc: Some(start + 299_000),
+            executable_tick_path: vec![
+                (start, close - 0.1, close + 0.1),
+                (start + 100_000, close + 0.2, close + 0.4),
+                (start + 200_000, close - 0.2, close),
+                (start + 299_000, close, close + 0.2),
+            ],
+        }
+    }
+
+    #[test]
+    fn market_calendar_handles_overnight_sessions_and_closed_dates() {
+        let policy = MarketSessionPolicy {
+            sessions: BTreeMap::from([(
+                1,
+                vec![(
+                    NaiveTime::from_hms_opt(23, 0, 0).expect("start"),
+                    NaiveTime::from_hms_opt(1, 0, 0).expect("end"),
+                )],
+            )]),
+            closed_dates: BTreeSet::new(),
+            utc_offset_hours: 0,
+        };
+        let overnight = DateTime::parse_from_rfc3339("2026-07-29T00:30:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        assert_eq!(
+            policy.session_open_until(overnight),
+            Some(
+                DateTime::parse_from_rfc3339("2026-07-29T01:00:00Z")
+                    .expect("session end")
+                    .with_timezone(&Utc)
+            )
+        );
+
+        let closed = MarketSessionPolicy {
+            closed_dates: BTreeSet::from(["2026-07-29".to_owned()]),
+            ..policy
+        };
+        assert_eq!(closed.session_open_until(overnight), None);
+    }
+
+    #[test]
+    fn market_calendar_rejects_malformed_closed_dates() {
+        let config = MarketSessionFile {
+            timezone: "fixed_broker_utc_offset".to_owned(),
+            monday: Vec::new(),
+            tuesday: Vec::new(),
+            wednesday: Vec::new(),
+            thursday: Vec::new(),
+            friday: Vec::new(),
+            saturday: Vec::new(),
+            sunday: Vec::new(),
+            closed_dates: vec!["29-07-2026".to_owned()],
+        };
+        assert!(
+            MarketSessionPolicy::parse(&config)
+                .expect_err("malformed date must fail")
+                .contains("invalid market closed date")
+        );
+    }
 
     #[test]
     fn barrier_outcome_uses_exact_long_contract() {
@@ -3689,6 +4862,188 @@ mod tests {
         assert_eq!(result.outcome, BarrierOutcome::TpFirst);
         assert_eq!(result.first_touch_time_msc, Some(3_000));
         assert_eq!(result.first_touch_price, Some(101.2));
+    }
+
+    #[test]
+    fn tick_sequence_keeps_same_timestamp_order_ambiguous() {
+        let result = tick_sequence_barrier_outcome(
+            DecisionAction::Long,
+            101.0,
+            99.0,
+            &[
+                (2_000, 101.2, 101.4),
+                (2_000, 98.8, 99.0),
+                (3_000, 100.0, 100.2),
+            ],
+            1_000,
+            4_000,
+        )
+        .expect("same-timestamp ticks");
+
+        assert_eq!(result.outcome, BarrierOutcome::AmbiguousSameTimestamp);
+        assert_eq!(result.first_touch_time_msc, Some(2_000));
+        assert_eq!(result.first_touch_price, None);
+    }
+
+    #[test]
+    fn tick_sequence_does_not_guess_a_touch_at_the_exact_quote_millisecond() {
+        let result = tick_sequence_barrier_outcome(
+            DecisionAction::Long,
+            101.0,
+            99.0,
+            &[(2_000, 101.2, 101.4), (3_000, 100.0, 100.2)],
+            2_000,
+            4_000,
+        )
+        .expect("boundary ambiguity");
+
+        assert_eq!(result.outcome, BarrierOutcome::AmbiguousSameTimestamp);
+        assert_eq!(result.first_touch_time_msc, Some(2_000));
+        assert_eq!(result.first_touch_price, None);
+    }
+
+    #[test]
+    fn price_horizons_require_every_exact_m5_bucket() {
+        let origin = Utc
+            .with_ymd_and_hms(2026, 7, 29, 10, 0, 0)
+            .single()
+            .expect("origin");
+        let exact = [5, 10, 15]
+            .into_iter()
+            .map(|minutes| {
+                (origin + chrono::Duration::minutes(minutes))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            })
+            .collect::<Vec<_>>();
+        assert!(is_exact_m5_horizon(origin, &exact));
+
+        let missing_middle = vec![exact[0].clone(), exact[2].clone()];
+        assert!(!is_exact_m5_horizon(origin, &missing_middle));
+        let duplicate = vec![exact[0].clone(), exact[0].clone()];
+        assert!(!is_exact_m5_horizon(origin, &duplicate));
+        assert!(!is_exact_m5_horizon(origin, &[]));
+    }
+
+    #[test]
+    fn tick_path_window_rejects_a_missing_middle_bucket() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let first_bucket =
+            DateTime::<Utc>::from_timestamp(1_700_000_100_i64.div_euclid(300) * 300, 0)
+                .expect("bucket");
+        for offset in 0..3 {
+            let bucket = first_bucket + chrono::Duration::minutes(offset * 5);
+            connection
+                .execute(
+                    "INSERT INTO market_bars
+                     (symbol,timeframe,timestamp,open,high,low,close,tick_volume)
+                     VALUES ('GOLDm#','M5',?1,100,101,99,100,10)",
+                    [bucket.to_rfc3339()],
+                )
+                .expect("market bar");
+            if offset == 1 {
+                continue;
+            }
+            let tick_msc = bucket.timestamp_millis() + 1_000;
+            connection
+                .execute(
+                    "INSERT INTO market_tick_paths
+                     (symbol,timeframe,timestamp,tick_path_json,path_point_count,
+                      first_tick_msc,last_tick_msc,path_valid,source,updated_at)
+                     VALUES ('GOLDm#','M5',?1,?2,1,?3,?3,1,'TEST',?4)",
+                    params![
+                        bucket.to_rfc3339(),
+                        serde_json::json!([[tick_msc, 100.0, 100.2]]).to_string(),
+                        tick_msc,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .expect("tick path");
+        }
+        let transaction = connection.transaction().expect("transaction");
+        let window = Store::load_tick_path_window(
+            &transaction,
+            "GOLDm#",
+            "M5",
+            first_bucket,
+            first_bucket + chrono::Duration::minutes(15),
+        )
+        .expect("tick path window");
+
+        assert!(!window.complete);
+        assert_eq!(window.expected_buckets.len(), 3);
+        assert_eq!(window.present_buckets.len(), 2);
+        assert_eq!(window.missing_buckets.len(), 1);
+        assert!(window.missing_market_buckets.is_empty());
+        assert_eq!(window.incomplete_reason(), "TICK_PATH_INCOMPLETE");
+    }
+
+    #[test]
+    fn tick_path_window_marks_a_missing_market_bucket_as_interrupted_session() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let first_bucket =
+            DateTime::<Utc>::from_timestamp(1_700_000_100_i64.div_euclid(300) * 300, 0)
+                .expect("bucket");
+        let transaction = connection.transaction().expect("transaction");
+        let window = Store::load_tick_path_window(
+            &transaction,
+            "GOLDm#",
+            "M5",
+            first_bucket,
+            first_bucket + chrono::Duration::minutes(5),
+        )
+        .expect("tick path window");
+
+        assert!(!window.complete);
+        assert_eq!(window.missing_market_buckets, vec![first_bucket]);
+        assert_eq!(window.incomplete_reason(), "SESSION_INTERRUPTED");
+    }
+
+    #[test]
+    fn tick_path_window_never_treats_a_live_partial_path_as_complete() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let bucket = DateTime::<Utc>::from_timestamp(1_700_000_100_i64.div_euclid(300) * 300, 0)
+            .expect("bucket");
+        let tick_msc = bucket.timestamp_millis() + 1_000;
+        connection
+            .execute(
+                "INSERT INTO market_bars
+                 (symbol,timeframe,timestamp,open,high,low,close,tick_volume)
+                 VALUES ('GOLDm#','M5',?1,100,101,99,100,10)",
+                [bucket.to_rfc3339()],
+            )
+            .expect("market bar");
+        connection
+            .execute(
+                "INSERT INTO market_tick_paths
+                 (symbol,timeframe,timestamp,tick_path_json,path_point_count,
+                  first_tick_msc,last_tick_msc,path_valid,source,updated_at)
+                 VALUES ('GOLDm#','M5',?1,?2,1,?3,?3,1,'LIVE_CURRENT',?4)",
+                params![
+                    bucket.to_rfc3339(),
+                    serde_json::json!([[tick_msc, 100.0, 100.2]]).to_string(),
+                    tick_msc,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("partial path");
+        let transaction = connection.transaction().expect("transaction");
+
+        let window = Store::load_tick_path_window(
+            &transaction,
+            "GOLDm#",
+            "M5",
+            bucket,
+            bucket + chrono::Duration::minutes(5),
+        )
+        .expect("tick path window");
+
+        assert!(!window.complete);
+        assert_eq!(window.missing_buckets, vec![bucket]);
+        assert!(window.missing_market_buckets.is_empty());
+        assert_eq!(window.incomplete_reason(), "TICK_PATH_INCOMPLETE");
     }
 
     #[test]
@@ -3818,6 +5173,129 @@ mod tests {
     }
 
     #[test]
+    fn prediction_waits_for_h3_paths_then_settles_after_recovery() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        let mut runtime = demo_state();
+        let origin = runtime.snapshot.bars[runtime.snapshot.bars.len() - 13].clone();
+        runtime.forecast.origin_bar_timestamp = origin.timestamp;
+        runtime.forecast.origin_bar_index = origin.timestamp.timestamp().div_euclid(300);
+        runtime.forecast.origin_close = origin.close;
+        runtime.forecast.generated_at = origin.timestamp + chrono::Duration::minutes(5);
+        runtime.forecast.target_price_long = origin.close + 1.25;
+        runtime.forecast.stop_price_long = origin.close - 1.0;
+        runtime.forecast.target_price_short = origin.close - 1.25;
+        runtime.forecast.stop_price_short = origin.close + 1.0;
+        store
+            .save_snapshot(&runtime.snapshot)
+            .expect("snapshot persistence");
+        store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .execute(
+                "DELETE FROM market_bars WHERE timestamp>?1",
+                [origin.timestamp.to_rfc3339()],
+            )
+            .expect("remove future fixture bars");
+        store
+            .save_prediction(&runtime.snapshot, &runtime.forecast, &runtime.proposals)
+            .expect("prediction persistence");
+        let future_bars = (1..=12)
+            .map(|offset| {
+                executable_backfill_bar(
+                    runtime.forecast.origin_bar_timestamp + chrono::Duration::minutes(offset * 5),
+                    runtime.forecast.origin_close + offset as f64 * 0.1,
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .save_backfill(&BackfillRequest {
+                symbol: xpde_domain::SUPPORTED_SYMBOL.to_owned(),
+                timeframe: xpde_domain::SUPPORTED_TIMEFRAME.to_owned(),
+                provider: "TEST".to_owned(),
+                broker_offset_hours: 0,
+                reset: false,
+                import_id: None,
+                final_chunk: true,
+                chunk_index: None,
+                total_chunks: None,
+                bars: future_bars.clone(),
+            })
+            .expect("future history");
+        let missing = future_bars[1].timestamp.to_rfc3339();
+        store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .execute(
+                "DELETE FROM market_tick_paths WHERE timestamp=?1",
+                [&missing],
+            )
+            .expect("remove middle path");
+
+        let initially_settled = store
+            .settle_expired_predictions()
+            .expect("incomplete settlement");
+        assert_eq!(initially_settled, 4);
+        let incomplete: (String, Option<String>, Option<String>) = store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .query_row(
+                "SELECT p.settlement_status, h.barrier_long_outcome,
+                        h.barrier_short_outcome
+                 FROM predictions p
+                 JOIN prediction_horizon_outcomes h
+                   ON h.prediction_id=p.prediction_id AND h.horizon_bars=3
+                 WHERE p.prediction_id=?1",
+                [runtime.forecast.prediction_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("incomplete state");
+        assert_eq!(incomplete, ("TICK_PATH_INCOMPLETE".to_owned(), None, None));
+
+        store
+            .save_backfill(&BackfillRequest {
+                symbol: xpde_domain::SUPPORTED_SYMBOL.to_owned(),
+                timeframe: xpde_domain::SUPPORTED_TIMEFRAME.to_owned(),
+                provider: "TEST".to_owned(),
+                broker_offset_hours: 0,
+                reset: false,
+                import_id: None,
+                final_chunk: true,
+                chunk_index: None,
+                total_chunks: None,
+                bars: vec![future_bars[1].clone()],
+            })
+            .expect("recover middle path");
+        store
+            .settle_expired_predictions()
+            .expect("recovered settlement");
+        let recovered: (String, String, String) = store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .query_row(
+                "SELECT p.settlement_status, h.barrier_long_outcome,
+                        h.barrier_short_outcome
+                 FROM predictions p
+                 JOIN prediction_horizon_outcomes h
+                   ON h.prediction_id=p.prediction_id AND h.horizon_bars=3
+                 WHERE p.prediction_id=?1",
+                [runtime.forecast.prediction_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("recovered state");
+        assert_eq!(recovered.0, "SETTLED");
+        assert!(!recovered.1.is_empty());
+        assert!(!recovered.2.is_empty());
+    }
+
+    #[test]
     fn proposal_instances_are_idempotent_until_material_state_changes() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         connection.execute_batch(MIGRATION).expect("migration");
@@ -3847,10 +5325,10 @@ mod tests {
             .save_proposal_instances(&[proposal.clone()])
             .expect("sub-tick proposal noise");
         assert_eq!(first[0].proposal_id, sub_tick[0].proposal_id);
-        proposal.reference_entry_price = proposal.reference_entry_price.map(|price| price + 0.01);
+        proposal.reference_entry_price = proposal.reference_entry_price.map(|price| price + 0.03);
         let material_tick = store
             .save_proposal_instances(&[proposal.clone()])
-            .expect("one-tick proposal change");
+            .expect("three-tick proposal change");
         assert_ne!(first[0].proposal_id, material_tick[0].proposal_id);
         assert!(!material_tick[0].evidence_eligible);
         let feedback = HumanFeedback {
@@ -3923,25 +5401,7 @@ mod tests {
             store: store.clone(),
             runtime: Arc::new(RwLock::new(runtime)),
             started_at: Utc::now(),
-            policies: PolicySet {
-                scalper: DecisionPolicy::scalper(),
-                sniper: DecisionPolicy::sniper(),
-                model_health: ModelHealthPolicy {
-                    minimum_settled_predictions: 100,
-                    minimum_interval_coverage: 0.70,
-                    maximum_interval_coverage: 0.90,
-                    maximum_direction_brier: 0.26,
-                    maximum_direction_brier_ratio_to_baseline: 1.0,
-                    maximum_barrier_brier_ratio_to_baseline: 1.0,
-                    maximum_barrier_ece: 0.12,
-                    minimum_mae_q90_coverage: 0.80,
-                    maximum_mae_q90_coverage: 0.98,
-                    degrade_after_failed_windows: 2,
-                    suspend_after_severe_windows: 2,
-                    recover_after_healthy_windows: 3,
-                    warming_up_forces_wait: true,
-                },
-            },
+            policies: always_open_policy_set(),
         };
         let before = store
             .connection
@@ -3964,6 +5424,458 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn policy_clock_freezes_directional_proposals_after_bridge_disconnect() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Arc::new(Store {
+            connection: Mutex::new(connection),
+        });
+        let mut runtime = demo_state();
+        let now = runtime.snapshot.timestamp + chrono::Duration::seconds(20);
+        runtime.safety.feed_is_demo = false;
+        runtime.mode = "LIVE_SHADOW";
+        runtime.connection_status = "MT5_CONNECTED";
+        runtime.last_market_snapshot_at = now - chrono::Duration::seconds(11);
+        runtime.snapshot.timestamp = runtime.last_market_snapshot_at;
+        runtime.model_health.status = ModelHealthStatus::Healthy;
+        runtime.forecast.model_id = "candidate-policy-clock".to_owned();
+        let state = AppState {
+            store,
+            runtime: Arc::new(RwLock::new(runtime)),
+            started_at: now,
+            policies: always_open_policy_set(),
+        };
+
+        refresh_runtime_policy(&state, now)
+            .await
+            .expect("policy clock");
+
+        let refreshed = state.runtime.read().await;
+        assert_eq!(refreshed.connection_status, "BRIDGE_DISCONNECTED");
+        assert_eq!(
+            refreshed.snapshot.data_quality.market_status,
+            MarketStatus::BridgeDisconnected
+        );
+        assert!(refreshed.proposals.iter().all(|proposal| {
+            proposal.action == DecisionAction::NoPrediction
+                && proposal
+                    .reason_codes
+                    .contains(&"BRIDGE_DISCONNECTED".to_owned())
+        }));
+    }
+
+    #[tokio::test]
+    async fn policy_clock_expires_entry_without_waiting_for_another_snapshot() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Arc::new(Store {
+            connection: Mutex::new(connection),
+        });
+        let mut runtime = demo_state();
+        let now = runtime.snapshot.timestamp + chrono::Duration::seconds(61);
+        runtime.safety.feed_is_demo = false;
+        runtime.mode = "LIVE_SHADOW";
+        runtime.connection_status = "MT5_CONNECTED";
+        runtime.last_market_snapshot_at = now;
+        runtime.snapshot.timestamp = now;
+        runtime.snapshot.data_quality.market_session_open_until =
+            Some(now + chrono::Duration::hours(1));
+        runtime.model_health.status = ModelHealthStatus::Healthy;
+        runtime.forecast.model_id = "candidate-policy-clock".to_owned();
+        runtime.forecast.generated_at = now - chrono::Duration::seconds(61);
+        let state = AppState {
+            store,
+            runtime: Arc::new(RwLock::new(runtime)),
+            started_at: now,
+            policies: always_open_policy_set(),
+        };
+
+        refresh_runtime_policy(&state, now)
+            .await
+            .expect("policy clock");
+
+        let refreshed = state.runtime.read().await;
+        let scalper = refreshed
+            .proposals
+            .iter()
+            .find(|proposal| proposal.profile == TradingProfile::Scalper)
+            .expect("scalper proposal");
+        assert_eq!(scalper.action, DecisionAction::Wait);
+        assert!(
+            scalper
+                .reason_codes
+                .contains(&"ENTRY_WINDOW_EXPIRED".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_clock_preserves_fresh_broker_market_closed_status() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Arc::new(Store {
+            connection: Mutex::new(connection),
+        });
+        let mut runtime = demo_state();
+        let now = runtime.snapshot.timestamp;
+        runtime.safety.feed_is_demo = false;
+        runtime.mode = "LIVE_SHADOW";
+        runtime.last_market_snapshot_at = now;
+        runtime.snapshot.data_quality.market_status = MarketStatus::MarketClosed;
+        runtime.snapshot.data_quality.market_session_open_until = None;
+        runtime.model_health.status = ModelHealthStatus::Healthy;
+        runtime.forecast.model_id = "candidate-policy-clock".to_owned();
+        let state = AppState {
+            store,
+            runtime: Arc::new(RwLock::new(runtime)),
+            started_at: now,
+            policies: always_open_policy_set(),
+        };
+
+        refresh_runtime_policy(&state, now)
+            .await
+            .expect("policy clock");
+
+        let refreshed = state.runtime.read().await;
+        assert_eq!(refreshed.connection_status, "MARKET_CLOSED");
+        assert_eq!(
+            refreshed.snapshot.data_quality.market_status,
+            MarketStatus::MarketClosed
+        );
+        assert!(
+            refreshed
+                .proposals
+                .iter()
+                .all(|proposal| proposal.action == DecisionAction::NoPrediction)
+        );
+    }
+
+    #[test]
+    fn feedback_requires_the_same_healthy_live_context_as_the_ui() {
+        let mut runtime = demo_state();
+        runtime.connection_status = "MT5_CONNECTED";
+        runtime.forecast_status = ForecastStatus::Current;
+        runtime.snapshot.data_quality.market_status = MarketStatus::Open;
+        runtime.snapshot.data_quality.tick_age_ms = 0;
+        runtime.snapshot.data_quality.absolute_tick_age_ms = 0;
+        runtime.snapshot.data_quality.transport_tick_age_ms = 0;
+        runtime.snapshot.data_quality.missing_flags.clear();
+        runtime.model_health.status = ModelHealthStatus::Healthy;
+        let policy = DecisionPolicy::scalper();
+        assert!(feedback_context_is_actionable(&runtime, &policy));
+
+        runtime.model_health.status = ModelHealthStatus::WarmingUp;
+        assert!(!feedback_context_is_actionable(&runtime, &policy));
+        runtime.model_health.status = ModelHealthStatus::Healthy;
+        runtime.connection_status = "BRIDGE_DISCONNECTED";
+        assert!(!feedback_context_is_actionable(&runtime, &policy));
+        runtime.connection_status = "MT5_CONNECTED";
+        runtime.snapshot.data_quality.absolute_tick_age_ms = policy.max_tick_age_ms + 1;
+        assert!(!feedback_context_is_actionable(&runtime, &policy));
+    }
+
+    #[test]
+    fn staged_backfill_sequence_rejects_gaps_and_contract_changes() {
+        let last = Utc::now() - chrono::Duration::minutes(10);
+        let next = last + chrono::Duration::minutes(5);
+        let ordered = vec![
+            executable_backfill_bar(last, 4000.0),
+            executable_backfill_bar(next, 4001.0),
+        ];
+        assert!(validate_backfill_bar_order(&ordered).is_ok());
+        let duplicate_timestamp = vec![ordered[0].clone(), ordered[0].clone()];
+        assert!(validate_backfill_bar_order(&duplicate_timestamp).is_err());
+        let reversed = vec![ordered[1].clone(), ordered[0].clone()];
+        assert!(validate_backfill_bar_order(&reversed).is_err());
+
+        let progress = BackfillImportProgress {
+            received_chunks: 1,
+            expected_chunks: 3,
+            last_staged_timestamp: last,
+        };
+        assert!(validate_backfill_continuation(progress, 1, 3, false, next).is_ok());
+
+        let gap = validate_backfill_continuation(progress, 2, 3, true, next)
+            .expect_err("a missing middle chunk must be rejected");
+        assert_eq!(gap.status, StatusCode::BAD_REQUEST);
+        assert!(gap.message.contains("exactly once"));
+
+        let duplicate = validate_backfill_continuation(progress, 0, 3, false, next)
+            .expect_err("an accepted chunk cannot mutate staging");
+        assert_eq!(duplicate.status, StatusCode::BAD_REQUEST);
+        assert!(duplicate.message.contains("exactly once"));
+
+        let changed_total = validate_backfill_continuation(progress, 1, 4, false, next)
+            .expect_err("the import contract cannot change");
+        assert_eq!(changed_total.status, StatusCode::BAD_REQUEST);
+        assert!(changed_total.message.contains("total_chunks changed"));
+
+        let overlap = validate_backfill_continuation(progress, 1, 3, false, last)
+            .expect_err("bar ranges cannot overlap across chunks");
+        assert_eq!(overlap.status, StatusCode::BAD_REQUEST);
+        assert!(overlap.message.contains("timestamps must increase"));
+
+        let early_final = validate_backfill_continuation(progress, 1, 3, true, next)
+            .expect_err("a final chunk cannot promote an incomplete import");
+        assert_eq!(early_final.status, StatusCode::BAD_REQUEST);
+        assert!(early_final.message.contains("before every preceding chunk"));
+
+        assert!(
+            validate_backfill_continuation(
+                BackfillImportProgress {
+                    received_chunks: 2,
+                    expected_chunks: 3,
+                    last_staged_timestamp: last,
+                },
+                2,
+                3,
+                true,
+                next,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn backfill_chunk_schema_rejects_impossible_indices() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        for (chunk_index, total_chunks) in [(-1, 1), (0, 0), (1, 1)] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO market_backfill_import_chunks
+                         (import_id,symbol,timeframe,chunk_index,total_chunks,created_at)
+                         VALUES (?1,'GOLDm#','M5',?2,?3,?4)",
+                        params![
+                            format!("invalid-{chunk_index}-{total_chunks}"),
+                            chunk_index,
+                            total_chunks,
+                            Utc::now().to_rfc3339(),
+                        ],
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn reset_backfill_is_atomic_and_rejects_orphan_continuations() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        let runtime = demo_state();
+        store
+            .save_snapshot(&runtime.snapshot)
+            .expect("seed live history");
+        let original_count: i64 = store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .query_row("SELECT COUNT(*) FROM market_bars", [], |row| row.get(0))
+            .expect("count live bars");
+        let anchor = runtime.snapshot.bars[0].timestamp;
+        let import_id = "atomic-import".to_owned();
+        let first = BackfillRequest {
+            symbol: xpde_domain::SUPPORTED_SYMBOL.to_owned(),
+            timeframe: xpde_domain::SUPPORTED_TIMEFRAME.to_owned(),
+            provider: "TEST".to_owned(),
+            broker_offset_hours: 0,
+            reset: true,
+            import_id: Some(import_id.clone()),
+            final_chunk: false,
+            chunk_index: Some(0),
+            total_chunks: Some(2),
+            bars: vec![executable_backfill_bar(anchor, 4100.0)],
+        };
+        store.save_backfill(&first).expect("stage first chunk");
+
+        let live_count_after_stage: i64 = store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .query_row("SELECT COUNT(*) FROM market_bars", [], |row| row.get(0))
+            .expect("count live bars");
+        assert_eq!(live_count_after_stage, original_count);
+        assert_eq!(
+            store
+                .backfill_import_progress(
+                    &import_id,
+                    xpde_domain::SUPPORTED_SYMBOL,
+                    xpde_domain::SUPPORTED_TIMEFRAME,
+                )
+                .expect("staging lookup"),
+            Some(BackfillImportProgress {
+                received_chunks: 1,
+                expected_chunks: 2,
+                last_staged_timestamp: anchor,
+            })
+        );
+
+        let second = BackfillRequest {
+            reset: false,
+            final_chunk: true,
+            chunk_index: Some(1),
+            total_chunks: Some(2),
+            bars: vec![executable_backfill_bar(
+                anchor + chrono::Duration::minutes(5),
+                4101.0,
+            )],
+            ..first
+        };
+        store.save_backfill(&second).expect("promote final chunk");
+
+        let connection = store.connection.lock().expect("database mutex");
+        let promoted_bars: i64 = connection
+            .query_row("SELECT COUNT(*) FROM market_bars", [], |row| row.get(0))
+            .expect("count promoted bars");
+        let promoted_paths: i64 = connection
+            .query_row("SELECT COUNT(*) FROM market_tick_paths", [], |row| {
+                row.get(0)
+            })
+            .expect("count promoted paths");
+        assert_eq!(promoted_bars, 2);
+        assert_eq!(promoted_paths, 2);
+        drop(connection);
+        assert_eq!(
+            store
+                .backfill_import_progress(
+                    &import_id,
+                    xpde_domain::SUPPORTED_SYMBOL,
+                    xpde_domain::SUPPORTED_TIMEFRAME,
+                )
+                .expect("staging removed"),
+            None
+        );
+
+        let gap_import = "gap-import".to_owned();
+        store
+            .save_backfill(&BackfillRequest {
+                symbol: xpde_domain::SUPPORTED_SYMBOL.to_owned(),
+                timeframe: xpde_domain::SUPPORTED_TIMEFRAME.to_owned(),
+                provider: "TEST".to_owned(),
+                broker_offset_hours: 0,
+                reset: true,
+                import_id: Some(gap_import.clone()),
+                final_chunk: false,
+                chunk_index: Some(0),
+                total_chunks: Some(3),
+                bars: vec![executable_backfill_bar(anchor, 4300.0)],
+            })
+            .expect("stage chunk zero");
+        let missing_middle_final = BackfillRequest {
+            symbol: xpde_domain::SUPPORTED_SYMBOL.to_owned(),
+            timeframe: xpde_domain::SUPPORTED_TIMEFRAME.to_owned(),
+            provider: "TEST".to_owned(),
+            broker_offset_hours: 0,
+            reset: false,
+            import_id: Some(gap_import),
+            final_chunk: true,
+            chunk_index: Some(2),
+            total_chunks: Some(3),
+            bars: vec![executable_backfill_bar(
+                anchor + chrono::Duration::minutes(10),
+                4302.0,
+            )],
+        };
+        assert!(store.save_backfill(&missing_middle_final).is_err());
+        let preserved_live_count: i64 = store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .query_row("SELECT COUNT(*) FROM market_bars", [], |row| row.get(0))
+            .expect("preserved live count");
+        assert_eq!(preserved_live_count, 2);
+
+        let orphan = BackfillRequest {
+            symbol: xpde_domain::SUPPORTED_SYMBOL.to_owned(),
+            timeframe: xpde_domain::SUPPORTED_TIMEFRAME.to_owned(),
+            provider: "TEST".to_owned(),
+            broker_offset_hours: 0,
+            reset: false,
+            import_id: Some("missing-import".to_owned()),
+            final_chunk: true,
+            chunk_index: Some(0),
+            total_chunks: Some(1),
+            bars: vec![executable_backfill_bar(anchor, 4200.0)],
+        };
+        assert!(store.save_backfill(&orphan).is_err());
+    }
+
+    #[test]
+    fn legacy_outcome_constraints_are_upgraded_as_one_contract() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 ALTER TABLE decision_proposal_outcomes
+                   RENAME TO decision_proposal_outcomes_new_contract;
+                 CREATE TABLE decision_proposal_outcomes (
+                   proposal_id TEXT PRIMARY KEY,
+                   prediction_id TEXT NOT NULL,
+                   profile TEXT NOT NULL,
+                   horizon_bars INTEGER NOT NULL,
+                   action TEXT NOT NULL,
+                   target_price REAL NOT NULL,
+                   stop_price REAL NOT NULL,
+                   barrier_outcome TEXT NOT NULL CHECK(
+                     barrier_outcome IN (
+                       'TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY',
+                       'AMBIGUOUS_SAME_BAR'
+                     )
+                   ),
+                   first_touch_time_msc INTEGER,
+                   first_touch_price REAL,
+                   settlement_source TEXT NOT NULL DEFAULT 'TICK_SEQUENCE',
+                   settled_at TEXT NOT NULL
+                 );
+                 DROP TABLE decision_proposal_outcomes_new_contract;",
+            )
+            .expect("install legacy constraint");
+
+        ensure_same_timestamp_outcome_contract(&connection).expect("upgrade contract");
+
+        let schemas: Vec<String> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT sql FROM sqlite_master
+                     WHERE type='table' AND name IN (
+                       'prediction_horizon_outcomes',
+                       'decision_proposal_outcomes',
+                       'prediction_proposal_outcomes'
+                     )",
+                )
+                .expect("schema query");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("schema rows")
+                .collect::<Result<_, _>>()
+                .expect("schemas")
+        };
+        assert_eq!(schemas.len(), 3);
+        assert!(
+            schemas
+                .iter()
+                .all(|schema| schema.contains("AMBIGUOUS_SAME_TIMESTAMP"))
+        );
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .expect("disable parents for constraint probe");
+        connection
+            .execute(
+                "INSERT INTO decision_proposal_outcomes
+                 (proposal_id, prediction_id, profile, horizon_bars, action,
+                  target_price, stop_price, barrier_outcome, settled_at)
+                 VALUES ('proposal', 'prediction', 'SCALPER', 3, 'LONG',
+                         1.0, 0.0, 'AMBIGUOUS_SAME_TIMESTAMP', ?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .expect("new outcome accepted");
     }
 
     #[test]
@@ -4052,10 +5964,10 @@ mod tests {
                       barrier_probability_short, symbol, timeframe,
                       origin_bar_timestamp, origin_close, origin_bid, origin_ask,
                       origin_bar_index, generated_at, expires_at, forecast_json,
-                      proposal_json, created_at)
+                      proposal_json, settlement_status, created_at)
                      VALUES (?1, 'health-model', 'goldm-m5-v4', ?2, ?3, ?3, ?3,
                              'GOLDm#', 'M5', ?4, 100.0, 100.0, 100.2, ?5, ?4,
-                             ?4, '{}', '[]', ?4)",
+                             ?4, '{}', '[]', 'SETTLED', ?4)",
                     params![
                         prediction_id,
                         BARRIER_SPEC_ID,

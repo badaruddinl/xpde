@@ -138,16 +138,21 @@ def merge_executable_bars(
         current["ask_low"] = min(
             float(current["ask_low"]), float(addition["ask_low"])
         )
-        current["executable_tick_count"] = int(
-            current.get("executable_tick_count", 0)
-        ) + int(addition.get("executable_tick_count", 0))
+        current_count = int(current.get("executable_tick_count", 0))
+        addition_count = int(addition.get("executable_tick_count", 0))
+        disjoint = bool(current_last and addition_first > current_last)
         combined_path = [
             *current.get("_tick_path", []),
             *addition.get("_tick_path", []),
         ]
         combined_path.sort(key=lambda item: int(item[0]))
         compact_path: list[list[float | int]] = []
+        seen_exact: set[tuple[int, float, float]] = set()
         for item in combined_path:
+            signature = (int(item[0]), float(item[1]), float(item[2]))
+            if signature in seen_exact:
+                continue
+            seen_exact.add(signature)
             if not compact_path:
                 compact_path.append(item)
             elif compact_path[-1][1] != item[1] or compact_path[-1][2] != item[2]:
@@ -161,6 +166,11 @@ def merge_executable_bars(
             else:
                 compact_path[-1] = item
         current["_tick_path"] = compact_path
+        current["executable_tick_count"] = (
+            current_count + addition_count
+            if disjoint
+            else max(current_count, addition_count, len(compact_path))
+        )
 
 
 def collect_executable_bars(
@@ -192,15 +202,27 @@ def collect_executable_bars(
             raise RuntimeError(
                 f"MetaTrader5 executable tick backfill failed ({code}): {message}"
             )
-        additions, maximum_time_msc = aggregate_executable_ticks(
+        previous_maximum = maximum_time_msc
+        additions, observed_maximum = aggregate_executable_ticks(
             ticks,
             clock=clock,
-            after_time_msc=maximum_time_msc,
+            after_time_msc=(
+                maximum_time_msc - 1 if maximum_time_msc is not None else None
+            ),
         )
+        maxima = [
+            value
+            for value in (previous_maximum, observed_maximum)
+            if value is not None
+        ]
+        maximum_time_msc = max(maxima, default=None)
         merge_executable_bars(result, additions)
         if chunk_end >= end:
             break
-        cursor = chunk_end + timedelta(milliseconds=1)
+        # Overlap one millisecond because provider range-end inclusivity is not
+        # assumed. Exact duplicates are removed during merge, while distinct
+        # same-millisecond quotes remain available for ambiguity handling.
+        cursor = chunk_end - timedelta(milliseconds=1)
     return result, maximum_time_msc
 
 
@@ -246,7 +268,7 @@ class ExecutableBarTracker:
     ) -> None:
         provider_now_epoch = now_epoch + clock.offset_hours * 3600
         start_epoch = (
-            self.last_tick_msc / 1000.0
+            (self.last_tick_msc - 1) / 1000.0
             if self.last_tick_msc is not None
             else provider_now_epoch - self.retention_bars * 300
         )
@@ -257,7 +279,12 @@ class ExecutableBarTracker:
             end_epoch=provider_now_epoch,
             clock=clock,
             chunk_hours=2,
-            after_time_msc=self.last_tick_msc,
+            # Re-read the last millisecond. MT5 can publish multiple quote
+            # changes with the same time_msc; merge_executable_bars removes
+            # exact overlap without discarding a later distinct price.
+            after_time_msc=(
+                self.last_tick_msc - 1 if self.last_tick_msc is not None else None
+            ),
         )
         merge_executable_bars(self.bars, additions)
         self.last_tick_msc = maximum
