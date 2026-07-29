@@ -47,10 +47,14 @@ interface Proposal {
   account_currency: string;
   quote_currency: string;
   pnl_currency: string;
+  symbol_profit_currency?: string;
+  calculated_pnl_currency?: string;
   pnl_calculation_source?: string;
   conversion_rate?: number | null;
   action: DecisionAction;
   generated_at: string;
+  evaluated_at?: string | null;
+  quote_timestamp?: string | null;
   decision_valid_until: string;
   outcome_matures_at: string;
   median_move_after_cost_account: number;
@@ -71,6 +75,7 @@ interface Proposal {
   remaining_horizon_seconds?: number;
   maximum_decision_age_seconds?: number;
   model_health_status?: string;
+  evidence_source?: string;
   invalidation_price: number | null;
   target_price: number | null;
   reason_codes: string[];
@@ -110,8 +115,11 @@ interface DashboardState {
       chart_mode: "BID" | "LAST" | "UNKNOWN";
       quote_currency: string;
       pnl_currency: string;
+      symbol_profit_currency?: string;
+      calculated_pnl_currency?: string;
       pnl_calculation_source?: string;
       conversion_rate?: number | null;
+      trade_mode?: "FULL" | "LONG_ONLY" | "SHORT_ONLY" | "CLOSE_ONLY" | "DISABLED" | "UNKNOWN";
     };
     data_quality: {
       completeness: number;
@@ -214,7 +222,8 @@ interface BarrierOutcomeMetrics {
 
 interface ProposalOutcomeMetrics extends BarrierOutcomeMetrics {
   profile: Profile;
-  settled_proposals: number;
+  evidence_source: "FIRST_ACTIONABLE" | "HUMAN_ACCEPTED" | "HUMAN_REJECTED" | "DIAGNOSTIC";
+  settled_proposal_instances: number;
 }
 
 interface EvaluationSummary {
@@ -342,7 +351,7 @@ function buildDemoState(): DashboardState {
       direction_probability_up: 0.57,
       barrier_probability_long: 0.54,
       barrier_probability_short: 0.46,
-      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v3",
+      barrier_spec_id: "atr-1.25tp-1.00sl-h3-executable-v4",
       barrier_horizon_bars: 3,
       target_price_long: bars[bars.length - 1].close + 1.25,
       stop_price_long: bars[bars.length - 1].close - 1,
@@ -498,6 +507,7 @@ function reasonLabel(reason: string) {
     BRIDGE_DISCONNECTED: "Bridge MT5 terputus",
     UNSUPPORTED_CHART_MODE: "Chart broker bukan Bid; kontrak executable tidak didukung",
     EXECUTABLE_SIDE_BAR_MISSING: "Candle Bid/Ask executable belum lengkap",
+    EXECUTABLE_TICK_PATH_MISSING: "Urutan tick executable candle belum lengkap",
     MODEL_LIVE_HEALTH_WARMING_UP: "Evidence live belum mencapai sampel minimum",
     MODEL_LIVE_HEALTH_DEGRADED: "Kesehatan model live menurun; proposal dihentikan",
     MODEL_LIVE_HEALTH_SUSPENDED: "Model disuspensi oleh gate evidence live",
@@ -510,6 +520,11 @@ function reasonLabel(reason: string) {
     EXIT_SPREAD_ESTIMATE_UNAVAILABLE: "Sampel estimasi spread exit belum mencukupi",
     ENTRY_WINDOW_EXPIRED: "Jendela entry forecast sudah berakhir",
     BROKER_STOPS_LEVEL_VIOLATION: "Target atau stop melanggar minimum stops broker",
+    BROKER_LONG_ONLY: "Broker hanya mengizinkan entry LONG",
+    BROKER_SHORT_ONLY: "Broker hanya mengizinkan entry SHORT",
+    BROKER_CLOSE_ONLY: "Broker hanya mengizinkan penutupan posisi",
+    BROKER_TRADE_MODE_DISABLED: "Trading simbol dinonaktifkan broker",
+    BROKER_TRADE_MODE_UNKNOWN: "Mode trading simbol belum dapat diverifikasi",
   };
   return labels[reason] ?? reason.replaceAll("_", " ").toLowerCase();
 }
@@ -614,7 +629,7 @@ export default function Home() {
   const sessionEvaluation = evaluation?.current_session ?? null;
   const activeProposalEvaluation =
     evaluation?.proposal_outcomes_by_profile.find(
-      (item) => item.profile === profile,
+      (item) => item.profile === profile && item.evidence_source === "FIRST_ACTIONABLE",
     ) ?? null;
   const liveCoverage =
     activeEvaluation &&
@@ -717,6 +732,8 @@ export default function Home() {
       proposal.reference_entry_price === null ||
       proposal.invalidation_price === null ||
       proposal.remaining_reward_account <= 0 ||
+      proposal.remaining_risk_account <= 0 ||
+      proposal.reference_lot <= 0 ||
       proposal.reward_risk_ratio <= 0
     ) {
       return { lot: null, reason: "Entry atau barrier proposal tidak valid." };
@@ -725,13 +742,17 @@ export default function Home() {
     const stopDistance = Math.abs(
       proposal.reference_entry_price - proposal.invalidation_price,
     );
-    const tickSize = state.snapshot.symbol_spec.tick_size;
-    const tickValue = state.snapshot.symbol_spec.tick_value;
-    const lossPerLot = (stopDistance / tickSize) * tickValue;
-    if (!Number.isFinite(lossPerLot) || lossPerLot <= 0) {
-      return { lot: null, reason: "Tick value atau jarak stop tidak valid." };
+    const referenceLot = proposal.reference_lot;
+    const pnlFactor =
+      proposal.remaining_risk_account / (stopDistance * referenceLot);
+    const stopSlippageAccount =
+      proposal.slippage_assumption * pnlFactor * referenceLot;
+    const riskPerReferenceLot =
+      proposal.remaining_risk_account + stopSlippageAccount + proposal.commission;
+    if (!Number.isFinite(riskPerReferenceLot) || riskPerReferenceLot <= 0) {
+      return { lot: null, reason: "Risk account-currency proposal tidak valid." };
     }
-    const raw = riskUsd / lossPerLot;
+    const raw = (riskUsd / riskPerReferenceLot) * referenceLot;
     const minimumLot = state.snapshot.symbol_spec.volume_min;
     if (raw < minimumLot) {
       return { lot: null, reason: "MIN_LOT_EXCEEDS_RISK" };
@@ -891,6 +912,25 @@ export default function Home() {
         <div>
           <span>Entry age / limit</span>
           <strong>{proposal.decision_age_seconds ?? 0}s / {proposal.maximum_decision_age_seconds ?? 0}s</strong>
+        </div>
+        <div>
+          <span>Proposal instance</span>
+          <strong>
+            {proposal.proposal_id?.slice(0, 8) ?? "—"}
+            {" · "}{proposal.evidence_source ?? "DIAGNOSTIC"}
+          </strong>
+        </div>
+        <div>
+          <span>Evaluated / quote</span>
+          <strong>
+            {proposal.evaluated_at
+              ? new Date(proposal.evaluated_at).toLocaleTimeString("en-ID")
+              : "—"}
+            {" / "}
+            {proposal.quote_timestamp
+              ? new Date(proposal.quote_timestamp).toLocaleTimeString("en-ID")
+              : "—"}
+          </strong>
         </div>
       </div>
       <ul className="reason-list">
@@ -1157,7 +1197,7 @@ export default function Home() {
               </small>
             </article>
             <article className="panel metric">
-              <span>Proposal TP dalam horizon · {profile} · 200 prediksi</span>
+              <span>First-actionable TP dalam horizon · {profile} · 200 proposal instances</span>
               <strong>{realizedTpRate === null ? "—" : percent(realizedTpRate)}</strong>
               <div className="meter realized">
                 <i style={{ width: realizedTpRate === null ? "0%" : percent(realizedTpRate) }} />
@@ -1233,7 +1273,11 @@ export default function Home() {
 
           <section className="panel feedback-panel">
             <span className="eyebrow">Human verification</span>
-            <h2>Apakah proposal ini layak?</h2>
+            <h2>
+              {proposal.action === "WAIT"
+                ? "Apakah keputusan untuk tidak entry sudah tepat?"
+                : "Apakah proposal ini layak dipertimbangkan?"}
+            </h2>
             <label className="feedback-reason">
               <span>Alasan jika Reject</span>
               <select
@@ -1252,9 +1296,13 @@ export default function Home() {
               </select>
             </label>
             <div className="feedback-actions">
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("ACCEPTED")}>Accept</button>
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("UNCERTAIN")}>Unsure</button>
-              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("REJECTED")}>Reject</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("ACCEPTED")}>
+                {proposal.action === "WAIT" ? "Setuju tidak entry" : "Layak dipertimbangkan"}
+              </button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("UNCERTAIN")}>Tidak yakin</button>
+              <button disabled={state.safety.feed_is_demo || state.forecast_status !== "CURRENT" || !proposal.proposal_id} type="button" onClick={() => submitFeedback("REJECTED")}>
+                {proposal.action === "WAIT" ? "Seharusnya actionable" : "Tolak"}
+              </button>
             </div>
             <small>{feedbackStatus || "Feedback tidak mengubah label harga objektif."}</small>
           </section>

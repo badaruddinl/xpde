@@ -7,7 +7,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from xpde_ml.settle_outcomes import barrier_outcome, settle_with_report
+from xpde_ml.settle_outcomes import (
+    barrier_outcome,
+    settle_with_report,
+    tick_sequence_barrier_outcome,
+)
 from xpde_ml.dataset import BARRIER_SPEC_ID
 
 
@@ -68,6 +72,23 @@ def test_barrier_outcome_keeps_no_hit_before_expiry() -> None:
     )
 
 
+def test_tick_sequence_starts_after_exact_quote_inside_current_candle() -> None:
+    result = tick_sequence_barrier_outcome(
+        "LONG",
+        101.0,
+        99.0,
+        [
+            (1_000, 98.8, 99.0),
+            (2_000, 100.0, 100.2),
+            (3_000, 101.2, 101.4),
+        ],
+        start_exclusive_msc=1_500,
+        end_exclusive_msc=4_000,
+    )
+
+    assert result == ("TP_FIRST", 3_000, 101.2)
+
+
 def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
     database = tmp_path / "xpde.sqlite"
     connection = sqlite3.connect(database)
@@ -106,6 +127,19 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             ask_low REAL,
             ask_close REAL,
             PRIMARY KEY(symbol, timeframe, timestamp)
+        );
+        CREATE TABLE market_tick_paths (
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            tick_path_json TEXT NOT NULL,
+            path_point_count INTEGER NOT NULL,
+            first_tick_msc INTEGER NOT NULL,
+            last_tick_msc INTEGER NOT NULL,
+            path_valid INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(symbol, timeframe,timestamp)
         );
         """
     )
@@ -185,6 +219,29 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
                 close + 0.2,
             ),
         )
+        start_msc = int((origin + timedelta(minutes=5 * index)).timestamp() * 1000)
+        path = [
+            [start_msc, 100.0, 100.2],
+            [start_msc + 60_000, close + 0.2, close + 0.4],
+            [start_msc + 120_000, 99.5, 99.7],
+            [start_msc + 299_000, close, close + 0.2],
+        ]
+        connection.execute(
+            """
+            INSERT INTO market_tick_paths
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'TEST', ?)
+            """,
+            (
+                "GOLDm#",
+                "M5",
+                timestamp,
+                json.dumps(path),
+                len(path),
+                start_msc,
+                start_msc + 299_000,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
     connection.execute(
         """
         CREATE TABLE decision_proposal_instances (
@@ -216,7 +273,12 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
             101.0,
             99.0,
             1,
-            json.dumps(proposals[0]),
+            json.dumps(
+                {
+                    **proposals[0],
+                    "outcome_matures_at": (origin + timedelta(minutes=20)).isoformat(),
+                }
+            ),
         ),
     )
     connection.commit()

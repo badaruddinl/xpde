@@ -27,12 +27,15 @@ CREATE TABLE IF NOT EXISTS symbol_specs (
     chart_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
     quote_currency TEXT NOT NULL DEFAULT '',
     pnl_currency TEXT NOT NULL DEFAULT '',
+    symbol_profit_currency TEXT NOT NULL DEFAULT '',
+    calculated_pnl_currency TEXT NOT NULL DEFAULT '',
     profit_per_price_unit_per_lot_buy REAL,
     profit_per_price_unit_per_lot_sell REAL,
     pnl_calculation_source TEXT NOT NULL DEFAULT '',
     conversion_rate REAL,
     conversion_timestamp TEXT,
     trade_mode_enabled INTEGER NOT NULL DEFAULT 0,
+    trade_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
     captured_at TEXT NOT NULL
 );
 
@@ -56,6 +59,20 @@ CREATE TABLE IF NOT EXISTS market_bars (
     executable_tick_count INTEGER NOT NULL DEFAULT 0,
     first_tick_msc INTEGER,
     last_tick_msc INTEGER,
+    PRIMARY KEY(symbol, timeframe, timestamp)
+);
+
+CREATE TABLE IF NOT EXISTS market_tick_paths (
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    tick_path_json TEXT NOT NULL,
+    path_point_count INTEGER NOT NULL,
+    first_tick_msc INTEGER NOT NULL,
+    last_tick_msc INTEGER NOT NULL,
+    path_valid INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     PRIMARY KEY(symbol, timeframe, timestamp)
 );
 
@@ -91,8 +108,21 @@ CREATE TABLE IF NOT EXISTS decision_proposal_instances (
     model_health_status TEXT NOT NULL,
     proposal_json TEXT NOT NULL,
     evidence_eligible INTEGER NOT NULL DEFAULT 0,
+    evidence_source TEXT NOT NULL DEFAULT 'DIAGNOSTIC',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS decision_proposal_evidence (
+    proposal_id TEXT NOT NULL REFERENCES decision_proposal_instances(proposal_id),
+    evidence_source TEXT NOT NULL CHECK(evidence_source IN (
+        'FIRST_ACTIONABLE', 'HUMAN_ACCEPTED', 'HUMAN_REJECTED', 'DIAGNOSTIC'
+    )),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(proposal_id, evidence_source)
+);
+
+CREATE INDEX IF NOT EXISTS ix_proposal_instances_prediction_profile_time
+ON decision_proposal_instances(prediction_id, profile, evaluated_at);
 
 CREATE TABLE IF NOT EXISTS decision_proposal_outcomes (
     proposal_id TEXT PRIMARY KEY REFERENCES decision_proposal_instances(proposal_id),
@@ -110,6 +140,9 @@ CREATE TABLE IF NOT EXISTS decision_proposal_outcomes (
             'AMBIGUOUS_SAME_BAR'
         )
     ),
+    first_touch_time_msc INTEGER,
+    first_touch_price REAL,
+    settlement_source TEXT NOT NULL DEFAULT 'TICK_SEQUENCE',
     settled_at TEXT NOT NULL
 );
 

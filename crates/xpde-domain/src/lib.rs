@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 pub const SUPPORTED_SYMBOL: &str = "GOLDm#";
 pub const SUPPORTED_TIMEFRAME: &str = "M5";
-pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v3";
-pub const EXECUTABLE_SIDE_CONTRACT_ID: &str = "bid-entry-exit-long-ask-exit-short-tick-sequence-v2";
+pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-v4";
+pub const EXECUTABLE_SIDE_CONTRACT_ID: &str = "bid-entry-exit-long-ask-exit-short-tick-sequence-v3";
 pub const BARRIER_HORIZON_BARS: u32 = 3;
 pub const M5_BAR_MINUTES: i64 = 5;
 
@@ -40,6 +40,8 @@ pub struct MarketBar {
     pub first_tick_msc: Option<i64>,
     #[serde(default)]
     pub last_tick_msc: Option<i64>,
+    #[serde(default)]
+    pub executable_tick_path: Vec<(i64, f64, f64)>,
 }
 
 impl MarketBar {
@@ -88,6 +90,68 @@ impl MarketBar {
                     && value < self.timestamp.timestamp_millis() + 300_000
             })
     }
+
+    pub fn has_valid_tick_path(&self) -> bool {
+        if self.executable_tick_path.is_empty() || !self.has_executable_sides() {
+            return false;
+        }
+        let Some((first, last)) = self.first_tick_msc.zip(self.last_tick_msc) else {
+            return false;
+        };
+        if self.executable_tick_path.first().map(|tick| tick.0) != Some(first)
+            || self.executable_tick_path.last().map(|tick| tick.0) != Some(last)
+            || self
+                .executable_tick_path
+                .windows(2)
+                .any(|pair| pair[0].0 > pair[1].0)
+            || self.executable_tick_path.iter().any(|(_, bid, ask)| {
+                !bid.is_finite() || !ask.is_finite() || *bid <= 0.0 || *ask <= *bid
+            })
+        {
+            return false;
+        }
+        let bid_open = self.executable_tick_path[0].1;
+        let ask_open = self.executable_tick_path[0].2;
+        let bid_close = self.executable_tick_path.last().expect("non-empty path").1;
+        let ask_close = self.executable_tick_path.last().expect("non-empty path").2;
+        let bid_high = self
+            .executable_tick_path
+            .iter()
+            .map(|tick| tick.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let bid_low = self
+            .executable_tick_path
+            .iter()
+            .map(|tick| tick.1)
+            .fold(f64::INFINITY, f64::min);
+        let ask_high = self
+            .executable_tick_path
+            .iter()
+            .map(|tick| tick.2)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let ask_low = self
+            .executable_tick_path
+            .iter()
+            .map(|tick| tick.2)
+            .fold(f64::INFINITY, f64::min);
+        let expected = [
+            self.bid_open,
+            self.bid_high,
+            self.bid_low,
+            self.bid_close,
+            self.ask_open,
+            self.ask_high,
+            self.ask_low,
+            self.ask_close,
+        ];
+        let actual = [
+            bid_open, bid_high, bid_low, bid_close, ask_open, ask_high, ask_low, ask_close,
+        ];
+        expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| expected.is_some_and(|value| (value - actual).abs() <= 1e-8))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +168,40 @@ impl ChartMode {
         match self {
             Self::Bid => "BID",
             Self::Last => "LAST",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TradeMode {
+    Full,
+    LongOnly,
+    ShortOnly,
+    CloseOnly,
+    Disabled,
+    #[default]
+    Unknown,
+}
+
+impl TradeMode {
+    pub const fn allows(self, action: DecisionAction) -> bool {
+        matches!(
+            (self, action),
+            (Self::Full, DecisionAction::Long | DecisionAction::Short)
+                | (Self::LongOnly, DecisionAction::Long)
+                | (Self::ShortOnly, DecisionAction::Short)
+        )
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "FULL",
+            Self::LongOnly => "LONG_ONLY",
+            Self::ShortOnly => "SHORT_ONLY",
+            Self::CloseOnly => "CLOSE_ONLY",
+            Self::Disabled => "DISABLED",
             Self::Unknown => "UNKNOWN",
         }
     }
@@ -165,6 +263,10 @@ pub struct SymbolSpec {
     #[serde(default)]
     pub pnl_currency: String,
     #[serde(default)]
+    pub symbol_profit_currency: String,
+    #[serde(default)]
+    pub calculated_pnl_currency: String,
+    #[serde(default)]
     pub profit_per_price_unit_per_lot_buy: Option<f64>,
     #[serde(default)]
     pub profit_per_price_unit_per_lot_sell: Option<f64>,
@@ -176,6 +278,8 @@ pub struct SymbolSpec {
     pub conversion_timestamp: Option<DateTime<Utc>>,
     #[serde(default)]
     pub trade_mode_enabled: bool,
+    #[serde(default)]
+    pub trade_mode: TradeMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -310,6 +414,14 @@ impl MarketSnapshot {
         }) {
             return Err(ContractError::InvalidExecutableBar);
         }
+        if self
+            .bars
+            .iter()
+            .chain(self.current_bar.iter())
+            .any(|bar| !bar.executable_tick_path.is_empty() && !bar.has_valid_tick_path())
+        {
+            return Err(ContractError::InvalidExecutableBar);
+        }
         Ok(())
     }
 }
@@ -438,6 +550,17 @@ pub enum DecisionAction {
     NoPrediction,
 }
 
+impl DecisionAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Long => "LONG",
+            Self::Short => "SHORT",
+            Self::Wait => "WAIT",
+            Self::NoPrediction => "NO_PREDICTION",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DecisionProposal {
     #[serde(default)]
@@ -454,6 +577,10 @@ pub struct DecisionProposal {
     pub quote_currency: String,
     #[serde(default)]
     pub pnl_currency: String,
+    #[serde(default)]
+    pub symbol_profit_currency: String,
+    #[serde(default)]
+    pub calculated_pnl_currency: String,
     #[serde(default)]
     pub pnl_calculation_source: String,
     #[serde(default)]
@@ -509,6 +636,8 @@ pub struct DecisionProposal {
     pub model_health_status: String,
     #[serde(default)]
     pub evidence_eligible: bool,
+    #[serde(default)]
+    pub evidence_source: String,
     pub invalidation_price: Option<f64>,
     pub target_price: Option<f64>,
     pub reason_codes: Vec<String>,
@@ -615,6 +744,8 @@ pub fn decide_at(
         account_currency: snapshot.account.currency.clone(),
         quote_currency: snapshot.symbol_spec.quote_currency.clone(),
         pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
+        symbol_profit_currency: snapshot.symbol_spec.symbol_profit_currency.clone(),
+        calculated_pnl_currency: snapshot.symbol_spec.calculated_pnl_currency.clone(),
         pnl_calculation_source: snapshot.symbol_spec.pnl_calculation_source.clone(),
         conversion_rate: snapshot.symbol_spec.conversion_rate,
         conversion_timestamp: snapshot.symbol_spec.conversion_timestamp,
@@ -649,6 +780,7 @@ pub fn decide_at(
         maximum_decision_age_seconds: policy.maximum_decision_age_seconds,
         model_health_status: String::new(),
         evidence_eligible: false,
+        evidence_source: "DIAGNOSTIC".to_owned(),
         invalidation_price: None,
         target_price: None,
         reason_codes: vec![reason.to_owned()],
@@ -759,6 +891,16 @@ pub fn decide_at(
     }
 
     let selected_side = q50_side.unwrap_or(classifier_side);
+    if !snapshot.symbol_spec.trade_mode.allows(selected_side) {
+        let reason = match snapshot.symbol_spec.trade_mode {
+            TradeMode::LongOnly => "BROKER_LONG_ONLY",
+            TradeMode::ShortOnly => "BROKER_SHORT_ONLY",
+            TradeMode::CloseOnly => "BROKER_CLOSE_ONLY",
+            TradeMode::Disabled => "BROKER_TRADE_MODE_DISABLED",
+            TradeMode::Full | TradeMode::Unknown => "BROKER_TRADE_MODE_UNKNOWN",
+        };
+        return no_prediction(reason, decision_valid_until, outcome_matures_at);
+    }
     let (direction_probability, barrier_probability, target_price, stop_price) = match selected_side
     {
         DecisionAction::Long => (
@@ -955,6 +1097,8 @@ pub fn decide_at(
         account_currency: snapshot.account.currency.clone(),
         quote_currency: snapshot.symbol_spec.quote_currency.clone(),
         pnl_currency: snapshot.symbol_spec.pnl_currency.clone(),
+        symbol_profit_currency: snapshot.symbol_spec.symbol_profit_currency.clone(),
+        calculated_pnl_currency: snapshot.symbol_spec.calculated_pnl_currency.clone(),
         pnl_calculation_source,
         conversion_rate: snapshot.symbol_spec.conversion_rate,
         conversion_timestamp: snapshot.symbol_spec.conversion_timestamp,
@@ -983,6 +1127,7 @@ pub fn decide_at(
         maximum_decision_age_seconds: policy.maximum_decision_age_seconds,
         model_health_status: String::new(),
         evidence_eligible: false,
+        evidence_source: "DIAGNOSTIC".to_owned(),
         invalidation_price: invalidation,
         target_price: target,
         reason_codes: reasons,
@@ -1089,6 +1234,7 @@ mod tests {
                     last_tick_msc: Some(
                         (now - chrono::Duration::minutes(offset * 5)).timestamp() * 1000 + 299_000,
                     ),
+                    executable_tick_path: Vec::new(),
                 })
                 .collect(),
             current_bar: Some(MarketBar {
@@ -1109,6 +1255,7 @@ mod tests {
                 executable_tick_count: 10,
                 first_tick_msc: Some(now.timestamp() * 1000),
                 last_tick_msc: Some(now.timestamp() * 1000 + 1_000),
+                executable_tick_path: Vec::new(),
             }),
             account: AccountSnapshot {
                 login: 1,
@@ -1134,12 +1281,15 @@ mod tests {
                 chart_mode: ChartMode::Bid,
                 quote_currency: "USD".to_owned(),
                 pnl_currency: "USD".to_owned(),
+                symbol_profit_currency: "USD".to_owned(),
+                calculated_pnl_currency: "USD".to_owned(),
                 profit_per_price_unit_per_lot_buy: Some(1.0),
                 profit_per_price_unit_per_lot_sell: Some(1.0),
                 pnl_calculation_source: "MT5_ORDER_CALC_PROFIT".to_owned(),
                 conversion_rate: Some(1.0),
                 conversion_timestamp: Some(now),
                 trade_mode_enabled: true,
+                trade_mode: TradeMode::Full,
             },
             data_quality: DataQuality {
                 completeness: 1.0,
@@ -1219,6 +1369,25 @@ mod tests {
         let decision = decide(&snapshot, &sample_forecast(), &DecisionPolicy::scalper());
         assert_eq!(decision.action, DecisionAction::NoPrediction);
         assert_eq!(decision.reason_codes, vec!["DATA_INVALID_OR_STALE"]);
+    }
+
+    #[test]
+    fn broker_directional_trade_mode_blocks_wrong_side_and_close_only() {
+        let mut snapshot = sample_snapshot();
+        snapshot.symbol_spec.trade_mode = TradeMode::ShortOnly;
+        let wrong_side = decide(&snapshot, &sample_forecast(), &DecisionPolicy::scalper());
+        assert_eq!(wrong_side.action, DecisionAction::NoPrediction);
+        assert_eq!(wrong_side.reason_codes, vec!["BROKER_SHORT_ONLY"]);
+
+        snapshot.symbol_spec.trade_mode = TradeMode::CloseOnly;
+        let close_only = decide(&snapshot, &sample_forecast(), &DecisionPolicy::scalper());
+        assert_eq!(close_only.action, DecisionAction::NoPrediction);
+        assert_eq!(close_only.reason_codes, vec!["BROKER_CLOSE_ONLY"]);
+    }
+
+    #[test]
+    fn no_prediction_uses_database_contract_spelling() {
+        assert_eq!(DecisionAction::NoPrediction.as_str(), "NO_PREDICTION");
     }
 
     #[test]
@@ -1320,6 +1489,7 @@ mod tests {
             executable_tick_count: 10,
             first_tick_msc: Some(snapshot.timestamp.timestamp() * 1000),
             last_tick_msc: Some(snapshot.timestamp.timestamp() * 1000 + 1_000),
+            executable_tick_path: Vec::new(),
         });
         let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
         assert_eq!(decision.action, DecisionAction::Wait);

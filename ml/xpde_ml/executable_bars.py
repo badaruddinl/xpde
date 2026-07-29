@@ -93,6 +93,14 @@ def aggregate_executable_ticks(
             path = bar["_tick_path"]
             if path[-1][1] != bid or path[-1][2] != ask:
                 path.append([normalized_time_msc, bid, ask])
+            elif (
+                len(path) == 1
+                or path[-2][1] != bid
+                or path[-2][2] != ask
+            ):
+                path.append([normalized_time_msc, bid, ask])
+            else:
+                path[-1][0] = normalized_time_msc
         maximum_time_msc = max(maximum_time_msc or 0, time_msc)
     return bars, maximum_time_msc
 
@@ -140,12 +148,18 @@ def merge_executable_bars(
         combined_path.sort(key=lambda item: int(item[0]))
         compact_path: list[list[float | int]] = []
         for item in combined_path:
-            if (
-                not compact_path
-                or compact_path[-1][1] != item[1]
-                or compact_path[-1][2] != item[2]
+            if not compact_path:
+                compact_path.append(item)
+            elif compact_path[-1][1] != item[1] or compact_path[-1][2] != item[2]:
+                compact_path.append(item)
+            elif (
+                len(compact_path) == 1
+                or compact_path[-2][1] != item[1]
+                or compact_path[-2][2] != item[2]
             ):
                 compact_path.append(item)
+            else:
+                compact_path[-1] = item
         current["_tick_path"] = compact_path
 
 
@@ -171,7 +185,7 @@ def collect_executable_bars(
             symbol,
             cursor,
             chunk_end,
-            getattr(mt5, "COPY_TICKS_INFO", getattr(mt5, "COPY_TICKS_ALL", 0)),
+            getattr(mt5, "COPY_TICKS_ALL", 0),
         )
         if ticks is None:
             code, message = mt5.last_error()
@@ -207,6 +221,7 @@ def overlay_executable_bars(
                 if key not in {"timestamp", "_tick_path"}
             })
             if include_tick_path:
+                merged["executable_tick_path"] = executable.get("_tick_path", [])
                 merged["executable_tick_path_json"] = json.dumps(
                     executable.get("_tick_path", []),
                     separators=(",", ":"),

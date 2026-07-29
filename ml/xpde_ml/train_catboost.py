@@ -371,17 +371,19 @@ def train(args) -> dict[str, Any]:
         and source_manifest.get("chart_mode") == "BID"
         and source_manifest.get("executable_side_source")
         == "HISTORICAL_BID_ASK_TICKS"
+        and source_manifest.get("tick_collection_mode") == "COPY_TICKS_ALL"
         and float(executable_integrity.get("parity_mismatch_rate", 1.0)) == 0.0
         and int(executable_integrity.get("bars_without_full_tick_history", 1)) == 0
         and float(executable_integrity.get("minimum_tick_coverage_per_bar", 0.0))
-        >= 0.5
+        >= 0.95
+        and float(executable_integrity.get("tick_path_valid_rate", 0.0)) == 1.0
     )
     training_mode = getattr(args, "training_mode", "candidate")
     if training_mode == "candidate" and not dataset_integrity_ok:
         raise ValueError(
             "candidate training requires a clean dataset manifest with BID chart "
-            "mode, chart/tick Bid parity, sufficient tick coverage, and exact "
-            "HISTORICAL_BID_ASK_TICKS executable sides"
+            "mode, COPY_TICKS_ALL path integrity, chart/tick Bid parity, sufficient "
+            "tick coverage, and exact HISTORICAL_BID_ASK_TICKS executable sides"
         )
     frame = build_training_frame(raw)
     required = list(FEATURE_COLUMNS) + [

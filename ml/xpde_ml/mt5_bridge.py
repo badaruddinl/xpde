@@ -197,9 +197,16 @@ def build_snapshot(
             margin_buy = None
             margin_sell = None
 
-    trade_mode_enabled = int(getattr(symbol, "trade_mode", -1)) != int(
-        getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
-    )
+    raw_trade_mode = int(getattr(symbol, "trade_mode", -1))
+    trade_modes = {
+        int(getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4)): "FULL",
+        int(getattr(mt5, "SYMBOL_TRADE_MODE_LONGONLY", 1)): "LONG_ONLY",
+        int(getattr(mt5, "SYMBOL_TRADE_MODE_SHORTONLY", 2)): "SHORT_ONLY",
+        int(getattr(mt5, "SYMBOL_TRADE_MODE_CLOSEONLY", 3)): "CLOSE_ONLY",
+        int(getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)): "DISABLED",
+    }
+    trade_mode = trade_modes.get(raw_trade_mode, "UNKNOWN")
+    trade_mode_enabled = trade_mode != "DISABLED"
     profit_buy = None
     profit_sell = None
     pnl_source = "UNAVAILABLE"
@@ -283,6 +290,12 @@ def build_snapshot(
         for rate in rates
     ]
     bars = overlay_executable_bars(bars, executable_bars or {})
+    if bars:
+        latest_executable = (executable_bars or {}).get(str(bars[-1]["timestamp"]))
+        if latest_executable is not None:
+            bars[-1]["executable_tick_path"] = latest_executable.get(
+                "_tick_path", []
+            )
     executable_fields = tuple(
         f"{side}_{field}"
         for side in ("bid", "ask")
@@ -291,8 +304,9 @@ def build_snapshot(
     if bars and (
         not all(field in bars[-1] for field in executable_fields)
         or int(bars[-1].get("executable_tick_count", 0)) <= 0
+        or not bars[-1].get("executable_tick_path")
     ):
-        missing_flags.append("EXECUTABLE_SIDE_BAR_MISSING")
+        missing_flags.append("EXECUTABLE_TICK_PATH_MISSING")
     current_bar = None
     if current_rates is not None and len(current_rates) == 1:
         rate = current_rates[0]
@@ -305,13 +319,14 @@ def build_snapshot(
             "tick_volume": float(rate["tick_volume"]),
         }
         current_bar = overlay_executable_bars(
-            [current_bar], executable_bars or {}
+            [current_bar], executable_bars or {}, include_tick_path=True
         )[0]
     if current_bar is None or (
         not all(field in current_bar for field in executable_fields)
         or int(current_bar.get("executable_tick_count", 0)) <= 0
+        or not current_bar.get("executable_tick_path")
     ):
-        missing_flags.append("CURRENT_EXECUTABLE_SIDE_BAR_MISSING")
+        missing_flags.append("CURRENT_EXECUTABLE_TICK_PATH_MISSING")
 
     return {
         "symbol": SYMBOL,
@@ -343,7 +358,11 @@ def build_snapshot(
             "digits": int(symbol.digits),
             "chart_mode": chart_mode,
             "quote_currency": str(getattr(symbol, "currency_profit", "") or "USD"),
-            "pnl_currency": str(getattr(symbol, "currency_profit", "") or "USD"),
+            "pnl_currency": str(account.currency),
+            "symbol_profit_currency": str(
+                getattr(symbol, "currency_profit", "") or "USD"
+            ),
+            "calculated_pnl_currency": str(account.currency),
             "profit_per_price_unit_per_lot_buy": profit_buy,
             "profit_per_price_unit_per_lot_sell": profit_sell,
             "pnl_calculation_source": pnl_source,
@@ -354,6 +373,7 @@ def build_snapshot(
             ),
             "conversion_timestamp": tick_timestamp.isoformat(),
             "trade_mode_enabled": trade_mode_enabled,
+            "trade_mode": trade_mode,
             "margin_per_lot_buy": (
                 float(margin_buy)
                 if margin_buy is not None and float(margin_buy) > 0

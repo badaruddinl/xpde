@@ -10,7 +10,7 @@ import argparse
 import json
 import math
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .dataset import BARRIER_SPEC_ID
@@ -49,6 +49,70 @@ def barrier_outcome(
     return "NO_HIT_BEFORE_EXPIRY"
 
 
+def tick_sequence_barrier_outcome(
+    action: str,
+    target: float,
+    stop: float,
+    ticks: list[tuple[int, float, float]],
+    *,
+    start_exclusive_msc: int,
+    end_exclusive_msc: int,
+) -> tuple[str, int | None, float | None] | None:
+    if action not in {"LONG", "SHORT"} or end_exclusive_msc <= start_exclusive_msc:
+        return None
+    observed = False
+    for time_msc, bid, ask in ticks:
+        if time_msc <= start_exclusive_msc or time_msc >= end_exclusive_msc:
+            continue
+        observed = True
+        price = bid if action == "LONG" else ask
+        if (action == "LONG" and price >= target) or (
+            action == "SHORT" and price <= target
+        ):
+            return ("TP_FIRST", time_msc, price)
+        if (action == "LONG" and price <= stop) or (
+            action == "SHORT" and price >= stop
+        ):
+            return ("SL_FIRST", time_msc, price)
+    return ("NO_HIT_BEFORE_EXPIRY", None, None) if observed else None
+
+
+def _load_tick_path(
+    connection: sqlite3.Connection,
+    *,
+    symbol: str,
+    timeframe: str,
+    first_bucket: datetime,
+    end_exclusive: datetime,
+) -> list[tuple[int, float, float]] | None:
+    encoded = connection.execute(
+        """
+        SELECT tick_path_json
+        FROM market_tick_paths
+        WHERE symbol=? AND timeframe=? AND timestamp>=? AND timestamp<?
+          AND path_valid=1
+        ORDER BY timestamp
+        """,
+        (symbol, timeframe, first_bucket.isoformat(), end_exclusive.isoformat()),
+    ).fetchall()
+    if not encoded:
+        return None
+    ticks: list[tuple[int, float, float]] = []
+    try:
+        for row in encoded:
+            ticks.extend(
+                (int(item[0]), float(item[1]), float(item[2]))
+                for item in json.loads(str(row["tick_path_json"]))
+            )
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not ticks or any(
+        left[0] > right[0] for left, right in zip(ticks, ticks[1:])
+    ):
+        return None
+    return ticks
+
+
 def _ensure_schema(connection: sqlite3.Connection) -> None:
     prediction_columns = {
         str(row["name"])
@@ -82,6 +146,23 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE prediction_horizon_outcomes ADD COLUMN {column} TEXT"
             )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS market_tick_paths (
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            tick_path_json TEXT NOT NULL,
+            path_point_count INTEGER NOT NULL,
+            first_tick_msc INTEGER NOT NULL,
+            last_tick_msc INTEGER NOT NULL,
+            path_valid INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(symbol, timeframe, timestamp)
+        )
+        """
+    )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS prediction_horizon_outcomes (
@@ -130,11 +211,39 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             target_price REAL NOT NULL,
             stop_price REAL NOT NULL,
             barrier_outcome TEXT NOT NULL,
+            first_touch_time_msc INTEGER,
+            first_touch_price REAL,
+            settlement_source TEXT NOT NULL DEFAULT 'TICK_SEQUENCE',
             settled_at TEXT NOT NULL,
             UNIQUE(proposal_id)
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decision_proposal_evidence (
+            proposal_id TEXT NOT NULL,
+            evidence_source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(proposal_id, evidence_source)
+        )
+        """
+    )
+    proposal_outcome_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(decision_proposal_outcomes)"
+        ).fetchall()
+    }
+    for column, definition in (
+        ("first_touch_time_msc", "INTEGER"),
+        ("first_touch_price", "REAL"),
+        ("settlement_source", "TEXT NOT NULL DEFAULT 'TICK_SEQUENCE'"),
+    ):
+        if column not in proposal_outcome_columns:
+            connection.execute(
+                f"ALTER TABLE decision_proposal_outcomes ADD COLUMN {column} {definition}"
+            )
 
 
 def settle_with_report(database_path: Path) -> dict[str, int]:
@@ -222,24 +331,37 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
             barrier_short = None
             barrier = None
             if horizon == 3:
-                barrier_long = barrier_outcome(
-                    "LONG",
-                    float(forecast["target_price_long"]),
-                    float(forecast["stop_price_long"]),
-                    [
-                        {"high": bar["bid_high"], "low": bar["bid_low"]}
-                        for bar in bars
-                    ],
+                origin_time = datetime.fromisoformat(
+                    origin_timestamp.replace("Z", "+00:00")
                 )
-                barrier_short = barrier_outcome(
-                    "SHORT",
-                    float(forecast["target_price_short"]),
-                    float(forecast["stop_price_short"]),
-                    [
-                        {"high": bar["ask_high"], "low": bar["ask_low"]}
-                        for bar in bars
-                    ],
+                first_bucket = origin_time.replace(tzinfo=UTC) + timedelta(minutes=5)
+                end_exclusive = origin_time.replace(tzinfo=UTC) + timedelta(minutes=20)
+                ticks = _load_tick_path(
+                    connection,
+                    symbol=str(prediction["symbol"]),
+                    timeframe=str(prediction["timeframe"]),
+                    first_bucket=first_bucket,
+                    end_exclusive=end_exclusive,
                 )
+                if ticks is not None:
+                    long_result = tick_sequence_barrier_outcome(
+                        "LONG",
+                        float(forecast["target_price_long"]),
+                        float(forecast["stop_price_long"]),
+                        ticks,
+                        start_exclusive_msc=int(first_bucket.timestamp() * 1000) - 1,
+                        end_exclusive_msc=int(end_exclusive.timestamp() * 1000),
+                    )
+                    short_result = tick_sequence_barrier_outcome(
+                        "SHORT",
+                        float(forecast["target_price_short"]),
+                        float(forecast["stop_price_short"]),
+                        ticks,
+                        start_exclusive_msc=int(first_bucket.timestamp() * 1000) - 1,
+                        end_exclusive_msc=int(end_exclusive.timestamp() * 1000),
+                    )
+                    barrier_long = long_result[0] if long_result else None
+                    barrier_short = short_result[0] if short_result else None
                 barrier = barrier_long if point["q50"] >= 0 else barrier_short
             metrics = {
                 "median_error": abs(actual_return - point["q50"]),
@@ -302,25 +424,32 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
             str(proposal["quote_timestamp"]).replace("Z", "+00:00")
         )
         bucket_epoch = int(quote.timestamp()) // 300 * 300
-        bucket = datetime.fromtimestamp(bucket_epoch, tz=UTC).isoformat()
-        side_prefix = "bid" if proposal["action"] == "LONG" else "ask"
-        bars = connection.execute(
-            f"""
-            SELECT {side_prefix}_high AS high, {side_prefix}_low AS low
-            FROM market_bars
-            WHERE symbol=? AND timeframe=? AND timestamp>?
-              AND {side_prefix}_high IS NOT NULL AND {side_prefix}_low IS NOT NULL
-            ORDER BY timestamp LIMIT 3
-            """,
-            (proposal["symbol"], proposal["timeframe"], bucket),
-        ).fetchall()
-        if len(bars) < 3:
+        first_bucket = datetime.fromtimestamp(bucket_epoch, tz=UTC)
+        try:
+            proposal_json = json.loads(str(proposal["proposal_json"]))
+            outcome_matures_at = datetime.fromisoformat(
+                str(proposal_json["outcome_matures_at"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
-        outcome = barrier_outcome(
+        if datetime.now(UTC) < outcome_matures_at:
+            continue
+        ticks = _load_tick_path(
+            connection,
+            symbol=str(proposal["symbol"]),
+            timeframe=str(proposal["timeframe"]),
+            first_bucket=first_bucket,
+            end_exclusive=outcome_matures_at,
+        )
+        if ticks is None:
+            continue
+        outcome = tick_sequence_barrier_outcome(
             str(proposal["action"]),
             float(proposal["target_price"]),
             float(proposal["stop_price"]),
-            bars,
+            ticks,
+            start_exclusive_msc=int(quote.timestamp() * 1000),
+            end_exclusive_msc=int(outcome_matures_at.timestamp() * 1000),
         )
         if outcome is None:
             continue
@@ -328,8 +457,9 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
             """
             INSERT OR IGNORE INTO decision_proposal_outcomes
             (proposal_id, prediction_id, profile, horizon_bars, action,
-             target_price, stop_price, barrier_outcome, settled_at)
-            VALUES (?, ?, ?, 3, ?, ?, ?, ?, ?)
+             target_price, stop_price, barrier_outcome, first_touch_time_msc,
+             first_touch_price, settlement_source, settled_at)
+            VALUES (?, ?, ?, 3, ?, ?, ?, ?, ?, ?, 'TICK_SEQUENCE', ?)
             """,
             (
                 proposal["proposal_id"],
@@ -338,7 +468,9 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
                 proposal["action"],
                 proposal["target_price"],
                 proposal["stop_price"],
-                outcome,
+                outcome[0],
+                outcome[1],
+                outcome[2],
                 now,
             ),
         ).rowcount

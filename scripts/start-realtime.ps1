@@ -132,8 +132,8 @@ if ($existingBridge) {
             [int]$manifest.schema_version -eq 3 -and
             [int]$manifest.eligibility_gate_version -ge 3 -and
             $manifest.training_mode -eq "candidate" -and
-            $manifest.barrier_spec.id -eq "atr-1.25tp-1.00sl-h3-executable-v3" -and
-            $manifest.executable_side_contract.id -eq "bid-entry-exit-long-ask-exit-short-tick-sequence-v2" -and
+            $manifest.barrier_spec.id -eq "atr-1.25tp-1.00sl-h3-executable-v4" -and
+            $manifest.executable_side_contract.id -eq "bid-entry-exit-long-ask-exit-short-tick-sequence-v3" -and
             [int]$manifest.barrier_spec.horizon_bars -eq 3 -and
             $allGatesPassed -and
             $hasRequiredFiles

@@ -29,7 +29,7 @@ use xpde_domain::{
     AccountSnapshot, BARRIER_HORIZON_BARS, BARRIER_SPEC_ID, CalibrationStatus, ChartMode,
     DataQuality, DecisionAction, DecisionPolicy, DecisionProposal, EXECUTABLE_SIDE_CONTRACT_ID,
     ForecastEnvelope, ForecastPoint, HumanFeedback, MarketBar, MarketSnapshot, MarketStatus,
-    SymbolSpec, decide, decide_at,
+    SymbolSpec, TradeMode, decide,
 };
 
 const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
@@ -301,6 +301,7 @@ enum BarrierOutcome {
     TpFirst,
     SlFirst,
     NoHitBeforeExpiry,
+    #[cfg(test)]
     AmbiguousSameBar,
 }
 
@@ -310,11 +311,13 @@ impl BarrierOutcome {
             Self::TpFirst => "TP_FIRST",
             Self::SlFirst => "SL_FIRST",
             Self::NoHitBeforeExpiry => "NO_HIT_BEFORE_EXPIRY",
+            #[cfg(test)]
             Self::AmbiguousSameBar => "AMBIGUOUS_SAME_BAR",
         }
     }
 }
 
+#[cfg(test)]
 fn barrier_outcome(
     action: DecisionAction,
     target: f64,
@@ -338,6 +341,59 @@ fn barrier_outcome(
         }
     }
     Some(BarrierOutcome::NoHitBeforeExpiry)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TickBarrierOutcome {
+    outcome: BarrierOutcome,
+    first_touch_time_msc: Option<i64>,
+    first_touch_price: Option<f64>,
+}
+
+type ExecutableTick = (i64, f64, f64);
+
+fn tick_sequence_barrier_outcome(
+    action: DecisionAction,
+    target: f64,
+    stop: f64,
+    ticks: &[ExecutableTick],
+    start_exclusive_msc: i64,
+    end_exclusive_msc: i64,
+) -> Option<TickBarrierOutcome> {
+    if !target.is_finite() || !stop.is_finite() || end_exclusive_msc <= start_exclusive_msc {
+        return None;
+    }
+    let mut observed = false;
+    for &(time_msc, bid, ask) in ticks {
+        if time_msc <= start_exclusive_msc || time_msc >= end_exclusive_msc {
+            continue;
+        }
+        observed = true;
+        let executable_price = match action {
+            DecisionAction::Long => bid,
+            DecisionAction::Short => ask,
+            _ => return None,
+        };
+        let outcome = match action {
+            DecisionAction::Long if executable_price >= target => Some(BarrierOutcome::TpFirst),
+            DecisionAction::Long if executable_price <= stop => Some(BarrierOutcome::SlFirst),
+            DecisionAction::Short if executable_price <= target => Some(BarrierOutcome::TpFirst),
+            DecisionAction::Short if executable_price >= stop => Some(BarrierOutcome::SlFirst),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            return Some(TickBarrierOutcome {
+                outcome,
+                first_touch_time_msc: Some(time_msc),
+                first_touch_price: Some(executable_price),
+            });
+        }
+    }
+    observed.then_some(TickBarrierOutcome {
+        outcome: BarrierOutcome::NoHitBeforeExpiry,
+        first_touch_time_msc: None,
+        first_touch_price: None,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -564,6 +620,9 @@ impl Store {
             ("conversion_rate", "REAL"),
             ("conversion_timestamp", "TEXT"),
             ("trade_mode_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("symbol_profit_currency", "TEXT NOT NULL DEFAULT ''"),
+            ("calculated_pnl_currency", "TEXT NOT NULL DEFAULT ''"),
+            ("trade_mode", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
         ] {
             ensure_column(&connection, "symbol_specs", column, definition)?;
         }
@@ -605,6 +664,66 @@ impl Store {
             "prediction_horizon_outcomes",
             "barrier_short_outcome",
             "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "decision_proposal_instances",
+            "evidence_source",
+            "TEXT NOT NULL DEFAULT 'DIAGNOSTIC'",
+        )?;
+        ensure_column(
+            &connection,
+            "decision_proposal_outcomes",
+            "first_touch_time_msc",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &connection,
+            "decision_proposal_outcomes",
+            "first_touch_price",
+            "REAL",
+        )?;
+        ensure_column(
+            &connection,
+            "decision_proposal_outcomes",
+            "settlement_source",
+            "TEXT NOT NULL DEFAULT 'TICK_SEQUENCE'",
+        )?;
+        connection.execute_batch(
+            "INSERT OR IGNORE INTO decision_proposal_evidence
+             (proposal_id, evidence_source, created_at)
+             SELECT dpi.proposal_id, 'FIRST_ACTIONABLE', dpi.created_at
+             FROM decision_proposal_instances dpi
+             WHERE dpi.action IN ('LONG','SHORT')
+               AND dpi.evidence_eligible=1
+               AND dpi.rowid=(
+                 SELECT first.rowid
+                 FROM decision_proposal_instances first
+                 WHERE first.prediction_id=dpi.prediction_id
+                   AND first.profile=dpi.profile
+                   AND first.action IN ('LONG','SHORT')
+                   AND first.evidence_eligible=1
+                 ORDER BY first.evaluated_at, first.rowid
+                 LIMIT 1
+               );
+             INSERT OR IGNORE INTO decision_proposal_evidence
+             (proposal_id, evidence_source, created_at)
+             SELECT hf.proposal_id, 'HUMAN_ACCEPTED', hf.created_at
+             FROM human_feedback hf
+             WHERE hf.proposal_id IS NOT NULL AND hf.verdict='ACCEPTED'
+               AND EXISTS (
+                 SELECT 1 FROM decision_proposal_instances dpi
+                 WHERE dpi.proposal_id=hf.proposal_id
+               );
+             INSERT OR IGNORE INTO decision_proposal_evidence
+             (proposal_id, evidence_source, created_at)
+             SELECT hf.proposal_id, 'HUMAN_REJECTED', hf.created_at
+             FROM human_feedback hf
+             WHERE hf.proposal_id IS NOT NULL AND hf.verdict='REJECTED'
+               AND EXISTS (
+                 SELECT 1 FROM decision_proposal_instances dpi
+                 WHERE dpi.proposal_id=hf.proposal_id
+               );",
         )?;
         connection.execute_batch(
             "UPDATE predictions
@@ -663,6 +782,90 @@ impl Store {
         })
     }
 
+    fn save_tick_paths<'a>(
+        transaction: &rusqlite::Transaction<'_>,
+        symbol: &str,
+        timeframe: &str,
+        bars: impl Iterator<Item = &'a MarketBar>,
+        source: &str,
+    ) -> Result<(), rusqlite::Error> {
+        for bar in bars.filter(|bar| bar.has_valid_tick_path()) {
+            let first = bar.first_tick_msc.expect("validated tick path start");
+            let last = bar.last_tick_msc.expect("validated tick path end");
+            transaction.execute(
+                "INSERT INTO market_tick_paths
+                 (symbol, timeframe, timestamp, tick_path_json, path_point_count,
+                  first_tick_msc, last_tick_msc, path_valid, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
+                 ON CONFLICT(symbol, timeframe, timestamp) DO UPDATE SET
+                   tick_path_json=excluded.tick_path_json,
+                   path_point_count=excluded.path_point_count,
+                   first_tick_msc=excluded.first_tick_msc,
+                   last_tick_msc=excluded.last_tick_msc,
+                   path_valid=excluded.path_valid,
+                   source=excluded.source,
+                   updated_at=excluded.updated_at
+                 WHERE excluded.first_tick_msc<=market_tick_paths.first_tick_msc
+                   AND excluded.last_tick_msc>=market_tick_paths.last_tick_msc
+                   AND excluded.path_point_count>=market_tick_paths.path_point_count",
+                params![
+                    symbol,
+                    timeframe,
+                    bar.timestamp.to_rfc3339(),
+                    serde_json::to_string(&bar.executable_tick_path)
+                        .unwrap_or_else(|_| "[]".to_owned()),
+                    bar.executable_tick_path.len(),
+                    first,
+                    last,
+                    source,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_tick_path(
+        transaction: &rusqlite::Transaction<'_>,
+        symbol: &str,
+        timeframe: &str,
+        first_bucket: DateTime<Utc>,
+        end_exclusive: DateTime<Utc>,
+    ) -> Result<Option<Vec<ExecutableTick>>, rusqlite::Error> {
+        let mut statement = transaction.prepare(
+            "SELECT tick_path_json
+             FROM market_tick_paths
+             WHERE symbol=?1 AND timeframe=?2
+               AND timestamp>=?3 AND timestamp<?4 AND path_valid=1
+             ORDER BY timestamp",
+        )?;
+        let encoded = statement
+            .query_map(
+                params![
+                    symbol,
+                    timeframe,
+                    first_bucket.to_rfc3339(),
+                    end_exclusive.to_rfc3339()
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if encoded.is_empty() {
+            return Ok(None);
+        }
+        let mut ticks = Vec::new();
+        for path in encoded {
+            let Ok(mut parsed) = serde_json::from_str::<Vec<ExecutableTick>>(&path) else {
+                return Ok(None);
+            };
+            ticks.append(&mut parsed);
+        }
+        if ticks.is_empty() || ticks.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+            return Ok(None);
+        }
+        Ok(Some(ticks))
+    }
+
     fn save_snapshot(&self, snapshot: &MarketSnapshot) -> Result<(), rusqlite::Error> {
         let mut connection = self.connection.lock().expect("database mutex poisoned");
         let transaction = connection.transaction()?;
@@ -692,11 +895,12 @@ impl Store {
             "INSERT INTO symbol_specs
              (symbol, description, contract_size, volume_min, volume_max, volume_step,
               tick_size, tick_value, stops_level_points, digits, chart_mode,
-              quote_currency, pnl_currency, profit_per_price_unit_per_lot_buy,
+              quote_currency, pnl_currency, symbol_profit_currency,
+              calculated_pnl_currency, profit_per_price_unit_per_lot_buy,
               profit_per_price_unit_per_lot_sell, pnl_calculation_source,
-              conversion_rate, conversion_timestamp, trade_mode_enabled, captured_at)
+              conversion_rate, conversion_timestamp, trade_mode_enabled, trade_mode, captured_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(symbol) DO UPDATE SET
                description=excluded.description,
                contract_size=excluded.contract_size,
@@ -710,12 +914,15 @@ impl Store {
                chart_mode=excluded.chart_mode,
                quote_currency=excluded.quote_currency,
                pnl_currency=excluded.pnl_currency,
+               symbol_profit_currency=excluded.symbol_profit_currency,
+               calculated_pnl_currency=excluded.calculated_pnl_currency,
                profit_per_price_unit_per_lot_buy=excluded.profit_per_price_unit_per_lot_buy,
                profit_per_price_unit_per_lot_sell=excluded.profit_per_price_unit_per_lot_sell,
                pnl_calculation_source=excluded.pnl_calculation_source,
                conversion_rate=excluded.conversion_rate,
                conversion_timestamp=excluded.conversion_timestamp,
                trade_mode_enabled=excluded.trade_mode_enabled,
+               trade_mode=excluded.trade_mode,
                captured_at=excluded.captured_at
              WHERE description IS NOT excluded.description
                 OR contract_size IS NOT excluded.contract_size
@@ -729,12 +936,15 @@ impl Store {
                 OR chart_mode IS NOT excluded.chart_mode
                 OR quote_currency IS NOT excluded.quote_currency
                 OR pnl_currency IS NOT excluded.pnl_currency
+                OR symbol_profit_currency IS NOT excluded.symbol_profit_currency
+                OR calculated_pnl_currency IS NOT excluded.calculated_pnl_currency
                 OR profit_per_price_unit_per_lot_buy IS NOT excluded.profit_per_price_unit_per_lot_buy
                 OR profit_per_price_unit_per_lot_sell IS NOT excluded.profit_per_price_unit_per_lot_sell
                 OR pnl_calculation_source IS NOT excluded.pnl_calculation_source
                 OR conversion_rate IS NOT excluded.conversion_rate
                 OR conversion_timestamp IS NOT excluded.conversion_timestamp
-                OR trade_mode_enabled IS NOT excluded.trade_mode_enabled",
+                OR trade_mode_enabled IS NOT excluded.trade_mode_enabled
+                OR trade_mode IS NOT excluded.trade_mode",
             params![
                 snapshot.symbol,
                 snapshot.symbol_spec.description,
@@ -749,6 +959,8 @@ impl Store {
                 snapshot.symbol_spec.chart_mode.as_str(),
                 snapshot.symbol_spec.quote_currency,
                 snapshot.symbol_spec.pnl_currency,
+                snapshot.symbol_spec.symbol_profit_currency,
+                snapshot.symbol_spec.calculated_pnl_currency,
                 snapshot.symbol_spec.profit_per_price_unit_per_lot_buy,
                 snapshot.symbol_spec.profit_per_price_unit_per_lot_sell,
                 snapshot.symbol_spec.pnl_calculation_source,
@@ -758,6 +970,7 @@ impl Store {
                     .conversion_timestamp
                     .map(|value| value.to_rfc3339()),
                 snapshot.symbol_spec.trade_mode_enabled,
+                snapshot.symbol_spec.trade_mode.as_str(),
                 snapshot.timestamp.to_rfc3339(),
             ],
         )?;
@@ -820,6 +1033,18 @@ impl Store {
                 ],
             )?;
         }
+        Self::save_tick_paths(
+            &transaction,
+            &snapshot.symbol,
+            &snapshot.timeframe,
+            snapshot
+                .bars
+                .iter()
+                .max_by_key(|bar| bar.timestamp)
+                .into_iter()
+                .chain(snapshot.current_bar.iter()),
+            "LIVE_SNAPSHOT",
+        )?;
         transaction.execute(
             "INSERT INTO audit_events(event_type, entity_id, payload_json, created_at)
              VALUES ('MARKET_SNAPSHOT_ACCEPTED', ?1, ?2, ?3)",
@@ -852,6 +1077,10 @@ impl Store {
         if request.reset {
             transaction.execute(
                 "DELETE FROM market_bars WHERE symbol=?1 AND timeframe=?2",
+                params![request.symbol, request.timeframe],
+            )?;
+            transaction.execute(
+                "DELETE FROM market_tick_paths WHERE symbol=?1 AND timeframe=?2",
                 params![request.symbol, request.timeframe],
             )?;
         }
@@ -917,6 +1146,13 @@ impl Store {
             }
             inserted
         };
+        Self::save_tick_paths(
+            &transaction,
+            &request.symbol,
+            &request.timeframe,
+            request.bars.iter(),
+            "HISTORICAL_BACKFILL",
+        )?;
         transaction.execute(
             "INSERT INTO audit_events(event_type, entity_id, payload_json, created_at)
              VALUES ('MARKET_BACKFILL_ACCEPTED', ?1, ?2, ?3)",
@@ -1078,18 +1314,33 @@ impl Store {
                 persisted.push(proposal.clone());
                 continue;
             }
+            let tick_size = transaction
+                .query_row(
+                    "SELECT s.tick_size
+                     FROM predictions p
+                     LEFT JOIN symbol_specs s ON s.symbol=p.symbol
+                     WHERE p.prediction_id=?1",
+                    [&prediction_id],
+                    |row| row.get::<_, Option<f64>>(0),
+                )
+                .ok()
+                .flatten()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(0.01);
+            let price_tick =
+                |value: Option<f64>| value.map(|price| (price / tick_size).round() as i64);
             let profile = format!("{:?}", proposal.profile).to_uppercase();
-            let action = format!("{:?}", proposal.action).to_uppercase();
+            let action = proposal.action.as_str();
             let fingerprint = serde_json::json!({
                 "action": action,
-                "reference_entry_price": proposal.reference_entry_price,
-                "target_price": proposal.target_price,
-                "stop_price": proposal.invalidation_price,
-                "remaining_reward_account": proposal.remaining_reward_account,
-                "remaining_risk_account": proposal.remaining_risk_account,
+                "reference_entry_tick": price_tick(proposal.reference_entry_price),
+                "target_tick": price_tick(proposal.target_price),
+                "stop_tick": price_tick(proposal.invalidation_price),
+                "reward_risk_band": (proposal.reward_risk_ratio / 0.05).round() as i64,
                 "cost_model_id": proposal.cost_model_id,
-                "entry_spread": proposal.entry_spread,
-                "expected_exit_spread": proposal.expected_exit_spread,
+                "entry_spread_ticks": (proposal.entry_spread / tick_size).round() as i64,
+                "expected_exit_spread_ticks":
+                    (proposal.expected_exit_spread / tick_size).round() as i64,
                 "reason_codes": proposal.reason_codes,
                 "model_health_status": proposal.model_health_status,
                 "pnl_calculation_source": proposal.pnl_calculation_source,
@@ -1116,8 +1367,11 @@ impl Store {
             );
             let has_policy_instance: bool = transaction.query_row(
                 "SELECT EXISTS(
-                   SELECT 1 FROM decision_proposal_instances
-                   WHERE prediction_id=?1 AND profile=?2 AND evidence_eligible=1
+                   SELECT 1
+                   FROM decision_proposal_evidence dpe
+                   JOIN decision_proposal_instances dpi ON dpi.proposal_id=dpe.proposal_id
+                   WHERE dpi.prediction_id=?1 AND dpi.profile=?2
+                     AND dpe.evidence_source='FIRST_ACTIONABLE'
                  )",
                 params![prediction_id, profile],
                 |row| row.get(0),
@@ -1125,6 +1379,11 @@ impl Store {
             let mut saved = proposal.clone();
             saved.proposal_id = Some(Uuid::new_v4());
             saved.evidence_eligible = directional && !has_policy_instance;
+            saved.evidence_source = if saved.evidence_eligible {
+                "FIRST_ACTIONABLE".to_owned()
+            } else {
+                "DIAGNOSTIC".to_owned()
+            };
             let evaluated_at = saved.evaluated_at.unwrap_or_else(Utc::now);
             let quote_timestamp = saved.quote_timestamp.unwrap_or(evaluated_at);
             let proposal_json = serde_json::to_string(&saved).unwrap_or_else(|_| "{}".to_owned());
@@ -1135,9 +1394,9 @@ impl Store {
                   stop_price, remaining_reward_account, remaining_risk_account,
                   account_currency, cost_model_id, entry_spread, expected_exit_spread,
                   reason_codes_json, model_health_status, proposal_json,
-                  evidence_eligible, created_at)
+                  evidence_eligible, evidence_source, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     saved.proposal_id.map(|value| value.to_string()),
                     prediction_id,
@@ -1159,11 +1418,62 @@ impl Store {
                     saved.model_health_status,
                     proposal_json,
                     saved.evidence_eligible,
+                    saved.evidence_source,
                     Utc::now().to_rfc3339(),
                 ],
             )?;
+            if saved.evidence_eligible {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO decision_proposal_evidence
+                     (proposal_id, evidence_source, created_at)
+                     VALUES (?1, 'FIRST_ACTIONABLE', ?2)",
+                    params![
+                        saved.proposal_id.map(|value| value.to_string()),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
             persisted.push(saved);
         }
+        transaction.execute(
+            "DELETE FROM decision_proposal_instances
+             WHERE evidence_eligible=0
+               AND created_at<?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM human_feedback hf
+                 WHERE hf.proposal_id=decision_proposal_instances.proposal_id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM decision_proposal_outcomes dpo
+                 WHERE dpo.proposal_id=decision_proposal_instances.proposal_id
+               )",
+            [(Utc::now() - chrono::Duration::days(7)).to_rfc3339()],
+        )?;
+        transaction.execute(
+            "DELETE FROM decision_proposal_instances
+             WHERE proposal_id IN (
+               SELECT proposal_id
+               FROM (
+                 SELECT proposal_id,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY prediction_id, profile
+                          ORDER BY evaluated_at DESC, rowid DESC
+                        ) AS recency_rank
+                 FROM decision_proposal_instances
+                 WHERE evidence_eligible=0
+               ) ranked
+               WHERE recency_rank>128
+             )
+               AND NOT EXISTS (
+                 SELECT 1 FROM human_feedback hf
+                 WHERE hf.proposal_id=decision_proposal_instances.proposal_id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM decision_proposal_outcomes dpo
+                 WHERE dpo.proposal_id=decision_proposal_instances.proposal_id
+               )",
+            [],
+        )?;
         transaction.commit()?;
         Ok(persisted)
     }
@@ -1180,9 +1490,9 @@ impl Store {
                 feedback.proposal_id.to_string(),
                 feedback.prediction_id.to_string(),
                 format!("{:?}", feedback.profile).to_uppercase(),
-                format!("{:?}", feedback.proposal_action).to_uppercase(),
+                feedback.proposal_action.as_str(),
                 feedback.model_id,
-                format!("{:?}", feedback.forecast_side).to_uppercase(),
+                feedback.forecast_side.as_str(),
                 feedback.selected_reason,
                 format!("{:?}", feedback.verdict).to_uppercase(),
                 serde_json::to_string(&feedback.reason_codes).unwrap_or_else(|_| "[]".to_owned()),
@@ -1190,12 +1500,31 @@ impl Store {
                 feedback.created_at.to_rfc3339(),
             ],
         )?;
-        if matches!(feedback.verdict, xpde_domain::FeedbackVerdict::Accepted) {
+        let evidence_source = match feedback.verdict {
+            xpde_domain::FeedbackVerdict::Accepted => Some("HUMAN_ACCEPTED"),
+            xpde_domain::FeedbackVerdict::Rejected => Some("HUMAN_REJECTED"),
+            xpde_domain::FeedbackVerdict::Uncertain => None,
+        };
+        if let Some(evidence_source) = evidence_source {
             transaction.execute(
                 "UPDATE decision_proposal_instances
-                 SET evidence_eligible=1
+                 SET evidence_eligible=1,
+                     evidence_source=CASE
+                       WHEN evidence_source='FIRST_ACTIONABLE' THEN evidence_source
+                       ELSE ?2
+                     END
                  WHERE proposal_id=?1",
-                [feedback.proposal_id.to_string()],
+                params![feedback.proposal_id.to_string(), evidence_source],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO decision_proposal_evidence
+                 (proposal_id, evidence_source, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    feedback.proposal_id.to_string(),
+                    evidence_source,
+                    feedback.created_at.to_rfc3339(),
+                ],
             )?;
         }
         transaction.commit()
@@ -1207,7 +1536,16 @@ impl Store {
             "SELECT dpi.proposal_json, p.model_id
              FROM decision_proposal_instances dpi
              JOIN predictions p ON p.prediction_id=dpi.prediction_id
-             WHERE dpi.proposal_id=?1",
+             WHERE dpi.proposal_id=?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM decision_proposal_instances newer
+                 WHERE newer.prediction_id=dpi.prediction_id
+                   AND newer.profile=dpi.profile
+                   AND (
+                     newer.evaluated_at>dpi.evaluated_at
+                     OR (newer.evaluated_at=dpi.evaluated_at AND newer.rowid>dpi.rowid)
+                   )
+               )",
             [feedback.proposal_id.to_string()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         );
@@ -1217,11 +1555,16 @@ impl Store {
         let Ok(proposal) = serde_json::from_str::<DecisionProposal>(&proposal_json) else {
             return Ok(false);
         };
+        let now = Utc::now();
+        let entry_window_end = proposal.generated_at
+            + chrono::Duration::seconds(proposal.maximum_decision_age_seconds as i64);
         Ok(proposal.prediction_id == feedback.prediction_id
             && proposal.profile == feedback.profile
             && proposal.action == feedback.proposal_action
             && model_id == feedback.model_id
-            && Utc::now() <= proposal.decision_valid_until)
+            && now <= proposal.decision_valid_until
+            && (!matches!(feedback.verdict, xpde_domain::FeedbackVerdict::Accepted)
+                || now <= entry_window_end))
     }
 
     fn register_model(&self, model: &ModelRegistration) -> Result<(), rusqlite::Error> {
@@ -1450,38 +1793,43 @@ impl Store {
                     continue;
                 }
                 let (barrier_long, barrier_short) = if target.horizon_bars == BARRIER_HORIZON_BARS {
-                    let long_barrier_bars = horizon_bars
-                        .iter()
-                        .map(|bar| {
-                            (
-                                bar.4.unwrap_or_default(),
-                                bar.5.unwrap_or_default(),
-                                bar.6.unwrap_or_default(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let short_barrier_bars = horizon_bars
-                        .iter()
-                        .map(|bar| {
-                            (
-                                bar.7.unwrap_or_default(),
-                                bar.8.unwrap_or_default(),
-                                bar.9.unwrap_or_default(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let long = barrier_outcome(
-                        DecisionAction::Long,
-                        forecast.target_price_long,
-                        forecast.stop_price_long,
-                        &long_barrier_bars,
-                    );
-                    let short = barrier_outcome(
-                        DecisionAction::Short,
-                        forecast.target_price_short,
-                        forecast.stop_price_short,
-                        &short_barrier_bars,
-                    );
+                    let Ok(origin_time) = DateTime::parse_from_rfc3339(&origin_bar_timestamp)
+                    else {
+                        continue;
+                    };
+                    let first_bucket =
+                        origin_time.with_timezone(&Utc) + chrono::Duration::minutes(5);
+                    let end_exclusive = origin_time.with_timezone(&Utc)
+                        + chrono::Duration::minutes((BARRIER_HORIZON_BARS as i64 + 1) * 5);
+                    let tick_path = Self::load_tick_path(
+                        &transaction,
+                        &symbol,
+                        &timeframe,
+                        first_bucket,
+                        end_exclusive,
+                    )?;
+                    let long = tick_path.as_deref().and_then(|ticks| {
+                        tick_sequence_barrier_outcome(
+                            DecisionAction::Long,
+                            forecast.target_price_long,
+                            forecast.stop_price_long,
+                            ticks,
+                            first_bucket.timestamp_millis() - 1,
+                            end_exclusive.timestamp_millis(),
+                        )
+                        .map(|result| result.outcome)
+                    });
+                    let short = tick_path.as_deref().and_then(|ticks| {
+                        tick_sequence_barrier_outcome(
+                            DecisionAction::Short,
+                            forecast.target_price_short,
+                            forecast.stop_price_short,
+                            ticks,
+                            first_bucket.timestamp_millis() - 1,
+                            end_exclusive.timestamp_millis(),
+                        )
+                        .map(|result| result.outcome)
+                    });
                     (long, short)
                 } else {
                     (None, None)
@@ -1614,10 +1962,13 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT dpi.proposal_id, dpi.prediction_id, dpi.profile,
                         dpi.quote_timestamp, dpi.action, dpi.target_price, dpi.stop_price,
-                        p.symbol, p.timeframe
+                        p.symbol, p.timeframe, dpi.proposal_json
                  FROM decision_proposal_instances dpi
                  JOIN predictions p ON p.prediction_id=dpi.prediction_id
-                 WHERE dpi.evidence_eligible=1
+                 WHERE EXISTS (
+                     SELECT 1 FROM decision_proposal_evidence dpe
+                     WHERE dpe.proposal_id=dpi.proposal_id
+                   )
                    AND dpi.action IN ('LONG','SHORT')
                    AND dpi.target_price IS NOT NULL
                    AND dpi.stop_price IS NOT NULL
@@ -1640,6 +1991,7 @@ impl Store {
                         row.get::<_, f64>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -1656,63 +2008,54 @@ impl Store {
             stop,
             symbol,
             timeframe,
+            proposal_json,
         ) in pending
         {
             let Ok(quote_time) = DateTime::parse_from_rfc3339(&quote_timestamp) else {
                 continue;
             };
-            let bucket =
-                DateTime::<Utc>::from_timestamp(quote_time.timestamp().div_euclid(300) * 300, 0)
-                    .expect("valid M5 proposal bucket")
-                    .to_rfc3339();
-            let bars = {
-                let mut statement = transaction.prepare(
-                    "SELECT bid_high, bid_low, bid_close, ask_high, ask_low, ask_close
-                     FROM market_bars
-                     WHERE symbol=?1 AND timeframe=?2 AND timestamp>?3
-                       AND bid_high IS NOT NULL AND bid_low IS NOT NULL
-                       AND bid_close IS NOT NULL AND ask_high IS NOT NULL
-                       AND ask_low IS NOT NULL AND ask_close IS NOT NULL
-                     ORDER BY timestamp LIMIT 3",
-                )?;
-                statement
-                    .query_map(params![symbol, timeframe, bucket], |row| {
-                        Ok((
-                            row.get::<_, f64>(0)?,
-                            row.get::<_, f64>(1)?,
-                            row.get::<_, f64>(2)?,
-                            row.get::<_, f64>(3)?,
-                            row.get::<_, f64>(4)?,
-                            row.get::<_, f64>(5)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
+            let Ok(proposal) = serde_json::from_str::<DecisionProposal>(&proposal_json) else {
+                continue;
             };
-            if bars.len() < BARRIER_HORIZON_BARS as usize {
+            if Utc::now() < proposal.outcome_matures_at {
                 continue;
             }
+            let quote_time = quote_time.with_timezone(&Utc);
+            let first_bucket =
+                DateTime::<Utc>::from_timestamp(quote_time.timestamp().div_euclid(300) * 300, 0)
+                    .expect("valid M5 proposal bucket");
+            let Some(ticks) = Self::load_tick_path(
+                &transaction,
+                &symbol,
+                &timeframe,
+                first_bucket,
+                proposal.outcome_matures_at,
+            )?
+            else {
+                continue;
+            };
             let action = if action_text == "LONG" {
                 DecisionAction::Long
             } else {
                 DecisionAction::Short
             };
-            let executable = if action == DecisionAction::Long {
-                bars.iter()
-                    .map(|bar| (bar.0, bar.1, bar.2))
-                    .collect::<Vec<_>>()
-            } else {
-                bars.iter()
-                    .map(|bar| (bar.3, bar.4, bar.5))
-                    .collect::<Vec<_>>()
-            };
-            let Some(outcome) = barrier_outcome(action, target, stop, &executable) else {
+            let Some(outcome) = tick_sequence_barrier_outcome(
+                action,
+                target,
+                stop,
+                &ticks,
+                quote_time.timestamp_millis(),
+                proposal.outcome_matures_at.timestamp_millis(),
+            ) else {
                 continue;
             };
             transaction.execute(
                 "INSERT OR IGNORE INTO decision_proposal_outcomes
                  (proposal_id, prediction_id, profile, horizon_bars, action,
-                  target_price, stop_price, barrier_outcome, settled_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  target_price, stop_price, barrier_outcome, first_touch_time_msc,
+                  first_touch_price, settlement_source, settled_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         'TICK_SEQUENCE', ?11)",
                 params![
                     proposal_id,
                     prediction_id,
@@ -1721,7 +2064,9 @@ impl Store {
                     action_text,
                     target,
                     stop,
-                    outcome.as_str(),
+                    outcome.outcome.as_str(),
+                    outcome.first_touch_time_msc,
+                    outcome.first_touch_price,
                     Utc::now().to_rfc3339(),
                 ],
             )?;
@@ -2468,7 +2813,7 @@ impl Store {
                    ORDER BY p.origin_bar_timestamp DESC
                    LIMIT 200
                  )
-                 SELECT po.profile,
+                 SELECT po.profile, dpe.evidence_source,
                         COUNT(*),
                         COUNT(CASE WHEN po.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                         AVG(CASE
@@ -2486,21 +2831,24 @@ impl Store {
                             END)
                  FROM decision_proposal_outcomes po
                  JOIN recent_predictions rp ON rp.prediction_id=po.prediction_id
+                 JOIN decision_proposal_evidence dpe ON dpe.proposal_id=po.proposal_id
                  WHERE po.horizon_bars=3
-                 GROUP BY po.profile ORDER BY po.profile",
+                 GROUP BY po.profile, dpe.evidence_source
+                 ORDER BY po.profile, dpe.evidence_source",
             )?;
             statement
                 .query_map(params![current_model_id, BARRIER_SPEC_ID], |row| {
                     Ok(serde_json::json!({
                         "profile": row.get::<_, String>(0)?,
-                        "settled_proposals": row.get::<_, i64>(1)?,
-                        "tp_before_sl_samples": row.get::<_, i64>(2)?,
-                        "tp_before_sl_rate": row.get::<_, Option<f64>>(3)?,
-                        "no_hit_samples": row.get::<_, i64>(4)?,
-                        "ambiguous_samples": row.get::<_, i64>(5)?,
-                        "tp_first_within_horizon_samples": row.get::<_, i64>(6)?,
-                        "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(7)?,
-                        "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(3)?,
+                        "evidence_source": row.get::<_, String>(1)?,
+                        "settled_proposal_instances": row.get::<_, i64>(2)?,
+                        "tp_before_sl_samples": row.get::<_, i64>(3)?,
+                        "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
+                        "no_hit_samples": row.get::<_, i64>(5)?,
+                        "ambiguous_samples": row.get::<_, i64>(6)?,
+                        "tp_first_within_horizon_samples": row.get::<_, i64>(7)?,
+                        "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(8)?,
+                        "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(4)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -2700,6 +3048,11 @@ async fn post_snapshot(
         .store
         .save_snapshot(&snapshot)
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    let current_model_id = state.runtime.read().await.forecast.model_id.clone();
+    let model_health = state
+        .store
+        .model_health(&current_model_id, &state.policies.model_health)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
 
     let mut runtime = state.runtime.write().await;
     runtime.snapshot = snapshot;
@@ -2712,6 +3065,7 @@ async fn post_snapshot(
     runtime.mode = "LIVE_SHADOW";
     runtime.updated_at = Utc::now();
     runtime.safety.feed_is_demo = false;
+    runtime.model_health = model_health;
     runtime.forecast_status = forecast_status(
         &runtime.snapshot,
         &runtime.forecast,
@@ -2731,6 +3085,10 @@ async fn post_snapshot(
         &health,
         state.policies.model_health.warming_up_forces_wait,
     );
+    runtime.proposals = state
+        .store
+        .save_proposal_instances(&runtime.proposals)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -2766,11 +3124,12 @@ async fn post_forecast(
     }
     if runtime.snapshot.symbol_spec.chart_mode != ChartMode::Bid
         || !latest_completed.has_executable_sides()
+        || !latest_completed.has_valid_tick_path()
         || !runtime
             .snapshot
             .current_bar
             .as_ref()
-            .is_some_and(MarketBar::has_executable_sides)
+            .is_some_and(|bar| bar.has_executable_sides() && bar.has_valid_tick_path())
     {
         return Err(ApiError::bad_request(
             "forecast rejected because exact Bid/Ask executable bars are unavailable",
@@ -2811,6 +3170,10 @@ async fn post_forecast(
             &health,
             state.policies.model_health.warming_up_forces_wait,
         );
+        runtime.proposals = state
+            .store
+            .save_proposal_instances(&runtime.proposals)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
         runtime.updated_at = Utc::now();
         runtime.forecast_status = forecast_status(
             &runtime.snapshot,
@@ -2821,7 +3184,10 @@ async fn post_forecast(
         return Ok(StatusCode::OK);
     }
     runtime.forecast = forecast;
-    runtime.proposals = proposals;
+    runtime.proposals = state
+        .store
+        .save_proposal_instances(&proposals)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     runtime.model_health = model_health;
     runtime.updated_at = Utc::now();
     runtime.forecast_status = forecast_status(
@@ -2858,6 +3224,33 @@ async fn post_feedback(
         )
     {
         return Err(ApiError::bad_request("feedback context is invalid"));
+    }
+    {
+        let runtime = state.runtime.read().await;
+        let latest_matches = runtime.proposals.iter().any(|proposal| {
+            proposal.profile == feedback.profile
+                && proposal.proposal_id == Some(feedback.proposal_id)
+                && proposal.action == feedback.proposal_action
+        });
+        if !latest_matches {
+            return Err(ApiError::bad_request(
+                "feedback rejected because the proposal is not the latest published instance",
+            ));
+        }
+        if matches!(feedback.verdict, xpde_domain::FeedbackVerdict::Accepted)
+            && matches!(
+                feedback.proposal_action,
+                DecisionAction::Long | DecisionAction::Short
+            )
+            && matches!(
+                runtime.model_health.status,
+                ModelHealthStatus::Degraded | ModelHealthStatus::Suspended
+            )
+        {
+            return Err(ApiError::bad_request(
+                "feedback rejected because live model health no longer permits entry",
+            ));
+        }
     }
     if !state
         .store
@@ -2945,10 +3338,7 @@ async fn get_evaluation_summary(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let current_model_id = state.runtime.read().await.forecast.model_id.clone();
-    let model_health = state
-        .store
-        .model_health(&current_model_id, &state.policies.model_health)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let model_health = state.runtime.read().await.model_health.clone();
     let mut summary = state
         .store
         .evaluation_summary(&current_model_id, state.started_at)
@@ -2986,12 +3376,12 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 
 async fn public_runtime_state(state: &AppState) -> RuntimeState {
     let mut runtime = state.runtime.read().await.clone();
-    runtime.model_health = state
-        .store
-        .model_health(&runtime.forecast.model_id, &state.policies.model_health)
-        .unwrap_or_else(|_| {
-            ModelHealth::warming_up(state.policies.model_health.minimum_settled_predictions)
-        });
+    for bar in &mut runtime.snapshot.bars {
+        bar.executable_tick_path.clear();
+    }
+    if let Some(current_bar) = &mut runtime.snapshot.current_bar {
+        current_bar.executable_tick_path.clear();
+    }
     let now = Utc::now();
     runtime.forecast_status = forecast_status(
         &runtime.snapshot,
@@ -3022,29 +3412,6 @@ async fn public_runtime_state(state: &AppState) -> RuntimeState {
         } else if runtime.snapshot.data_quality.tick_age_ms > state.policies.scalper.max_tick_age_ms
         {
             runtime.connection_status = "MT5_STALE";
-        }
-        runtime.proposals = vec![
-            decide_at(
-                &runtime.snapshot,
-                &runtime.forecast,
-                &state.policies.scalper,
-                now,
-            ),
-            decide_at(
-                &runtime.snapshot,
-                &runtime.forecast,
-                &state.policies.sniper,
-                now,
-            ),
-        ];
-        let health = runtime.model_health.clone();
-        apply_model_health_gate(
-            &mut runtime.proposals,
-            &health,
-            state.policies.model_health.warming_up_forces_wait,
-        );
-        if let Ok(proposals) = state.store.save_proposal_instances(&runtime.proposals) {
-            runtime.proposals = proposals;
         }
     }
     runtime
@@ -3110,6 +3477,7 @@ fn demo_state() -> RuntimeState {
             last_tick_msc: Some(
                 (bar_anchor - chrono::Duration::minutes(index * 5)).timestamp() * 1000 + 299_000,
             ),
+            executable_tick_path: Vec::new(),
         });
         price = close;
     }
@@ -3147,12 +3515,15 @@ fn demo_state() -> RuntimeState {
             chart_mode: ChartMode::Bid,
             quote_currency: "USD".to_owned(),
             pnl_currency: "USD".to_owned(),
+            symbol_profit_currency: "USD".to_owned(),
+            calculated_pnl_currency: "USD".to_owned(),
             profit_per_price_unit_per_lot_buy: Some(1.0),
             profit_per_price_unit_per_lot_sell: Some(1.0),
             pnl_calculation_source: "MT5_ORDER_CALC_PROFIT".to_owned(),
             conversion_rate: Some(1.0),
             conversion_timestamp: Some(now),
             trade_mode_enabled: true,
+            trade_mode: TradeMode::Full,
         },
         data_quality: DataQuality {
             completeness: 1.0,
@@ -3297,6 +3668,27 @@ mod tests {
             barrier_outcome(DecisionAction::Long, 101.0, 99.0, &bars),
             Some(BarrierOutcome::NoHitBeforeExpiry)
         );
+    }
+
+    #[test]
+    fn tick_sequence_ignores_pre_quote_touch_inside_current_bar() {
+        let result = tick_sequence_barrier_outcome(
+            DecisionAction::Long,
+            101.0,
+            99.0,
+            &[
+                (1_000, 98.8, 99.0),
+                (2_000, 100.0, 100.2),
+                (3_000, 101.2, 101.4),
+            ],
+            1_500,
+            4_000,
+        )
+        .expect("post-quote ticks");
+
+        assert_eq!(result.outcome, BarrierOutcome::TpFirst);
+        assert_eq!(result.first_touch_time_msc, Some(3_000));
+        assert_eq!(result.first_touch_price, Some(101.2));
     }
 
     #[test]
@@ -3450,11 +3842,22 @@ mod tests {
             .expect("idempotent proposal instance");
         assert_eq!(first[0].proposal_id, repeated[0].proposal_id);
         assert!(first[0].evidence_eligible);
+        proposal.reference_entry_price = proposal.reference_entry_price.map(|price| price + 0.001);
+        let sub_tick = store
+            .save_proposal_instances(&[proposal.clone()])
+            .expect("sub-tick proposal noise");
+        assert_eq!(first[0].proposal_id, sub_tick[0].proposal_id);
+        proposal.reference_entry_price = proposal.reference_entry_price.map(|price| price + 0.01);
+        let material_tick = store
+            .save_proposal_instances(&[proposal.clone()])
+            .expect("one-tick proposal change");
+        assert_ne!(first[0].proposal_id, material_tick[0].proposal_id);
+        assert!(!material_tick[0].evidence_eligible);
         let feedback = HumanFeedback {
-            proposal_id: first[0].proposal_id.expect("proposal id"),
+            proposal_id: material_tick[0].proposal_id.expect("proposal id"),
             prediction_id: runtime.forecast.prediction_id,
-            profile: first[0].profile,
-            proposal_action: first[0].action,
+            profile: material_tick[0].profile,
+            proposal_action: material_tick[0].action,
             model_id: runtime.forecast.model_id.clone(),
             forecast_side: DecisionAction::Long,
             selected_reason: None,
@@ -3468,6 +3871,27 @@ mod tests {
                 .feedback_matches_proposal(&feedback)
                 .expect("feedback proposal match")
         );
+        store
+            .save_feedback(&feedback)
+            .expect("feedback persistence");
+        let evidence_sources = {
+            let connection = store.connection.lock().expect("database mutex");
+            let mut statement = connection
+                .prepare(
+                    "SELECT evidence_source FROM decision_proposal_evidence
+                     ORDER BY evidence_source",
+                )
+                .expect("evidence query");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("evidence rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("evidence values")
+        };
+        assert_eq!(
+            evidence_sources,
+            vec!["FIRST_ACTIONABLE".to_owned(), "HUMAN_ACCEPTED".to_owned()]
+        );
 
         proposal.action = DecisionAction::Wait;
         proposal.target_price = None;
@@ -3478,6 +3902,68 @@ mod tests {
             .expect("changed proposal instance");
         assert_ne!(first[0].proposal_id, changed[0].proposal_id);
         assert!(!changed[0].evidence_eligible);
+    }
+
+    #[tokio::test]
+    async fn public_state_and_websocket_payload_path_are_database_read_only() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Arc::new(Store {
+            connection: Mutex::new(connection),
+        });
+        let mut runtime = demo_state();
+        runtime.snapshot.bars[0].executable_tick_path = vec![(
+            runtime.snapshot.bars[0]
+                .first_tick_msc
+                .expect("demo first tick"),
+            runtime.snapshot.bars[0].bid_open.expect("demo bid"),
+            runtime.snapshot.bars[0].ask_open.expect("demo ask"),
+        )];
+        let state = AppState {
+            store: store.clone(),
+            runtime: Arc::new(RwLock::new(runtime)),
+            started_at: Utc::now(),
+            policies: PolicySet {
+                scalper: DecisionPolicy::scalper(),
+                sniper: DecisionPolicy::sniper(),
+                model_health: ModelHealthPolicy {
+                    minimum_settled_predictions: 100,
+                    minimum_interval_coverage: 0.70,
+                    maximum_interval_coverage: 0.90,
+                    maximum_direction_brier: 0.26,
+                    maximum_direction_brier_ratio_to_baseline: 1.0,
+                    maximum_barrier_brier_ratio_to_baseline: 1.0,
+                    maximum_barrier_ece: 0.12,
+                    minimum_mae_q90_coverage: 0.80,
+                    maximum_mae_q90_coverage: 0.98,
+                    degrade_after_failed_windows: 2,
+                    suspend_after_severe_windows: 2,
+                    recover_after_healthy_windows: 3,
+                    warming_up_forces_wait: true,
+                },
+            },
+        };
+        let before = store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .total_changes();
+
+        let published = public_runtime_state(&state).await;
+
+        let after = store
+            .connection
+            .lock()
+            .expect("database mutex")
+            .total_changes();
+        assert_eq!(before, after);
+        assert!(published.snapshot.bars[0].executable_tick_path.is_empty());
+        assert_eq!(
+            state.runtime.read().await.snapshot.bars[0]
+                .executable_tick_path
+                .len(),
+            1
+        );
     }
 
     #[test]

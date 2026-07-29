@@ -30,11 +30,11 @@ def make_artifact(path: Path, *, eligible: bool = True) -> Path:
         },
         "artifact_files": artifact_files,
         "barrier_spec": {
-            "id": "atr-1.25tp-1.00sl-h3-executable-v3",
+            "id": "atr-1.25tp-1.00sl-h3-executable-v4",
             "horizon_bars": 3,
         },
         "executable_side_contract": {
-            "id": "bid-entry-exit-long-ask-exit-short-tick-sequence-v2",
+            "id": "bid-entry-exit-long-ask-exit-short-tick-sequence-v3",
             "chart_mode": "BID",
             "long_exit_ohlc": "BID",
             "short_exit_ohlc": "ASK",
@@ -72,7 +72,7 @@ class FakeCandidateModel:
             "direction_probability_up": 0.55,
             "barrier_probability_long": 0.54,
             "barrier_probability_short": 0.46,
-            "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v3",
+            "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v4",
             "barrier_horizon_bars": 3,
             "target_price_long": origin["close"] + 1.25,
             "stop_price_long": origin["close"] - 1.0,

@@ -42,6 +42,7 @@ def validate_export_bars(
     }
     tick_coverages: list[float] = []
     parity_mismatches = 0
+    valid_tick_paths = 0
     for bar in bars:
         if (
             float(bar["high"]) < max(float(bar["open"]), float(bar["close"]))
@@ -84,6 +85,44 @@ def validate_export_bars(
             and bar_start_msc <= int(bar["last_tick_msc"]) < bar_start_msc + 300_000
         ):
             raise ValueError("dataset tick boundaries are outside their normalized M5 bar")
+        raw_path = bar.get("executable_tick_path")
+        if raw_path is None:
+            try:
+                raw_path = json.loads(str(bar.get("executable_tick_path_json", "[]")))
+            except json.JSONDecodeError as error:
+                raise ValueError("dataset tick path is not valid JSON") from error
+        if not isinstance(raw_path, list) or not raw_path:
+            raise ValueError("dataset executable tick path is missing")
+        try:
+            path = [
+                (int(item[0]), float(item[1]), float(item[2]))
+                for item in raw_path
+            ]
+        except (IndexError, TypeError, ValueError) as error:
+            raise ValueError("dataset tick path item is invalid") from error
+        if (
+            path[0][0] != int(bar["first_tick_msc"])
+            or path[-1][0] != int(bar["last_tick_msc"])
+            or any(left[0] > right[0] for left, right in zip(path, path[1:]))
+            or any(bid <= 0.0 or ask <= bid for _, bid, ask in path)
+        ):
+            raise ValueError("dataset tick path boundaries or ordering are invalid")
+        reconstructed = {
+            "bid_open": path[0][1],
+            "bid_high": max(item[1] for item in path),
+            "bid_low": min(item[1] for item in path),
+            "bid_close": path[-1][1],
+            "ask_open": path[0][2],
+            "ask_high": max(item[2] for item in path),
+            "ask_low": min(item[2] for item in path),
+            "ask_close": path[-1][2],
+        }
+        if any(
+            abs(float(bar[field]) - value) > 1e-12
+            for field, value in reconstructed.items()
+        ):
+            raise ValueError("dataset tick path does not reconstruct executable OHLC")
+        valid_tick_paths += 1
         tolerance = max(float(bar.get("tick_size", 0.0)), 1e-12)
         row_mismatch = False
         for field in parity_errors:
@@ -123,8 +162,9 @@ def validate_export_bars(
         "minimum_tick_coverage_per_bar": min(tick_coverages, default=0.0),
         "mean_tick_coverage_per_bar": sum(tick_coverages) / len(tick_coverages),
         "bars_without_full_tick_history": sum(
-            coverage < 0.5 for coverage in tick_coverages
+            coverage < 0.95 for coverage in tick_coverages
         ),
+        "tick_path_valid_rate": valid_tick_paths / len(bars),
     }
 
 
@@ -165,6 +205,7 @@ def write_dataset_manifest(
         "provider": "MetaTrader5",
         "chart_mode": chart_mode,
         "executable_side_source": "HISTORICAL_BID_ASK_TICKS",
+        "tick_collection_mode": "COPY_TICKS_ALL",
         "first_timestamp": bars[0]["timestamp"],
         "last_timestamp": bars[-1]["timestamp"],
         "row_count": len(bars),
@@ -240,8 +281,9 @@ def fetch_bars(mt5: Any, count: int) -> tuple[list[dict[str, Any]], int, str]:
 
 def write_csv(path: Path, bars: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [field for field in bars[0] if field != "executable_tick_path"]
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(bars[0]))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(bars)
 

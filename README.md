@@ -23,6 +23,10 @@ records outcomes and feedback, then leaves the final decision to a human.
 - Historical ticks are aggregated into separate Bid and Ask OHLC with first/last
   tick timestamps and a compact price-change path. LONG outcomes use Bid exits;
   SHORT outcomes use Ask exits, and same-bar order is resolved from tick order.
+- Live `COPY_TICKS_ALL` paths are persisted separately from OHLC. Forecast and
+  proposal settlement use the same ordered first-touch algorithm as training;
+  proposal evaluation begins strictly after its exact quote timestamp, including
+  the remainder of the current M5 candle.
 - Absolute provider tick age and local transport age are checked independently;
   market closed, stale feed and disconnected bridge remain distinct states.
 - Side-aware costs use Ask-entry/Bid-exit for LONG and Bid-entry/estimated
@@ -30,6 +34,8 @@ records outcomes and feedback, then leaves the final decision to a human.
   configured conservative quantile instead of an optimistic median.
 - Every material realtime decision is an immutable proposal instance. Feedback
   and policy outcomes refer to its `proposal_id`, quote, entry and health state.
+  Instances are emitted only by forecast/snapshot events; HTTP GET and WebSocket
+  serialization are read-only.
 - Live coverage, absolute and baseline-relative Brier, ECE and MAE-coverage
   gates use persisted hysteresis and stop proposals while warming or unhealthy.
 - Dynamic MT5 account, currency and symbol specifications.
@@ -171,6 +177,8 @@ Git.
 Candidate training is intentionally blocked unless the dataset manifest proves
 that it came from a Bid chart and historical Bid/Ask ticks, chart Bid matches
 aggregated tick Bid within one tick, and tick coverage is sufficient. Training
+requires `COPY_TICKS_ALL`, a parseable path for every bar, exact path-to-OHLC
+reconstruction, a 100% valid-path rate and at least 95% tick-volume coverage.
 spread features use exact `ask_close - bid_close` plus rolling median/q75/q90
 and spread/ATR. Existing artifacts from the previous feature or barrier
 contract must be retired and retrained.
@@ -223,16 +231,22 @@ candidate cannot load because inference packages are absent, rerun
 
 Forecast barrier evaluation and actionable proposal evaluation are intentionally
 separate. Every settled H3 forecast records counterfactual LONG and SHORT
-TP-before-SL outcomes using the exact forecast target/stop. Realtime SCALPER and
-SNIPER changes are stored in `decision_proposal_instances`. The first actionable
-instance per profile, plus an explicitly accepted instance, is eligible for
-policy settlement over the next three full completed bars. A later `WAIT`
-therefore cannot be confused with the earlier proposal a human actually saw.
+TP-before-SL outcomes using ordered executable ticks and the exact forecast
+target/stop. Realtime SCALPER and SNIPER changes are stored in
+`decision_proposal_instances` from authoritative market events. Material change
+fingerprints quantize prices to the broker tick and reward/risk to policy bands,
+so floating-point noise does not create evidence. Evidence memberships are
+reported separately as `FIRST_ACTIONABLE`, `HUMAN_ACCEPTED` and
+`HUMAN_REJECTED`; they are never blended into one policy rate. Proposal outcome
+time starts after `quote_timestamp` and ends at the forecast's exact
+`outcome_matures_at`.
 
 Broker sessions come from `[market_session]` in `config/default.toml`, with
 Sunday/Friday hours, maintenance gaps represented as split sessions, holiday
 closures, and the MT5 symbol trade-mode check. `XPDE_MARKET_CLOSED_DATES` can
 add emergency closure dates without changing source.
+The MVP still uses the configured integer broker UTC offset; DST changes must be
+updated operationally until an authoritative broker timezone source is available.
 Forecast quality and policy outcome remain separate; a proposal metric never
 masquerades as model coverage.
 `tp_first_within_horizon_rate` includes no-hit outcomes in its denominator and is

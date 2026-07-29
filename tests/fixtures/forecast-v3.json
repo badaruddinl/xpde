@@ -9,7 +9,7 @@
   "direction_probability_up": 0.67,
   "barrier_probability_long": 0.63,
   "barrier_probability_short": 0.37,
-  "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v3",
+  "barrier_spec_id": "atr-1.25tp-1.00sl-h3-executable-v4",
   "barrier_horizon_bars": 3,
   "target_price_long": 3333.0,
   "stop_price_long": 3328.5,

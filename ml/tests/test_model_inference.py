@@ -58,9 +58,9 @@ def test_registration_payload_carries_executable_contract(tmp_path) -> None:
         "eligibility_gate_version": 3,
         "training_mode": "candidate",
         "eligible_for_shadow": True,
-        "barrier_spec": {"id": "atr-1.25tp-1.00sl-h3-executable-v3"},
+        "barrier_spec": {"id": "atr-1.25tp-1.00sl-h3-executable-v4"},
         "executable_side_contract": {
-            "id": "bid-entry-exit-long-ask-exit-short-tick-sequence-v2"
+            "id": "bid-entry-exit-long-ask-exit-short-tick-sequence-v3"
         },
         "eligibility_gates": {"dataset_integrity": True},
         "metrics": {"holdout": "verified"},
@@ -72,5 +72,5 @@ def test_registration_payload_carries_executable_contract(tmp_path) -> None:
     assert payload["eligibility_gate_version"] == 3
     assert (
         payload["executable_side_contract_id"]
-        == "bid-entry-exit-long-ask-exit-short-tick-sequence-v2"
+        == "bid-entry-exit-long-ask-exit-short-tick-sequence-v3"
     )

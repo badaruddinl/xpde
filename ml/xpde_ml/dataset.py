@@ -50,8 +50,8 @@ METADATA = DatasetMetadata(
 )
 
 BARRIER_HORIZON = 3
-BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v3"
-EXECUTABLE_SIDE_CONTRACT_ID = "bid-entry-exit-long-ask-exit-short-tick-sequence-v2"
+BARRIER_SPEC_ID = "atr-1.25tp-1.00sl-h3-executable-v4"
+EXECUTABLE_SIDE_CONTRACT_ID = "bid-entry-exit-long-ask-exit-short-tick-sequence-v3"
 BARRIER_TP_ATR_MULTIPLIER = 1.25
 BARRIER_SL_ATR_MULTIPLIER = 1.0
 BARRIER_CLASS = {

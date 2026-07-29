@@ -88,13 +88,15 @@ Every prediction stores `origin_bar_timestamp`, `origin_close`,
 the first `h` completed candles strictly after that origin for horizons 1, 3, 6
 and 12; wall-clock expiry is not used as a proxy for the outcome candle.
 
-Barrier training and live evaluation use the same explicit three-bar horizon.
-For a Bid chart, LONG enters Ask and exits against future Bid OHLC; SHORT enters
-Bid and exits against future Ask OHLC constructed from historical ticks.
+Barrier training and live evaluation use the same explicit three-bar horizon
+and ordered-tick first-touch implementation. For a Bid chart, LONG enters Ask
+and exits against future Bid ticks; SHORT enters Bid and exits against future
+Ask ticks.
 One-sided OHLC or a spread approximation is not accepted for candidate training.
 The dataset gate also requires chart-Bid/tick-Bid parity within tick-size
-tolerance and sufficient tick coverage. A compact ordered tick path resolves
-same-bar first passage whenever the raw history is available.
+tolerance, `COPY_TICKS_ALL`, at least 95% tick-volume coverage, a parseable path
+for every bar, and exact path-to-OHLC reconstruction. The path is authoritative
+for first passage; OHLC is not used as a live ambiguity fallback.
 LONG and SHORT retain `TP_FIRST`, `SL_FIRST`,
 `NO_HIT_BEFORE_EXPIRY`, and `AMBIGUOUS_SAME_BAR`. A disagreement between q50,
 the direction classifier, and the stronger barrier side yields
@@ -127,17 +129,25 @@ recent exact Bid/Ask closes. Insufficient samples force `WAIT`.
 `order_calc_profit()` supplies account-currency profit-per-price-unit factors;
 non-matching account/P&L currencies force
 `CURRENCY_CONVERSION_UNAVAILABLE` when that authoritative conversion is absent.
-Proposal records include account, quote and P&L currency, conversion metadata
-and every cost assumption used by the decision.
+The contract distinguishes symbol profit currency from calculated P&L currency;
+`order_calc_profit()` results are explicitly denominated in account currency.
+Proposal records include every currency, conversion metadata and cost assumption.
 
 ## Dynamic proposal evidence
 
 `predictions` owns the immutable forecast. Every material decision change is
 stored separately in `decision_proposal_instances` with an exact `proposal_id`,
 quote timestamp, entry, action, target, stop, cost assumptions and model-health
-state. Human feedback refers to this ID. Policy evidence evaluates the first
-actionable instance per profile (or another instance explicitly accepted by the
-human) over the next three fully completed M5 bars.
+state. Instances are persisted by forecast and market snapshot events; GET and
+WebSocket reads never create evidence. Human feedback refers to this ID and is
+rejected unless it is still the latest instance within its entry-age and health
+gate. A tick-quantized material-change fingerprint suppresses floating-point
+churn.
+
+Policy evidence uses explicit, separately reported memberships:
+`FIRST_ACTIONABLE`, `HUMAN_ACCEPTED`, `HUMAN_REJECTED`, and `DIAGNOSTIC`.
+Settlement begins strictly after the instance `quote_timestamp`, includes the
+remaining portion of its current candle, and ends at `outcome_matures_at`.
 
 Decision age is bounded independently of forecast expiry. Warming, degraded or
 suspended model health forces `WAIT`; health transitions use persisted
@@ -149,6 +159,12 @@ The broker weekly calendar is configuration-driven and combined with holiday
 overrides, symbol trade mode, absolute tick age and transport freshness. Exact
 bar upserts only replace stored Bid/Ask OHLC when the incoming tick count is at
 least as complete; first and last tick timestamps make that comparison auditable.
+Compact ordered tick paths live in `market_tick_paths`, independent from OHLC,
+and are replaced only by a path spanning at least the stored boundaries.
+Directional MT5 modes (`FULL`, `LONG_ONLY`, `SHORT_ONLY`, `CLOSE_ONLY`,
+`DISABLED`) gate each proposal side independently. Broker DST remains an
+explicit operational configuration risk because the MVP uses an integer UTC
+offset rather than a timezone database identifier.
 Legacy predictions without executable origin sides or the current barrier
 contract are quarantined as `LEGACY_UNSETTLEABLE`.
 

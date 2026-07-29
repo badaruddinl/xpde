@@ -27,7 +27,9 @@ test("desktop renders forecast contract and has no serious accessibility violati
   await expect(page.getByText("FORECAST DEMO", { exact: true })).toBeVisible();
   await expect(page.getByText("50% interval", { exact: true })).toBeVisible();
   await expect(page.getByText("TP 3333.66", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Accept" })).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Setuju tidak entry" }),
+  ).toBeDisabled();
 
   const accessibility = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa"])
