@@ -306,6 +306,44 @@ def test_tracker_rehydrates_from_completed_trading_bars_after_weekend() -> None:
     assert mt5.requested_starts[0] == oldest_completed
 
 
+def test_failed_full_rehydration_is_not_retried_inside_same_m5_bucket() -> None:
+    now = datetime(2026, 7, 29, 10, 2, tzinfo=UTC)
+
+    class Mt5:
+        COPY_TICKS_ALL = 0
+        TIMEFRAME_M5 = 5
+        history_calls = 0
+
+        def copy_rates_from_pos(self, *_args):
+            self.history_calls += 1
+            return None
+
+        @staticmethod
+        def copy_ticks_range(*_args):
+            return []
+
+        @staticmethod
+        def last_error():
+            return 500, "temporary history failure"
+
+    tracker = ExecutableBarTracker(retention_bars=64)
+    mt5 = Mt5()
+    with pytest.raises(RuntimeError, match="completed-bar history"):
+        tracker.refresh(
+            mt5,
+            symbol="GOLDm#",
+            clock=BrokerClock(),
+            now_epoch=now.timestamp(),
+        )
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(now + timedelta(seconds=30)).timestamp(),
+    )
+    assert mt5.history_calls == 1
+
+
 def test_tracker_rehydrates_stale_non_empty_cache_after_twelve_hour_gap() -> None:
     stale = datetime(2026, 7, 29, 7, 0, tzinfo=UTC)
     now = datetime(2026, 7, 29, 19, 0, tzinfo=UTC)
@@ -428,6 +466,130 @@ def test_weekend_rehydration_restores_complete_executable_feature_window() -> No
 
     assert len(tracker.bars) == 24
     assert has_complete_executable_feature_window(hydrated)
+
+
+def test_requested_feature_window_rehydration_is_bounded_and_repairs_old_bar() -> None:
+    oldest = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
+    current = oldest + timedelta(minutes=5 * 64)
+    raw_ticks = []
+    chart_bars = []
+    tracker = ExecutableBarTracker(retention_bars=64)
+    for index in range(64):
+        timestamp = oldest + timedelta(minutes=5 * index)
+        timestamp_text = timestamp.isoformat().replace("+00:00", "Z")
+        base_msc = int(timestamp.timestamp() * 1000)
+        price = 4000.0 + index
+        path = [
+            [base_msc + offset * 2_000, price + offset / 1000, price + 0.2 + offset / 1000]
+            for offset in range(100)
+        ]
+        raw_ticks.extend(
+            {"time_msc": item[0], "bid": item[1], "ask": item[2]}
+            for item in path
+        )
+        tracker.bars[timestamp_text] = {
+            "timestamp": timestamp_text,
+            "bid_open": path[0][1],
+            "bid_high": path[0][1],
+            "bid_low": path[0][1],
+            "bid_close": path[0][1],
+            "ask_open": path[0][2],
+            "ask_high": path[0][2],
+            "ask_low": path[0][2],
+            "ask_close": path[0][2],
+            "executable_tick_count": 1,
+            "first_tick_msc": path[0][0],
+            "last_tick_msc": path[0][0],
+            "_tick_path": [path[0]],
+        }
+        chart_bars.append(
+            {
+                "timestamp": timestamp_text,
+                "tick_volume": 100,
+            }
+        )
+    tracker.last_tick_msc = int(
+        (current - timedelta(minutes=5)).timestamp() * 1000
+    )
+
+    class Mt5:
+        COPY_TICKS_ALL = 0
+        TIMEFRAME_M5 = 5
+        history_calls = 0
+
+        def copy_rates_from_pos(self, _symbol, _timeframe, _start, _count):
+            self.history_calls += 1
+            return [
+                {"time": (oldest + timedelta(minutes=5 * index)).timestamp()}
+                for index in range(64)
+            ]
+
+        @staticmethod
+        def copy_ticks_range(_symbol, start, end, _mode):
+            return [
+                tick
+                for tick in raw_ticks
+                if start.timestamp() * 1000
+                <= tick["time_msc"]
+                <= end.timestamp() * 1000
+            ]
+
+        @staticmethod
+        def last_error():
+            return 0, "ok"
+
+    mt5 = Mt5()
+    assert not has_complete_executable_feature_window(
+        overlay_executable_bars(chart_bars[-24:], tracker.bars)
+    )
+    tracker.request_feature_window_rehydration()
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(current + timedelta(seconds=10)).timestamp(),
+    )
+    assert mt5.history_calls == 1
+    assert has_complete_executable_feature_window(
+        overlay_executable_bars(chart_bars[-24:], tracker.bars)
+    )
+
+    # The request remains fail-safe until a rebuilt snapshot explicitly clears it,
+    # but it cannot trigger another full reload in the same M5 bucket.
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(current + timedelta(seconds=30)).timestamp(),
+    )
+    assert mt5.history_calls == 1
+
+    # If validation still failed, the next bucket is the bounded retry point.
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(current + timedelta(minutes=5, seconds=10)).timestamp(),
+    )
+    assert mt5.history_calls == 2
+
+    # Even an empty authoritative response counts as the bucket's attempt.
+    raw_ticks.clear()
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(current + timedelta(minutes=10, seconds=10)).timestamp(),
+    )
+    assert mt5.history_calls == 3
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(current + timedelta(minutes=10, seconds=30)).timestamp(),
+    )
+    assert mt5.history_calls == 3
+    tracker.clear_feature_window_rehydration_request()
 
 
 def test_catchup_hydrates_tracker_memory_without_replacing_broader_path() -> None:

@@ -1,6 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  isMarketDataCurrent,
+  marketDataUnavailableMessage,
+} from "./market-data-current";
 
 type Profile = "SCALPER" | "SNIPER";
 type DecisionAction = "LONG" | "SHORT" | "WAIT" | "NO_PREDICTION";
@@ -254,6 +258,14 @@ interface EvaluationSummary {
     }
   >;
   proposal_outcomes_by_profile: ProposalOutcomeMetrics[];
+  direction_calibration_bins: Array<{
+    bin_index: number;
+    sample_size: number;
+    mean_probability: number;
+    observed_up_rate: number;
+    brier_score: number;
+  }>;
+  direction_expected_calibration_error: number | null;
   barrier_calibration_bins: Array<{
     side: "LONG" | "SHORT";
     bin_index: number;
@@ -764,14 +776,21 @@ export default function Home() {
   const range = Math.max(maxPrice - minPrice, 0.01);
   const lastPrice = (state.snapshot.bid + state.snapshot.ask) / 2;
   const profileTickAgeLimit = profile === "SCALPER" ? 10_000 : 5_000;
+  const marketDataContext = {
+    forecastStatus: state.forecast_status,
+    connectionStatus: state.connection_status,
+    marketStatus: state.snapshot.data_quality.market_status,
+    tickAgeMs: state.snapshot.data_quality.tick_age_ms,
+    absoluteTickAgeMs: state.snapshot.data_quality.absolute_tick_age_ms,
+    transportTickAgeMs: state.snapshot.data_quality.transport_tick_age_ms,
+    missingFlags: state.snapshot.data_quality.missing_flags,
+    maximumTickAgeMs: profileTickAgeLimit,
+  };
+  const marketDataCurrent = isMarketDataCurrent(marketDataContext);
+  const probabilityUnavailableMessage =
+    marketDataUnavailableMessage(marketDataContext);
   const marketContextActionable =
-    state.connection_status === "MT5_CONNECTED" &&
-    state.snapshot.data_quality.market_status === "OPEN" &&
-    state.snapshot.data_quality.tick_age_ms <= profileTickAgeLimit &&
-    state.snapshot.data_quality.absolute_tick_age_ms <= profileTickAgeLimit &&
-    state.snapshot.data_quality.transport_tick_age_ms <= profileTickAgeLimit &&
-    state.snapshot.data_quality.missing_flags.length === 0 &&
-    state.forecast_status === "CURRENT" &&
+    marketDataCurrent &&
     state.model_health.status === "HEALTHY" &&
     (proposal.decision_age_seconds ?? Number.POSITIVE_INFINITY) <=
       (proposal.maximum_decision_age_seconds ?? 0);
@@ -1231,34 +1250,34 @@ export default function Home() {
             <article className="panel metric direction-metric">
               <span>Origin forecast peluang arah · H3</span>
               <div className="direction-values">
-                <div className="direction-stat up" aria-label={`Probabilitas naik ${probabilityUpPercent.toFixed(1)}%`}>
+                <div className="direction-stat up" aria-label={marketDataCurrent ? `Probabilitas naik ${probabilityUpPercent.toFixed(1)}%` : "Probabilitas naik tidak tersedia"}>
                   <i aria-hidden="true">↑</i>
-                  <strong>{forecastIsStale ? "—" : `${probabilityUpPercent.toFixed(1)}%`}</strong>
+                  <strong>{marketDataCurrent ? `${probabilityUpPercent.toFixed(1)}%` : "—"}</strong>
                 </div>
-                <div className="direction-stat down" aria-label={`Probabilitas turun ${probabilityDownPercent.toFixed(1)}%`}>
+                <div className="direction-stat down" aria-label={marketDataCurrent ? `Probabilitas turun ${probabilityDownPercent.toFixed(1)}%` : "Probabilitas turun tidak tersedia"}>
                   <i aria-hidden="true">↓</i>
-                  <strong>{forecastIsStale ? "—" : `${probabilityDownPercent.toFixed(1)}%`}</strong>
+                  <strong>{marketDataCurrent ? `${probabilityDownPercent.toFixed(1)}%` : "—"}</strong>
                 </div>
               </div>
               <div
                 className="direction-meter"
-                aria-label={`${probabilityUpPercent.toFixed(1)}% naik, ${probabilityDownPercent.toFixed(1)}% turun`}
+                aria-label={marketDataCurrent ? `${probabilityUpPercent.toFixed(1)}% naik, ${probabilityDownPercent.toFixed(1)}% turun` : "Probabilitas arah tidak tersedia"}
                 role="img"
               >
-                <i className="up" style={{ width: forecastIsStale ? "0%" : `${probabilityUpPercent}%` }} />
-                <i className="down" style={{ width: forecastIsStale ? "0%" : `${probabilityDownPercent}%` }} />
+                <i className="up" style={{ width: marketDataCurrent ? `${probabilityUpPercent}%` : "0%" }} />
+                <i className="down" style={{ width: marketDataCurrent ? `${probabilityDownPercent}%` : "0%" }} />
               </div>
               <small className="direction-summary">
-                {forecastIsStale
-                  ? "Forecast stale — bukan sinyal"
+                {!marketDataCurrent
+                  ? probabilityUnavailableMessage
                   : `${directionSummary} · Tidak dikondisikan ulang terhadap current entry`}
               </small>
             </article>
             <article className="panel metric">
               <span>Origin forecast P(TP-first) · {forecastSide} · H3</span>
-              <strong>{forecastIsStale ? "—" : percent(barrierProbability)}</strong>
-              <div className="meter amber"><i style={{ width: forecastIsStale ? "0%" : percent(barrierProbability) }} /></div>
-              <small>{forecastIsStale ? "Forecast stale — bukan sinyal" : "Tidak dikondisikan ulang terhadap current entry · gate Sniper 60%"}</small>
+              <strong>{marketDataCurrent ? percent(barrierProbability) : "—"}</strong>
+              <div className="meter amber"><i style={{ width: marketDataCurrent ? percent(barrierProbability) : "0%" }} /></div>
+              <small>{marketDataCurrent ? "Tidak dikondisikan ulang terhadap current entry · gate Sniper 60%" : probabilityUnavailableMessage}</small>
             </article>
             <article className="panel metric">
               <span>Offline holdout coverage</span>
@@ -1360,6 +1379,7 @@ export default function Home() {
             <div className="gate-row"><span><i className={coverageHealthy ? "ok" : "warn"} /> Calibration</span><strong>{coverageHealthy ? "In range" : "Out of range"}</strong></div>
             <div className="gate-row"><span><i className={state.forecast.drift_detected ? "bad" : "ok"} /> Drift detector</span><strong>{state.forecast.drift_detected ? "Detected" : "Clear"}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Live direction Brier</span><strong>{activeEvaluation?.direction_brier?.toFixed(4) ?? "—"}</strong></div>
+            <div className="gate-row"><span><i className="warn" /> Direction calibration ECE</span><strong>{evaluation?.direction_expected_calibration_error === null || evaluation?.direction_expected_calibration_error === undefined ? "—" : percent(evaluation.direction_expected_calibration_error)}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Barrier calibration ECE</span><strong>{evaluation?.barrier_expected_calibration_error === null || evaluation?.barrier_expected_calibration_error === undefined ? "—" : percent(evaluation.barrier_expected_calibration_error)}</strong></div>
             <div className="gate-row">
               <span><i className={state.model_health.settlement_completeness_rate === null ? "warn" : state.model_health.settlement_completeness_rate >= 0.98 ? "ok" : "bad"} /> Settlement completeness</span>

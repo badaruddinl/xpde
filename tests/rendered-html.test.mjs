@@ -24,14 +24,15 @@ test("server-renders the XPDE shadow terminal", async () => {
   assert.match(html, /DEMO DATA/);
   assert.match(html, /FORECAST/);
   assert.match(html, /Auto-trading nonaktif/);
-  assert.match(html, /Probabilitas naik 57\.0%/);
-  assert.match(html, /Probabilitas turun 43\.0%/);
+  assert.match(html, /Probabilitas naik tidak tersedia/);
+  assert.match(html, /Probabilitas turun tidak tersedia/);
+  assert.match(html, /Data market terputus — probabilitas disembunyikan/);
   assert.match(html, /Origin forecast peluang arah · H3/);
   assert.match(html, /Sisa reward dari harga entry tidak memadai/);
   assert.match(html, /Offline holdout coverage/);
   assert.match(html, /Live coverage · fully-settled predictions/);
   assert.match(html, /Origin forecast P\(TP-first\)/);
-  assert.match(html, /Tidak dikondisikan ulang terhadap current entry/);
+  assert.doesNotMatch(html, /Tidak dikondisikan ulang terhadap current entry/);
   assert.match(html, /Settlement completeness/);
   assert.match(html, /Current runtime session · direction/);
   assert.match(html, /Retry realtime/);

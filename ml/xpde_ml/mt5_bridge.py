@@ -487,6 +487,18 @@ def build_snapshot(
     }
 
 
+def synchronize_feature_window_rehydration(
+    tracker: ExecutableBarTracker,
+    snapshot: dict[str, Any],
+) -> None:
+    """Keep retrying bounded full reloads until the published feature window is sound."""
+    missing_flags = snapshot.get("data_quality", {}).get("missing_flags", [])
+    if "FEATURE_WINDOW_EXECUTABLE_HISTORY_INCOMPLETE" in missing_flags:
+        tracker.request_feature_window_rehydration()
+    else:
+        tracker.clear_feature_window_rehydration_request()
+
+
 def post_payload(
     api_url: str,
     payload: dict[str, Any],
@@ -714,6 +726,10 @@ def main() -> None:
                     broker_clock=broker_clock,
                     executable_bars=executable_tracker.bars,
                 )
+                synchronize_feature_window_rehydration(
+                    executable_tracker,
+                    startup_snapshot,
+                )
                 latest_completed_bar = startup_snapshot["bars"][-1]["timestamp"]
                 cursor = get_payload(args.cursor_url).get(
                     "last_completed_bar_timestamp"
@@ -819,6 +835,10 @@ def main() -> None:
                     broker_clock=broker_clock,
                     executable_bars=executable_tracker.bars,
                     transport_tick_age_ms=transport_tick_age_ms,
+                )
+                synchronize_feature_window_rehydration(
+                    executable_tracker,
+                    snapshot,
                 )
                 tick_signature = (
                     snapshot["timestamp"],

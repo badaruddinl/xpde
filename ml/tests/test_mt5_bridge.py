@@ -20,7 +20,9 @@ from xpde_ml.mt5_bridge import (
     market_session_covers_forecast_envelope,
     next_retry_delay,
     post_payload,
+    synchronize_feature_window_rehydration,
 )
+from xpde_ml.executable_bars import ExecutableBarTracker
 from xpde_ml.time_utils import BrokerClock
 
 
@@ -83,6 +85,43 @@ def test_executable_feature_window_requires_24_finite_covered_bid_ask_bars() -> 
     bars[-1]["executable_tick_count"] = 100
     bars[-1]["ask_close"] = float("nan")
     assert not has_complete_executable_feature_window(bars)
+
+
+def test_undercovered_older_feature_bar_requests_bounded_rehydration() -> None:
+    start = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+    bars = [
+        {
+            "timestamp": (start + timedelta(minutes=5 * index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "bid_close": 4000.0 + index,
+            "ask_close": 4000.2 + index,
+            "tick_volume": 100,
+            "executable_tick_count": 100,
+        }
+        for index in range(24)
+    ]
+    bars[7]["executable_tick_count"] = 20
+    assert not has_complete_executable_feature_window(bars)
+
+    tracker = ExecutableBarTracker(retention_bars=64)
+    synchronize_feature_window_rehydration(
+        tracker,
+        {
+            "data_quality": {
+                "missing_flags": [
+                    "FEATURE_WINDOW_EXECUTABLE_HISTORY_INCOMPLETE"
+                ]
+            }
+        },
+    )
+    assert tracker.feature_window_rehydration_requested
+
+    synchronize_feature_window_rehydration(
+        tracker,
+        {"data_quality": {"missing_flags": []}},
+    )
+    assert not tracker.feature_window_rehydration_requested
 
 
 def test_candidate_value_error_is_wrapped_without_masking_other_value_errors() -> None:

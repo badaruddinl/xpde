@@ -47,7 +47,9 @@ records outcomes and feedback, then leaves the final decision to a human.
   of the latest 64 completed trading bars rather than a wall-clock lookback.
   Catch-up paths also hydrate inference memory, and the candidate remains
   fail-closed until its latest 24 completed bars have finite Bid/Ask closes with
-  at least 95% executable tick coverage.
+  at least 95% executable tick coverage. A failure anywhere in that feature
+  window requests a bounded authoritative reload (at most once per M5 bucket)
+  until a rebuilt snapshot proves the window healthy.
 - Settlement verifies every expected M5 bucket, path metadata and completed-path
   source. Missing or partial windows remain `TICK_PATH_INCOMPLETE` or
   `SESSION_INTERRUPTED`; they can never become a false no-hit or enter
@@ -56,6 +58,12 @@ records outcomes and feedback, then leaves the final decision to a human.
   expiry and entry-window expiry authoritative even when MT5 sends no new event.
 - Live coverage, absolute and baseline-relative Brier, ECE and MAE-coverage
   gates use persisted hysteresis and stop proposals while warming or unhealthy.
+- Direction evidence uses the training truth (`actual_return > 0`) and scores
+  the displayed classifier at `P(UP) >= 0.5`. Evaluation recomputes accuracy
+  from probability and return, so legacy stored hit flags cannot bias it.
+- Origin direction and barrier probabilities are hidden while market data is
+  disconnected, closed, stale or incomplete. They remain visible during model
+  `WARMING_UP` when the underlying market data itself is current.
 - Dynamic MT5 account, currency and symbol specifications.
 - MT5 `order_calc_margin()` and `order_calc_profit()` are authoritative for
   margin and account-currency PnL conversion when available.

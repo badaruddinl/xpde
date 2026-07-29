@@ -261,6 +261,15 @@ class ExecutableBarTracker:
         self.bars: dict[str, dict[str, Any]] = {}
         self.last_tick_msc: int | None = None
         self.last_full_rehydration_bucket_epoch: int | None = None
+        self.feature_window_rehydration_requested = False
+
+    def request_feature_window_rehydration(self) -> None:
+        """Request an authoritative history reload after a coverage invariant fails."""
+        self.feature_window_rehydration_requested = True
+
+    def clear_feature_window_rehydration_request(self) -> None:
+        """Clear the request only after a rebuilt snapshot proves the window healthy."""
+        self.feature_window_rehydration_requested = False
 
     @staticmethod
     def _timestamp_epoch(timestamp: str) -> float:
@@ -471,11 +480,17 @@ class ExecutableBarTracker:
             or cache_gap_bars is None
             or cache_gap_bars > 1
             or completed_cached_count < self.retention_bars
+            or self.feature_window_rehydration_requested
         )
         full_rehydration = (
             needs_full_rehydration
             and self.last_full_rehydration_bucket_epoch != current_bucket_epoch
         )
+        if full_rehydration:
+            # Mark the heavy attempt before touching provider history. A failure
+            # or empty response remains fail-closed, but cannot cause a one-second
+            # retry storm inside the same M5 bucket.
+            self.last_full_rehydration_bucket_epoch = current_bucket_epoch
         # Recount the current and immediately previous M5 bucket from their
         # authoritative raw MT5 ticks. This avoids estimating raw tick growth
         # from a compact price-change path when the provider query overlaps the
@@ -507,7 +522,6 @@ class ExecutableBarTracker:
                     rehydrated[timestamp] = addition
             self.bars = rehydrated
             self.last_tick_msc = maximum
-            self.last_full_rehydration_bucket_epoch = current_bucket_epoch
         else:
             for timestamp, bar in additions.items():
                 self.bars[timestamp] = bar

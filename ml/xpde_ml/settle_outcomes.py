@@ -26,6 +26,17 @@ BARRIER_OUTCOMES = {
 }
 
 
+def classifier_direction_hit(
+    direction_probability_up: float,
+    actual_return: float,
+) -> int:
+    """Score the calibrated direction classifier against the training truth."""
+    return int(
+        (float(direction_probability_up) >= 0.5)
+        == (float(actual_return) > 0.0)
+    )
+
+
 @dataclass(frozen=True)
 class TickPathWindow:
     ticks: list[tuple[int, float, float]]
@@ -532,6 +543,20 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
         )
         if not points:
             continue
+        direction_probability_up = prediction["direction_probability_up"]
+        if direction_probability_up is None:
+            direction_probability_up = forecast.get("direction_probability_up")
+        if direction_probability_up is None:
+            connection.execute(
+                """
+                UPDATE predictions
+                SET settlement_status='LEGACY_UNSETTLEABLE',
+                    settlement_reason='DIRECTION_PROBABILITY_UNAVAILABLE'
+                WHERE prediction_id=?
+                """,
+                (prediction["prediction_id"],),
+            )
+            continue
         settlement_reason: str | None = None
         try:
             origin_time = datetime.fromisoformat(
@@ -579,7 +604,10 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
             actual_ask_high = max(float(bar["ask_high"]) for bar in bars)
             actual_ask_low = min(float(bar["ask_low"]) for bar in bars)
             interval_hit = int(point["q10"] <= actual_return <= point["q90"])
-            direction_hit = int((point["q50"] >= 0) == (actual_return >= 0))
+            direction_hit = classifier_direction_hit(
+                float(direction_probability_up),
+                actual_return,
+            )
             if point["q50"] >= 0:
                 expected_mfe = float(forecast["expected_mfe_long"])
                 expected_mae = float(forecast["expected_mae_long"])

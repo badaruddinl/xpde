@@ -129,6 +129,23 @@ closes and at least 95% tick coverage. An incomplete window is published as
 inference. A defensive `ValueError` boundary retries operationally invalid
 feature frames without hiding process-control exceptions.
 
+That missing flag also arms an authoritative history reload. The tracker tries
+it at most once per M5 bucket and keeps it armed until a rebuilt snapshot
+validates every bar in the feature window. This repairs an older undercovered
+cached bar without polling heavy historical `COPY_TICKS_ALL` data every second.
+
+Direction truth has one definition across training and live evidence:
+`actual_return > 0` is UP and a flat return is non-UP. Accuracy is scored from
+the calibrated classifier (`direction_probability_up >= 0.5`), not the median
+quantile sign. Evaluation recomputes this truth for old and new outcomes and
+publishes direction reliability bins and ECE with the same definition.
+
+The dashboard distinguishes forecast lifecycle from current market data.
+Direction and barrier probabilities are shown only while the forecast is
+CURRENT, MT5 is connected, the market is open, all tick-age checks pass and no
+quality flag is missing. Model `WARMING_UP` does not hide diagnostic
+probabilities; it only prevents actionable policy output.
+
 After downtime, market bars and their ordered `COPY_TICKS_ALL` paths are
 backfilled from the last local completed candle. Requests are gzip-compressed
 and bounded by bytes, bars and tick points. A reset import accepts strictly

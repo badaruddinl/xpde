@@ -915,6 +915,14 @@ fn is_exact_m5_horizon(origin: DateTime<Utc>, timestamps: &[String]) -> bool {
         })
 }
 
+fn direction_observation(actual_return: f64) -> f64 {
+    if actual_return > 0.0 { 1.0 } else { 0.0 }
+}
+
+fn classifier_direction_hit(direction_probability_up: f64, actual_return: f64) -> i64 {
+    i64::from((direction_probability_up >= 0.5) == (direction_observation(actual_return) == 1.0))
+}
+
 fn brier_score(probabilities: &[f64], outcomes: &[f64]) -> Option<f64> {
     if probabilities.is_empty() || probabilities.len() != outcomes.len() {
         return None;
@@ -2846,7 +2854,8 @@ impl Store {
                     .fold(f64::INFINITY, f64::min);
                 let interval_hit =
                     i64::from(actual_return >= target.q10 && actual_return <= target.q90);
-                let direction_hit = i64::from((target.q50 >= 0.0) == (actual_return >= 0.0));
+                let direction_hit =
+                    classifier_direction_hit(forecast.direction_probability_up, actual_return);
                 let (expected_mfe, expected_mae, actual_mfe, actual_mae) = if target.q50 >= 0.0 {
                     (
                         forecast.expected_mfe_long,
@@ -3175,7 +3184,7 @@ impl Store {
         for row in &rows {
             if let Some(probability) = row.2 {
                 direction_probabilities.push(probability);
-                direction_outcomes.push(if row.1 >= 0.0 { 1.0 } else { 0.0 });
+                direction_outcomes.push(direction_observation(row.1));
             }
             for (side, (outcome, probability)) in
                 [(&row.3, row.4), (&row.5, row.6)].into_iter().enumerate()
@@ -3476,7 +3485,10 @@ impl Store {
         let overall = connection.query_row(
             "SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
-                    COALESCE(AVG(o.direction_hit), 0.0),
+                    COALESCE(AVG(CASE
+                      WHEN (p.direction_probability_up >= 0.5 AND o.actual_return > 0.0)
+                        OR (p.direction_probability_up < 0.5 AND o.actual_return <= 0.0)
+                      THEN 1.0 ELSE 0.0 END), 0.0),
                     COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
@@ -3494,10 +3506,10 @@ impl Store {
                         END),
                     AVG(
                       (p.direction_probability_up
-                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                       - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                       *
                       (p.direction_probability_up
-                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                       - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                     )
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
@@ -3525,7 +3537,11 @@ impl Store {
         )?;
         let by_model = {
             let mut statement = connection.prepare(
-                "SELECT p.model_id, COUNT(*), AVG(o.interval_hit), AVG(o.direction_hit),
+                "SELECT p.model_id, COUNT(*), AVG(o.interval_hit),
+                        AVG(CASE
+                          WHEN (p.direction_probability_up >= 0.5 AND o.actual_return > 0.0)
+                            OR (p.direction_probability_up < 0.5 AND o.actual_return <= 0.0)
+                          THEN 1.0 ELSE 0.0 END),
                         COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                         AVG(CASE
                               WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
@@ -3543,10 +3559,10 @@ impl Store {
                             END),
                         AVG(
                           (p.direction_probability_up
-                           - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                           - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                           *
                           (p.direction_probability_up
-                           - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                           - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                         )
                  FROM prediction_horizon_outcomes o
                  JOIN predictions p ON p.prediction_id=o.prediction_id
@@ -3589,7 +3605,10 @@ impl Store {
              )
              SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
-                    COALESCE(AVG(o.direction_hit), 0.0),
+                    COALESCE(AVG(CASE
+                      WHEN (o.direction_probability_up >= 0.5 AND o.actual_return > 0.0)
+                        OR (o.direction_probability_up < 0.5 AND o.actual_return <= 0.0)
+                      THEN 1.0 ELSE 0.0 END), 0.0),
                     COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
@@ -3607,10 +3626,10 @@ impl Store {
                         END),
                     AVG(
                       (o.direction_probability_up
-                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                       - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                       *
                       (o.direction_probability_up
-                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                       - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                     )
              FROM recent o",
             params![current_model_id, BARRIER_SPEC_ID],
@@ -3635,7 +3654,10 @@ impl Store {
         let current_session = connection.query_row(
             "SELECT COUNT(*),
                     COALESCE(AVG(o.interval_hit), 0.0),
-                    COALESCE(AVG(o.direction_hit), 0.0),
+                    COALESCE(AVG(CASE
+                      WHEN (p.direction_probability_up >= 0.5 AND o.actual_return > 0.0)
+                        OR (p.direction_probability_up < 0.5 AND o.actual_return <= 0.0)
+                      THEN 1.0 ELSE 0.0 END), 0.0),
                     COUNT(CASE WHEN o.barrier_outcome IN ('TP_FIRST','SL_FIRST') THEN 1 END),
                     AVG(CASE
                           WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
@@ -3653,10 +3675,10 @@ impl Store {
                         END),
                     AVG(
                       (p.direction_probability_up
-                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                       - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                       *
                       (p.direction_probability_up
-                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                       - CASE WHEN o.actual_return>0.0 THEN 1.0 ELSE 0.0 END)
                     )
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
@@ -3751,6 +3773,66 @@ impl Store {
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
+        };
+        let direction_calibration_bins = {
+            let mut statement = connection.prepare(
+                "WITH recent AS (
+                   SELECT p.direction_probability_up AS probability,
+                          o.actual_return
+                   FROM prediction_horizon_outcomes o
+                   JOIN predictions p ON p.prediction_id=o.prediction_id
+                   WHERE o.horizon_bars=3
+                     AND p.model_id=?1
+                     AND p.barrier_spec_id=?2
+                     AND p.is_duplicate=0
+                     AND p.settlement_status='SETTLED'
+                     AND p.direction_probability_up IS NOT NULL
+                   ORDER BY o.origin_bar_timestamp DESC
+                   LIMIT 200
+                 ),
+                 valid AS (
+                   SELECT probability,
+                          MIN(9, CAST(probability * 10.0 AS INTEGER)) AS bin_index,
+                          CASE WHEN actual_return > 0.0 THEN 1.0 ELSE 0.0 END AS observed
+                   FROM recent
+                 )
+                 SELECT bin_index, COUNT(*), AVG(probability), AVG(observed),
+                        AVG((probability-observed)*(probability-observed))
+                 FROM valid
+                 GROUP BY bin_index
+                 ORDER BY bin_index",
+            )?;
+            statement
+                .query_map(params![current_model_id, BARRIER_SPEC_ID], |row| {
+                    Ok(serde_json::json!({
+                        "bin_index": row.get::<_, i64>(0)?,
+                        "sample_size": row.get::<_, i64>(1)?,
+                        "mean_probability": row.get::<_, f64>(2)?,
+                        "observed_up_rate": row.get::<_, f64>(3)?,
+                        "brier_score": row.get::<_, f64>(4)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let direction_calibration_sample_size = direction_calibration_bins
+            .iter()
+            .filter_map(|bin| bin["sample_size"].as_i64())
+            .sum::<i64>();
+        let direction_expected_calibration_error = if direction_calibration_sample_size > 0 {
+            Some(
+                direction_calibration_bins
+                    .iter()
+                    .map(|bin| {
+                        let samples = bin["sample_size"].as_i64().unwrap_or(0) as f64;
+                        let predicted = bin["mean_probability"].as_f64().unwrap_or(0.0);
+                        let observed = bin["observed_up_rate"].as_f64().unwrap_or(0.0);
+                        samples * (predicted - observed).abs()
+                    })
+                    .sum::<f64>()
+                    / direction_calibration_sample_size as f64,
+            )
+        } else {
+            None
         };
         let barrier_calibration_bins = {
             let mut statement = connection.prepare(
@@ -3943,6 +4025,8 @@ impl Store {
             "current_model": current_model,
             "current_session": current_session,
             "forecast_barrier_by_side": forecast_barrier_by_side,
+            "direction_calibration_bins": direction_calibration_bins,
+            "direction_expected_calibration_error": direction_expected_calibration_error,
             "barrier_calibration_bins": barrier_calibration_bins,
             "barrier_expected_calibration_error": barrier_expected_calibration_error,
             "forecast_quality_by_horizon": forecast_quality_by_horizon,
@@ -5463,6 +5547,15 @@ mod tests {
     }
 
     #[test]
+    fn direction_scoring_matches_training_truth_and_classifier_probability() {
+        assert_eq!(direction_observation(0.0), 0.0);
+        assert_eq!(classifier_direction_hit(0.1, 0.0), 1);
+        assert_eq!(classifier_direction_hit(0.9, 0.0), 0);
+        assert_eq!(classifier_direction_hit(0.9, 0.01), 1);
+        assert_eq!(classifier_direction_hit(0.1, -0.01), 1);
+    }
+
+    #[test]
     fn sqlite_round_trip_persists_executable_origin_sides() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         connection.execute_batch(MIGRATION).expect("migration");
@@ -6297,6 +6390,90 @@ mod tests {
         assert!(
             (persisted_path.1 - complete.executable_tick_count as f64 / complete.tick_volume).abs()
                 <= 1e-12
+        );
+    }
+
+    #[test]
+    fn evaluation_recomputes_direction_evidence_from_classifier_and_strict_up_truth() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(MIGRATION).expect("migration");
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        {
+            let connection = store.connection.lock().expect("database mutex");
+            for (index, actual_return, legacy_direction_hit) in
+                [(0_i64, 0.0_f64, 1_i64), (1_i64, 0.01_f64, 0_i64)]
+            {
+                let timestamp = DateTime::<Utc>::from_timestamp(1_700_000_000 + index * 300, 0)
+                    .expect("test timestamp")
+                    .to_rfc3339();
+                let prediction_id = format!("direction-{index}");
+                connection
+                    .execute(
+                        "INSERT INTO predictions
+                         (prediction_id, model_id, feature_version, label_contract_id,
+                          barrier_spec_id, direction_probability_up, symbol, timeframe,
+                          origin_bar_timestamp, origin_close, origin_bid, origin_ask,
+                          origin_bar_index, generated_at, expires_at, forecast_json,
+                          proposal_json, settlement_status, created_at)
+                         VALUES (?1, 'direction-model', ?2, ?3, ?4, 0.9, 'GOLDm#', 'M5',
+                                 ?5, 100.0, 100.0, 100.2, ?6, ?5, ?5,
+                                 '{\"points\":[{\"horizon_bars\":3,\"q10\":-0.02,\"q50\":-0.01,\"q90\":0.02}]}',
+                                 '[]', 'SETTLED', ?5)",
+                        params![
+                            prediction_id,
+                            FEATURE_VERSION_ID,
+                            LABEL_CONTRACT_ID,
+                            BARRIER_SPEC_ID,
+                            timestamp,
+                            (1_700_000_000 + index * 300).div_euclid(300),
+                        ],
+                    )
+                    .expect("prediction");
+                connection
+                    .execute(
+                        "INSERT INTO prediction_horizon_outcomes
+                         (prediction_id, horizon_bars, origin_bar_timestamp,
+                          outcome_bar_timestamp, actual_return, actual_high, actual_low,
+                          interval_hit, direction_hit, error_metrics_json, settled_at)
+                         VALUES (?1, 3, ?2, ?2, ?3, 101.0, 99.0, 1, ?4, '{}', ?2)",
+                        params![
+                            prediction_id,
+                            timestamp,
+                            actual_return,
+                            legacy_direction_hit,
+                        ],
+                    )
+                    .expect("outcome");
+            }
+        }
+
+        let summary = store
+            .evaluation_summary("direction-model", Utc::now() - chrono::Duration::days(1))
+            .expect("evaluation");
+        assert_eq!(summary["current_model"]["direction_accuracy"], 0.5);
+        assert!(
+            (summary["current_model"]["direction_brier"]
+                .as_f64()
+                .expect("brier")
+                - 0.41)
+                .abs()
+                < 1e-12
+        );
+        let bins = summary["direction_calibration_bins"]
+            .as_array()
+            .expect("direction bins");
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0]["sample_size"], 2);
+        assert_eq!(bins[0]["observed_up_rate"], 0.5);
+        assert!(
+            (summary["direction_expected_calibration_error"]
+                .as_f64()
+                .expect("direction ece")
+                - 0.4)
+                .abs()
+                < 1e-12
         );
     }
 

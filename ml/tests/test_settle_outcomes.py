@@ -10,6 +10,7 @@ import pytest
 from xpde_ml.settle_outcomes import (
     _is_exact_m5_horizon,
     barrier_outcome,
+    classifier_direction_hit,
     settle_with_report,
     tick_sequence_barrier_outcome,
 )
@@ -67,6 +68,18 @@ def test_price_horizons_require_every_exact_m5_bucket() -> None:
     assert not _is_exact_m5_horizon(origin, [exact[0], exact[2]])
     assert not _is_exact_m5_horizon(origin, [exact[0], exact[0]])
     assert not _is_exact_m5_horizon(origin, [])
+
+
+def test_direction_truth_treats_flat_return_as_not_up() -> None:
+    assert classifier_direction_hit(0.1, 0.0) == 1
+    assert classifier_direction_hit(0.9, 0.0) == 0
+
+
+def test_direction_accuracy_uses_classifier_not_median_quantile_side() -> None:
+    # A negative q50 is irrelevant here: the calibrated classifier predicts UP.
+    direction_probability_up = 0.9
+    actual_return = 0.01
+    assert classifier_direction_hit(direction_probability_up, actual_return) == 1
 
 
 def test_barrier_outcome_requires_directional_proposal() -> None:
@@ -194,6 +207,7 @@ def test_settlement_uses_exact_origin_and_completed_bar_count(tmp_path) -> None:
     forecast = {
         "origin_bar_timestamp": origin_text,
         "origin_close": 100.0,
+        "direction_probability_up": 0.6,
         "expected_mfe_long": 1.0,
         "expected_mae_long": 1.0,
         "expected_mfe_short": 1.0,
