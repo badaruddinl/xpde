@@ -267,10 +267,17 @@ class ExecutableBarTracker:
         now_epoch: float,
     ) -> None:
         provider_now_epoch = now_epoch + clock.offset_hours * 3600
+        current_bucket_epoch = int(provider_now_epoch // 300) * 300
+        # Recount the current and immediately previous M5 bucket from their
+        # authoritative raw MT5 ticks. This avoids estimating raw tick growth
+        # from a compact price-change path when the provider query overlaps the
+        # last millisecond. The previous bucket is recounted as well so a tick
+        # arriving between the last pre-boundary poll and the first new-bucket
+        # poll cannot be lost.
         start_epoch = (
-            (self.last_tick_msc - 1) / 1000.0
-            if self.last_tick_msc is not None
-            else provider_now_epoch - self.retention_bars * 300
+            provider_now_epoch - self.retention_bars * 300
+            if self.last_tick_msc is None or not self.bars
+            else current_bucket_epoch - 300
         )
         additions, maximum = collect_executable_bars(
             mt5,
@@ -279,15 +286,14 @@ class ExecutableBarTracker:
             end_epoch=provider_now_epoch,
             clock=clock,
             chunk_hours=2,
-            # Re-read the last millisecond. MT5 can publish multiple quote
-            # changes with the same time_msc; merge_executable_bars removes
-            # exact overlap without discarding a later distinct price.
-            after_time_msc=(
-                self.last_tick_msc - 1 if self.last_tick_msc is not None else None
-            ),
+            after_time_msc=None,
         )
-        merge_executable_bars(self.bars, additions)
-        self.last_tick_msc = maximum
+        for timestamp, bar in additions.items():
+            self.bars[timestamp] = bar
+        maxima = [
+            value for value in (self.last_tick_msc, maximum) if value is not None
+        ]
+        self.last_tick_msc = max(maxima, default=None)
         minimum_epoch = now_epoch - self.retention_bars * 300
         self.bars = {
             timestamp: bar

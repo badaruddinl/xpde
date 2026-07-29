@@ -12,6 +12,8 @@ pub const EXECUTABLE_SIDE_CONTRACT_ID: &str =
     "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5";
 pub const MINIMUM_EXECUTABLE_TICK_COVERAGE: f64 = 0.95;
 pub const BARRIER_HORIZON_BARS: u32 = 3;
+pub const FORECAST_HORIZONS: [u32; 4] = [1, 3, 6, 12];
+pub const MAX_FORECAST_HORIZON_BARS: u32 = 12;
 pub const M5_BAR_MINUTES: i64 = 5;
 
 pub fn is_price_tick_aligned(price: f64, tick_size: f64) -> bool {
@@ -559,11 +561,34 @@ impl ForecastEnvelope {
         if self.points.is_empty() {
             return Err(ContractError::MissingForecastPoints);
         }
+        let horizons = self
+            .points
+            .iter()
+            .map(|point| point.horizon_bars)
+            .collect::<Vec<_>>();
+        if horizons != FORECAST_HORIZONS {
+            return Err(ContractError::InvalidForecastHorizons);
+        }
         for point in &self.points {
             point.validate()?;
         }
         Ok(())
     }
+}
+
+pub fn full_forecast_envelope_matures_at(forecast: &ForecastEnvelope) -> DateTime<Utc> {
+    forecast.origin_bar_timestamp
+        + chrono::Duration::minutes((i64::from(MAX_FORECAST_HORIZON_BARS) + 1) * M5_BAR_MINUTES)
+}
+
+pub fn market_session_covers_full_forecast_envelope(
+    snapshot: &MarketSnapshot,
+    forecast: &ForecastEnvelope,
+) -> bool {
+    snapshot
+        .data_quality
+        .market_session_open_until
+        .is_some_and(|session_end| session_end >= full_forecast_envelope_matures_at(forecast))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -917,7 +942,7 @@ pub fn decide_at(
                 outcome_matures_at,
             );
         }
-        Some(session_end) if session_end < outcome_matures_at => {
+        Some(session_end) if session_end < full_forecast_envelope_matures_at(forecast) => {
             return no_prediction(
                 "HORIZON_CROSSES_MARKET_CLOSE",
                 decision_valid_until,
@@ -1261,6 +1286,8 @@ pub enum ContractError {
     InvalidBarrierContract,
     #[error("forecast points are required")]
     MissingForecastPoints,
+    #[error("forecast must contain exactly H1, H3, H6 and H12")]
+    InvalidForecastHorizons,
 }
 
 #[cfg(test)]
@@ -1409,14 +1436,17 @@ mod tests {
                 sample_size: 500,
             },
             drift_detected: false,
-            points: vec![ForecastPoint {
-                horizon_bars: 3,
-                q10: -0.0003,
-                q25: 0.0001,
-                q50: 0.0006,
-                q75: 0.0010,
-                q90: 0.0015,
-            }],
+            points: FORECAST_HORIZONS
+                .into_iter()
+                .map(|horizon_bars| ForecastPoint {
+                    horizon_bars,
+                    q10: -0.0003,
+                    q25: 0.0001,
+                    q50: 0.0006,
+                    q75: 0.0010,
+                    q90: 0.0015,
+                })
+                .collect(),
         }
     }
 
@@ -1501,7 +1531,12 @@ mod tests {
         let forecast = sample_forecast();
         let policy = DecisionPolicy::scalper();
         let proposal = decide(&snapshot, &forecast, &policy);
-        let median_bid_exit = forecast.origin_close * forecast.points[0].q50.exp();
+        let h3 = forecast
+            .points
+            .iter()
+            .find(|point| point.horizon_bars == BARRIER_HORIZON_BARS)
+            .expect("H3 forecast");
+        let median_bid_exit = forecast.origin_close * h3.q50.exp();
         let expected = (median_bid_exit - snapshot.ask)
             * snapshot.symbol_spec.contract_size
             * snapshot.symbol_spec.volume_min
@@ -1519,11 +1554,16 @@ mod tests {
         forecast.barrier_probability_long = 0.37;
         forecast.barrier_probability_short = 0.63;
         forecast.stop_price_short = 3331.5;
-        forecast.points[0].q10 = -0.0015;
-        forecast.points[0].q25 = -0.0010;
-        forecast.points[0].q50 = -0.0006;
-        forecast.points[0].q75 = -0.0001;
-        forecast.points[0].q90 = 0.0003;
+        let h3 = forecast
+            .points
+            .iter_mut()
+            .find(|point| point.horizon_bars == BARRIER_HORIZON_BARS)
+            .expect("H3 forecast");
+        h3.q10 = -0.0015;
+        h3.q25 = -0.0010;
+        h3.q50 = -0.0006;
+        h3.q75 = -0.0001;
+        h3.q90 = 0.0003;
         let mut policy = DecisionPolicy::scalper();
         policy.expected_exit_spread_usd = 0.80;
 
@@ -1531,7 +1571,14 @@ mod tests {
 
         assert_eq!(proposal.action, DecisionAction::Short);
         assert!((proposal.expected_exit_spread - 0.24).abs() < 1e-10);
-        let future_bid = forecast.origin_close * forecast.points[0].q50.exp();
+        let future_bid = forecast.origin_close
+            * forecast
+                .points
+                .iter()
+                .find(|point| point.horizon_bars == BARRIER_HORIZON_BARS)
+                .expect("H3 forecast")
+                .q50
+                .exp();
         let expected_move = (snapshot.bid - (future_bid + 0.24))
             * snapshot.symbol_spec.contract_size
             * snapshot.symbol_spec.volume_min
@@ -1623,7 +1670,7 @@ mod tests {
         let forecast = sample_forecast();
         let mut snapshot = sample_snapshot();
         snapshot.data_quality.market_session_open_until =
-            Some(forecast.origin_bar_timestamp + chrono::Duration::minutes(19));
+            Some(forecast.origin_bar_timestamp + chrono::Duration::minutes(20));
 
         let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
 
@@ -1633,6 +1680,40 @@ mod tests {
                 .reason_codes
                 .contains(&"HORIZON_CROSSES_MARKET_CLOSE".to_owned())
         );
+    }
+
+    #[test]
+    fn full_h12_session_boundary_keeps_the_envelope_actionable() {
+        let forecast = sample_forecast();
+        let mut snapshot = sample_snapshot();
+        snapshot.data_quality.market_session_open_until =
+            Some(forecast.origin_bar_timestamp + chrono::Duration::minutes(65));
+
+        let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+
+        assert_eq!(decision.action, DecisionAction::Long);
+        assert!(market_session_covers_full_forecast_envelope(
+            &snapshot, &forecast
+        ));
+    }
+
+    #[test]
+    fn forecast_contract_requires_the_complete_horizon_envelope() {
+        let mut forecast = sample_forecast();
+        forecast
+            .points
+            .retain(|point| point.horizon_bars != MAX_FORECAST_HORIZON_BARS);
+
+        assert!(matches!(
+            forecast.validate(),
+            Err(ContractError::InvalidForecastHorizons)
+        ));
+        let mut out_of_order = sample_forecast();
+        out_of_order.points.swap(0, 1);
+        assert!(matches!(
+            out_of_order.validate(),
+            Err(ContractError::InvalidForecastHorizons)
+        ));
     }
 
     #[test]

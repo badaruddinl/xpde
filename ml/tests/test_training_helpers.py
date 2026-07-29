@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -14,6 +17,7 @@ from xpde_ml.train_catboost import (
     _select_probability_calibrator,
     _validate_barrier_class_coverage,
 )
+from xpde_ml import train_catboost
 
 
 def test_small_calibration_split_uses_platt() -> None:
@@ -64,3 +68,52 @@ def test_barrier_class_coverage_reports_missing_partition_class() -> None:
             partition="holdout",
             minimum_per_class=2,
         )
+
+
+def test_manual_registration_includes_the_label_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict = {}
+
+    class Response:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def accept(request, *, timeout):
+        assert timeout == 30
+        captured.update(json.loads(request.data.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setattr(train_catboost.urllib.request, "urlopen", accept)
+    manifest = {
+        "model_id": "candidate-test",
+        "feature_version": "goldm-m5-v5",
+        "label_contract_id": "exact-contiguous-m5-horizons-v1",
+        "schema_version": 3,
+        "eligibility_gate_version": 3,
+        "training_mode": "candidate",
+        "eligible_for_shadow": True,
+        "barrier_spec": {"id": "barrier-v6"},
+        "executable_side_contract": {"id": "executable-v5"},
+        "eligibility_gates": {"gate": True},
+        "metrics": {},
+    }
+
+    train_catboost._register("http://127.0.0.1/models", manifest, tmp_path)
+
+    assert captured["label_contract_id"] == manifest["label_contract_id"]
+
+
+def test_local_training_defers_registration_until_verified_import() -> None:
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "train-candidate.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "xpde_ml.train_catboost" in script
+    assert "--no-register" in script
+    assert script.index("--no-register") < script.index("import-colab-artifact.py")

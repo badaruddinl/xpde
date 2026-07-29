@@ -16,6 +16,7 @@ import tomllib
 
 from .backfill_transport import post_backfill_payloads
 from .baseline import forecast_from_snapshot
+from .contracts import HORIZONS
 from .executable_bars import (
     CHART_MODE_BID,
     ExecutableBarTracker,
@@ -595,6 +596,24 @@ def forecast_generation_delay_ms(
     return max(0, int((reference - expected).total_seconds() * 1000))
 
 
+def forecast_envelope_matures_at(origin_bar_timestamp: str) -> datetime:
+    origin = datetime.fromisoformat(origin_bar_timestamp.replace("Z", "+00:00"))
+    return origin + timedelta(minutes=(max(HORIZONS) + 1) * 5)
+
+
+def market_session_covers_forecast_envelope(
+    snapshot: dict[str, Any],
+    origin_bar_timestamp: str,
+) -> bool:
+    raw_session_end = snapshot.get("data_quality", {}).get(
+        "market_session_open_until"
+    )
+    if not raw_session_end:
+        return False
+    session_end = datetime.fromisoformat(str(raw_session_end).replace("Z", "+00:00"))
+    return session_end >= forecast_envelope_matures_at(origin_bar_timestamp)
+
+
 def main() -> None:
     load_local_env()
     parser = argparse.ArgumentParser(description="Read-only MetaTrader5 bridge for GOLDm#")
@@ -708,6 +727,9 @@ def main() -> None:
                     and not startup_snapshot["data_quality"]["missing_flags"]
                     and forecast_generation_delay_ms(latest_completed_bar)
                     <= MAX_FORECAST_GENERATION_DELAY_MS
+                    and market_session_covers_forecast_envelope(
+                        startup_snapshot, latest_completed_bar
+                    )
                 ):
                     if (
                         pending_startup_forecast is None
@@ -851,6 +873,18 @@ def main() -> None:
                         print(
                             "XPDE skipped a late live forecast and will wait for "
                             "the next completed M5 candle",
+                            flush=True,
+                        )
+                        continue
+                    if not market_session_covers_forecast_envelope(
+                        snapshot, latest_bar
+                    ):
+                        last_forecast_bar = latest_bar
+                        pending_forecast = None
+                        pending_forecast_bar = None
+                        print(
+                            "XPDE skipped a forecast whose H1/H3/H6/H12 envelope "
+                            "crosses the market session boundary",
                             flush=True,
                         )
                         continue

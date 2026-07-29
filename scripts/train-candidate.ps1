@@ -21,7 +21,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "MT5 historical backfill failed."
     }
-    & $python -m xpde_ml.train_catboost $barsCsv --output $Output --iterations $Iterations
+    & $python -m xpde_ml.train_catboost $barsCsv --output $Output --iterations $Iterations --no-register
     if ($LASTEXITCODE -ne 0) {
         throw "Candidate training failed."
     }

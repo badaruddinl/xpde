@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
@@ -158,6 +158,124 @@ def test_tracker_overlap_keeps_distinct_quotes_with_the_same_millisecond() -> No
         [base + 1_000, 4000.0, 4000.2],
         [base + 1_000, 4000.4, 4000.6],
     ]
+    assert tracker.bars["2026-07-29T10:00:00Z"]["executable_tick_count"] == 2
+
+
+def test_tracker_recounts_raw_ticks_instead_of_freezing_count_on_overlap() -> None:
+    base = int(datetime(2026, 7, 29, 10, 0, tzinfo=UTC).timestamp() * 1000)
+
+    class Mt5:
+        COPY_TICKS_ALL = 0
+        calls = 0
+
+        def copy_ticks_range(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    {"time_msc": base + 1_000, "bid": 4000.0, "ask": 4000.2},
+                ]
+            return [
+                {"time_msc": base + 1_000, "bid": 4000.0, "ask": 4000.2},
+                {"time_msc": base + 2_000, "bid": 4000.0, "ask": 4000.2},
+                {"time_msc": base + 3_000, "bid": 4000.1, "ask": 4000.3},
+            ]
+
+        @staticmethod
+        def last_error():
+            return 0, "ok"
+
+    tracker = ExecutableBarTracker(retention_bars=1)
+    mt5 = Mt5()
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(base + 2_000) / 1000,
+    )
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(base + 4_000) / 1000,
+    )
+
+    bar = tracker.bars["2026-07-29T10:00:00Z"]
+    assert bar["executable_tick_count"] == 3
+    assert bar["_tick_path"] == [
+        [base + 1_000, 4000.0, 4000.2],
+        [base + 2_000, 4000.0, 4000.2],
+        [base + 3_000, 4000.1, 4000.3],
+    ]
+
+
+def test_tracker_recounts_previous_bucket_after_m5_rollover() -> None:
+    base = int(datetime(2026, 7, 29, 10, 0, tzinfo=UTC).timestamp() * 1000)
+
+    class Mt5:
+        COPY_TICKS_ALL = 0
+        calls = 0
+
+        def copy_ticks_range(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    {"time_msc": base + 299_000, "bid": 4000.0, "ask": 4000.2},
+                ]
+            return [
+                {"time_msc": base + 299_000, "bid": 4000.0, "ask": 4000.2},
+                {"time_msc": base + 299_500, "bid": 4000.1, "ask": 4000.3},
+                {"time_msc": base + 301_000, "bid": 4000.2, "ask": 4000.4},
+            ]
+
+        @staticmethod
+        def last_error():
+            return 0, "ok"
+
+    tracker = ExecutableBarTracker(retention_bars=2)
+    mt5 = Mt5()
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(base + 299_100) / 1000,
+    )
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=(base + 301_500) / 1000,
+    )
+
+    assert tracker.bars["2026-07-29T10:00:00Z"]["executable_tick_count"] == 2
+    assert tracker.bars["2026-07-29T10:05:00Z"]["executable_tick_count"] == 1
+
+
+def test_tracker_rehydrates_retention_window_when_cache_is_empty() -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
+
+    class Mt5:
+        COPY_TICKS_ALL = 0
+        requested_start = None
+
+        def copy_ticks_range(self, _symbol, start, _end, _mode):
+            self.requested_start = start
+            return []
+
+        @staticmethod
+        def last_error():
+            return 0, "ok"
+
+    tracker = ExecutableBarTracker(retention_bars=24)
+    tracker.last_tick_msc = int((now - timedelta(hours=12)).timestamp() * 1000)
+    mt5 = Mt5()
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=now.timestamp(),
+    )
+
+    assert mt5.requested_start == now - timedelta(hours=2)
 
 
 def test_historical_chunk_overlap_never_regresses_the_tick_cursor() -> None:

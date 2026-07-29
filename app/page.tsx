@@ -1220,7 +1220,7 @@ export default function Home() {
 
           <div className="metric-grid">
             <article className="panel metric direction-metric">
-              <span>Peluang arah dalam 3 bar / 15 menit</span>
+              <span>Origin forecast peluang arah · H3</span>
               <div className="direction-values">
                 <div className="direction-stat up" aria-label={`Probabilitas naik ${probabilityUpPercent.toFixed(1)}%`}>
                   <i aria-hidden="true">↑</i>
@@ -1239,7 +1239,11 @@ export default function Home() {
                 <i className="up" style={{ width: forecastIsStale ? "0%" : `${probabilityUpPercent}%` }} />
                 <i className="down" style={{ width: forecastIsStale ? "0%" : `${probabilityDownPercent}%` }} />
               </div>
-              <small className="direction-summary">{forecastIsStale ? "Forecast stale — bukan sinyal" : directionSummary}</small>
+              <small className="direction-summary">
+                {forecastIsStale
+                  ? "Forecast stale — bukan sinyal"
+                  : `${directionSummary} · Tidak dikondisikan ulang terhadap current entry`}
+              </small>
             </article>
             <article className="panel metric">
               <span>Origin forecast P(TP-first) · {forecastSide} · H3</span>

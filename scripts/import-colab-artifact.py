@@ -23,6 +23,7 @@ from xpde_ml.dataset import (
     FEATURE_VERSION,
     LABEL_CONTRACT_ID,
 )
+from xpde_ml.contracts import HORIZONS
 from xpde_ml.model_inference import (
     REQUIRED_ARTIFACT_FILES,
     CandidateModel,
@@ -122,6 +123,10 @@ def _verify_golden_forecast(path: Path) -> None:
         )
     ):
         raise ValueError("golden forecast barriers are not broker-tick aligned")
+    if [int(point.get("horizon_bars", 0)) for point in forecast["points"]] != list(
+        HORIZONS
+    ):
+        raise ValueError("golden forecast must contain exactly H1, H3, H6 and H12")
     for point in forecast["points"]:
         quantiles = [point[f"q{quantile}"] for quantile in (10, 25, 50, 75, 90)]
         if any(not math.isfinite(float(value)) for value in quantiles):

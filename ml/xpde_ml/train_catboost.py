@@ -310,6 +310,7 @@ def _register(url: str, manifest: dict[str, Any], artifact_path: Path) -> None:
         "model_type": "catboost_multi_quantile",
         "status": "candidate",
         "feature_version": manifest["feature_version"],
+        "label_contract_id": manifest["label_contract_id"],
         "schema_version": manifest["schema_version"],
         "eligibility_gate_version": manifest["eligibility_gate_version"],
         "training_mode": manifest["training_mode"],

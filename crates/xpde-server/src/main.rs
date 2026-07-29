@@ -34,6 +34,7 @@ use xpde_domain::{
     FEATURE_VERSION_ID, ForecastEnvelope, ForecastPoint, HumanFeedback, LABEL_CONTRACT_ID,
     MINIMUM_EXECUTABLE_TICK_COVERAGE, MarketBar, MarketSnapshot, MarketStatus, SymbolSpec,
     TradeMode, TradingProfile, decide, decide_at, is_price_tick_aligned,
+    market_session_covers_full_forecast_envelope,
 };
 
 const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
@@ -4331,6 +4332,11 @@ async fn post_forecast(
     {
         return Err(ApiError::bad_request(
             "forecast origin does not match the latest completed M5 candle",
+        ));
+    }
+    if !market_session_covers_full_forecast_envelope(&runtime.snapshot, &forecast) {
+        return Err(ApiError::bad_request(
+            "forecast rejected because the full H1/H3/H6/H12 envelope crosses the market session boundary",
         ));
     }
     if runtime.snapshot.symbol_spec.chart_mode != ChartMode::Bid

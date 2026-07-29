@@ -95,14 +95,23 @@ class FakeCandidateModel:
             "stop_price_short": snap(origin["close"] + 1.0, upward=True),
             "points": [
                 {
+                    "horizon_bars": horizon,
                     "q10": -0.01,
                     "q25": -0.005,
                     "q50": 0.0,
                     "q75": 0.005,
                     "q90": 0.01,
                 }
+                for horizon in importer.HORIZONS
             ],
         }
+
+
+class FakeIncompleteCandidateModel(FakeCandidateModel):
+    def forecast(self, snapshot: dict) -> dict:
+        forecast = super().forecast(snapshot)
+        forecast["points"] = forecast["points"][:-1]
+        return forecast
 
 
 def test_imports_immutable_verified_candidate(tmp_path, monkeypatch) -> None:
@@ -133,6 +142,22 @@ def test_ineligible_candidate_is_not_copied_to_latest(tmp_path, monkeypatch) -> 
             promote_latest=True,
         )
     assert not (tmp_path / "artifacts" / "runs").exists()
+
+
+def test_incomplete_forecast_envelope_is_rejected_before_promotion(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(importer, "CandidateModel", FakeIncompleteCandidateModel)
+    artifact = make_artifact(tmp_path / "source")
+
+    with pytest.raises(ValueError, match="H1, H3, H6 and H12"):
+        importer.import_candidate(
+            artifact,
+            tmp_path / "artifacts",
+            promote_latest=True,
+        )
+
+    assert not (tmp_path / "artifacts" / "latest").exists()
 
 
 def test_missing_required_model_is_rejected(tmp_path, monkeypatch) -> None:

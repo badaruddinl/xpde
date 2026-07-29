@@ -40,6 +40,9 @@ records outcomes and feedback, then leaves the final decision to a human.
   OHLC. Gzip requests are split by encoded bytes, bar count and tick-point count.
   Full resets stage strictly ordered, single-use chunks under an import ID and
   replace live history atomically only after every expected chunk is present.
+- Realtime collection recounts the current and previous M5 bucket from
+  authoritative raw ticks on every refresh. Overlap is never approximated from
+  the compact price-change path, so executable tick coverage cannot freeze.
 - Settlement verifies every expected M5 bucket, path metadata and completed-path
   source. Missing or partial windows remain `TICK_PATH_INCOMPLETE` or
   `SESSION_INTERRUPTED`; they can never become a false no-hit or enter
@@ -182,6 +185,9 @@ bars, train and register a CatBoost candidate:
 Every training run receives an immutable artifact directory. When its objective
 holdout gate passes, the artifact is loaded, exercised with a deterministic
 golden forecast, then atomically promoted to the local `latest` shadow slot.
+The trainer runs with `--no-register`; only the verified importer may register
+the promoted artifact. The legacy manual registration helper carries the same
+label contract if it is invoked explicitly.
 It remains registered as `candidate`;
 promotion to champion is deliberately manual and requires enough settled shadow
 predictions. Training artifacts and historical exports are local and ignored by
@@ -279,6 +285,9 @@ add emergency closure dates without changing source.
 `market_session.timezone = "fixed_broker_utc_offset"` states the limitation
 explicitly. The integer broker UTC offset must be updated operationally for DST
 until an authoritative broker timezone source is available.
+Because one prediction is a single H1/H3/H6/H12 envelope, publication requires
+the session to remain open through `origin + 65 minutes`. The HTTP forecast
+endpoint enforces the same boundary before persisting a prediction.
 Forecast quality and policy outcome remain separate; a proposal metric never
 masquerades as model coverage.
 

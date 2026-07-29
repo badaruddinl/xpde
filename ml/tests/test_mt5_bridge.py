@@ -11,8 +11,10 @@ from xpde_ml.mt5_bridge import (
     PayloadRejected,
     completed_bar_distance,
     fetch_catchup_bars,
+    forecast_envelope_matures_at,
     forecast_generation_delay_ms,
     has_complete_tick_coverage,
+    market_session_covers_forecast_envelope,
     next_retry_delay,
     post_payload,
 )
@@ -147,4 +149,27 @@ def test_generation_delay_is_measured_from_expected_m5_boundary() -> None:
             now_utc=datetime(2026, 7, 28, 10, 5, 9, tzinfo=UTC),
         )
         == 9_000
+    )
+
+
+def test_forecast_envelope_requires_session_through_h12_close() -> None:
+    origin = "2026-07-28T22:50:00+00:00"
+    assert forecast_envelope_matures_at(origin) == datetime(
+        2026, 7, 28, 23, 55, tzinfo=UTC
+    )
+    assert not market_session_covers_forecast_envelope(
+        {
+            "data_quality": {
+                "market_session_open_until": "2026-07-28T23:10:00+00:00"
+            }
+        },
+        origin,
+    )
+    assert market_session_covers_forecast_envelope(
+        {
+            "data_quality": {
+                "market_session_open_until": "2026-07-28T23:55:00+00:00"
+            }
+        },
+        origin,
     )

@@ -113,6 +113,9 @@ volume, executable tick count and coverage ratio alongside each ordered path.
 Settlement requires every expected bucket at >=95% coverage. Model health uses
 only fully settled outcomes and separately gates on >=98% settlement
 completeness over the latest due 200-prediction cohort.
+The realtime tracker fully recounts the current and previous M5 bucket on each
+refresh. Completed history remains frozen after that overlap window, while raw
+tick count is never inferred from the smaller compact price-change sequence.
 
 After downtime, market bars and their ordered `COPY_TICKS_ALL` paths are
 backfilled from the last local completed candle. Requests are gzip-compressed
@@ -193,6 +196,9 @@ Directional MT5 modes (`FULL`, `LONG_ONLY`, `SHORT_ONLY`, `CLOSE_ONLY`,
 explicit operational configuration risk: `fixed_broker_utc_offset` uses an
 integer UTC offset rather than pretending to resolve a timezone database
 identifier.
+Forecasts contain exactly H1/H3/H6/H12 and are accepted only when the active
+session covers the complete envelope through `origin + 65 minutes`; this gate
+runs in both the provider and Rust API before evidence persistence.
 Legacy predictions without executable origin sides or the current barrier
 contract are quarantined as `LEGACY_UNSETTLEABLE`.
 
