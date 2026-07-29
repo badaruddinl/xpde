@@ -32,12 +32,18 @@ interface ForecastPoint {
 interface Proposal {
   prediction_id: string;
   profile: Profile;
+  broker_policy_id: string;
   action: DecisionAction;
   generated_at: string;
   decision_valid_until: string;
   outcome_matures_at: string;
-  expected_edge_after_cost_usd: number;
+  median_move_after_cost_usd: number;
   reference_lot: number;
+  reference_entry_price: number | null;
+  remaining_reward_usd: number;
+  remaining_risk_usd: number;
+  reward_risk_ratio: number;
+  entry_deviation_from_origin: number;
   invalidation_price: number | null;
   target_price: number | null;
   reason_codes: string[];
@@ -72,6 +78,8 @@ interface DashboardState {
       volume_step: number;
       tick_size: number;
       tick_value: number;
+      margin_per_lot_buy?: number | null;
+      margin_per_lot_sell?: number | null;
     };
     data_quality: {
       completeness: number;
@@ -126,6 +134,10 @@ interface EvaluationMetrics {
   tp_before_sl_rate: number | null;
   no_hit_samples: number;
   ambiguous_samples: number;
+  tp_first_within_horizon_samples: number;
+  tp_first_within_horizon_rate: number | null;
+  tp_vs_sl_conditional_rate: number | null;
+  direction_brier: number | null;
 }
 
 interface BarrierOutcomeMetrics {
@@ -133,6 +145,10 @@ interface BarrierOutcomeMetrics {
   tp_before_sl_rate: number | null;
   no_hit_samples: number;
   ambiguous_samples: number;
+  tp_first_within_horizon_samples: number;
+  tp_first_within_horizon_rate: number | null;
+  tp_vs_sl_conditional_rate: number | null;
+  brier_score?: number | null;
 }
 
 interface ProposalOutcomeMetrics extends BarrierOutcomeMetrics {
@@ -156,6 +172,15 @@ interface EvaluationSummary {
     }
   >;
   proposal_outcomes_by_profile: ProposalOutcomeMetrics[];
+  barrier_calibration_bins: Array<{
+    side: "LONG" | "SHORT";
+    bin_index: number;
+    sample_size: number;
+    mean_probability: number;
+    observed_tp_rate: number;
+    brier_score: number;
+  }>;
+  barrier_expected_calibration_error: number | null;
   target_coverage: number;
   current_model_window: number;
   updated_at: string;
@@ -215,6 +240,8 @@ function buildDemoState(): DashboardState {
         volume_step: 0.1,
         tick_size: 0.01,
         tick_value: 0.01,
+        margin_per_lot_buy: 3.34,
+        margin_per_lot_sell: 3.34,
       },
       data_quality: {
         completeness: 1,
@@ -264,30 +291,42 @@ function buildDemoState(): DashboardState {
       {
         prediction_id: predictionId,
         profile: "SCALPER",
+        broker_policy_id: "goldm-demo-v1",
         action: "WAIT",
         generated_at: now,
         decision_valid_until: decisionValidUntil,
         outcome_matures_at: outcomeMaturesAt,
-        expected_edge_after_cost_usd: -0.01,
+        median_move_after_cost_usd: -0.01,
         reference_lot: 0.1,
+        reference_entry_price: 3333.08,
+        remaining_reward_usd: 0.06,
+        remaining_risk_usd: 0.17,
+        reward_risk_ratio: 0.35,
+        entry_deviation_from_origin: 0.17,
         invalidation_price: null,
         target_price: null,
-        reason_codes: ["EDGE_TOO_SMALL_AFTER_COST"],
+        reason_codes: ["REMAINING_EDGE_TOO_SMALL"],
         risk_warnings: ["HIGH_LEVERAGE_ACCOUNT", "MANUAL_CONFIRMATION_REQUIRED"],
       },
       {
         prediction_id: predictionId,
         profile: "SNIPER",
+        broker_policy_id: "goldm-demo-v1",
         action: "WAIT",
         generated_at: now,
         decision_valid_until: decisionValidUntil,
         outcome_matures_at: outcomeMaturesAt,
-        expected_edge_after_cost_usd: -0.01,
+        median_move_after_cost_usd: -0.01,
         reference_lot: 0.1,
+        reference_entry_price: 3333.08,
+        remaining_reward_usd: 0.06,
+        remaining_risk_usd: 0.17,
+        reward_risk_ratio: 0.35,
+        entry_deviation_from_origin: 0.17,
         invalidation_price: null,
         target_price: null,
         reason_codes: [
-          "EDGE_TOO_SMALL_AFTER_COST",
+          "REMAINING_EDGE_TOO_SMALL",
           "DIRECTION_PROBABILITY_TOO_LOW",
           "BARRIER_PROBABILITY_TOO_LOW",
         ],
@@ -330,11 +369,16 @@ function time(value: string | null | undefined) {
 function reasonLabel(reason: string) {
   const labels: Record<string, string> = {
     EDGE_TOO_SMALL_AFTER_COST: "Edge terlalu kecil setelah biaya",
+    REMAINING_EDGE_TOO_SMALL: "Sisa reward dari harga entry tidak memadai",
+    BARRIER_ALREADY_TOUCHED: "Target atau stop sudah tersentuh sejak forecast dibuat",
+    ENTRY_PRICE_OUTSIDE_BARRIER: "Harga entry saat ini sudah di luar barrier",
+    ENTRY_DEVIATION_TOO_LARGE: "Harga entry terlalu jauh dari origin forecast",
     DIRECTION_PROBABILITY_TOO_LOW: "Probabilitas arah belum melewati gate",
     BARRIER_PROBABILITY_TOO_LOW: "Peluang target belum memadai",
     CALIBRATION_OUTSIDE_GATE: "Coverage di luar toleransi",
     DATA_INVALID_OR_STALE: "Feed tidak valid atau stale",
     SPREAD_ABOVE_LIMIT: "Spread melewati batas profil",
+    SPREAD_ABOVE_ATR_LIMIT: "Spread terlalu besar relatif terhadap ATR",
     DRIFT_DETECTED: "Drift model terdeteksi",
     FORECAST_SIDE_CONFLICT: "Arah quantile, classifier, dan barrier tidak selaras",
     FORECAST_ORIGIN_MISMATCH: "Forecast belum tersedia untuk candle M5 terbaru",
@@ -360,7 +404,6 @@ export default function Home() {
       const response = await fetch(`${API_BASE}/api/v1/state`, { cache: "no-store" });
       if (!response.ok) throw new Error("API unavailable");
       setState((await response.json()) as DashboardState);
-      setTransport("connected");
     } catch {
       setTransport("fallback");
     }
@@ -380,12 +423,13 @@ export default function Home() {
 
   useEffect(() => {
     const initial = window.setTimeout(loadState, 0);
-    const timer = window.setInterval(loadState, 3000);
+    const timer =
+      transport === "fallback" ? window.setInterval(loadState, 3000) : null;
     return () => {
       window.clearTimeout(initial);
-      window.clearInterval(timer);
+      if (timer !== null) window.clearInterval(timer);
     };
-  }, [loadState]);
+  }, [loadState, transport]);
 
   useEffect(() => {
     const initial = window.setTimeout(loadEvaluation, 0);
@@ -397,18 +441,42 @@ export default function Home() {
   }, [loadEvaluation]);
 
   useEffect(() => {
-    const socket = new WebSocket("ws://127.0.0.1:8787/ws");
-    socket.addEventListener("message", (event) => {
-      try {
-        setState(JSON.parse(event.data) as DashboardState);
+    let socket: WebSocket | null = null;
+    let retryTimer: number | null = null;
+    let stopped = false;
+    let attempt = 0;
+
+    const connect = () => {
+      if (stopped) return;
+      socket = new WebSocket("ws://127.0.0.1:8787/ws");
+      socket.addEventListener("open", () => {
+        attempt = 0;
         setTransport("connected");
-      } catch {
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          setState(JSON.parse(event.data) as DashboardState);
+          setTransport("connected");
+        } catch {
+          setTransport("fallback");
+        }
+      });
+      socket.addEventListener("close", () => {
+        if (stopped) return;
         setTransport("fallback");
-      }
-    });
-    socket.addEventListener("close", () => setTransport("fallback"));
-    socket.addEventListener("error", () => setTransport("fallback"));
-    return () => socket.close();
+        const delay = Math.min(30_000, 1000 * 2 ** attempt);
+        attempt += 1;
+        retryTimer = window.setTimeout(connect, delay);
+      });
+      socket.addEventListener("error", () => socket?.close());
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      socket?.close();
+    };
   }, []);
 
   const proposal = state.proposals.find((item) => item.profile === profile) ?? state.proposals[0];
@@ -430,8 +498,8 @@ export default function Home() {
       : null;
   const realizedTpRate =
     activeProposalEvaluation &&
-    activeProposalEvaluation.tp_before_sl_samples >= MIN_LIVE_EVIDENCE
-      ? activeProposalEvaluation.tp_before_sl_rate
+    activeProposalEvaluation.tp_first_within_horizon_samples >= MIN_LIVE_EVIDENCE
+      ? activeProposalEvaluation.tp_first_within_horizon_rate
       : null;
   const horizonThree =
     state.forecast.points.find((point) => point.horizon_bars === 3) ??
@@ -478,6 +546,12 @@ export default function Home() {
       ? observedCoverage >= 0.76 && observedCoverage <= 0.84
       : observedCoverage >= 0.77 && observedCoverage <= 0.83;
   const spread = state.snapshot.ask - state.snapshot.bid;
+  const forecastIsStale =
+    state.forecast_status !== "CURRENT" && state.forecast_status !== "DEMO";
+  const maxForecastHorizon = Math.max(
+    ...state.forecast.points.map((point) => point.horizon_bars),
+    1,
+  );
   const completedBars = state.snapshot.bars.slice(
     state.snapshot.current_bar ? -31 : -32,
   );
@@ -503,11 +577,24 @@ export default function Home() {
   const lastPrice = (state.snapshot.bid + state.snapshot.ask) / 2;
 
   const riskPreview = useMemo(() => {
+    if (proposal.action !== "LONG" && proposal.action !== "SHORT") {
+      return { lot: null, reason: "Lot tidak dihitung karena proposal tidak actionable." };
+    }
     if (!state.forecast.excursion_modelled || state.forecast_status !== "CURRENT") {
       return { lot: null, reason: "Forecast current dan model excursion diperlukan." };
     }
+    if (
+      proposal.reference_entry_price === null ||
+      proposal.invalidation_price === null ||
+      proposal.remaining_reward_usd <= 0 ||
+      proposal.reward_risk_ratio <= 0
+    ) {
+      return { lot: null, reason: "Entry atau barrier proposal tidak valid." };
+    }
     const riskUsd = state.snapshot.account.equity * (riskPercent / 100);
-    const stopDistance = Math.abs(state.forecast.origin_close - barrierStop);
+    const stopDistance = Math.abs(
+      proposal.reference_entry_price - proposal.invalidation_price,
+    );
     const tickSize = state.snapshot.symbol_spec.tick_size;
     const tickValue = state.snapshot.symbol_spec.tick_value;
     const lossPerLot = (stopDistance / tickSize) * tickValue;
@@ -525,14 +612,22 @@ export default function Home() {
       state.snapshot.symbol_spec.volume_max,
       rounded,
     );
+    const providerMarginPerLot =
+      proposal.action === "LONG"
+        ? state.snapshot.symbol_spec.margin_per_lot_buy
+        : state.snapshot.symbol_spec.margin_per_lot_sell;
     const estimatedMargin =
-      (lastPrice * state.snapshot.symbol_spec.contract_size * lot) /
-      state.snapshot.account.leverage;
+      typeof providerMarginPerLot === "number" &&
+      Number.isFinite(providerMarginPerLot) &&
+      providerMarginPerLot > 0
+        ? providerMarginPerLot * lot
+        : (lastPrice * state.snapshot.symbol_spec.contract_size * lot) /
+          state.snapshot.account.leverage;
     if (estimatedMargin > state.snapshot.account.free_margin) {
       return { lot: null, reason: "FREE_MARGIN_INSUFFICIENT" };
     }
     return { lot, reason: "" };
-  }, [barrierStop, lastPrice, riskPercent, state]);
+  }, [lastPrice, proposal, riskPercent, state]);
 
   async function submitFeedback(verdict: "ACCEPTED" | "REJECTED" | "UNCERTAIN") {
     if (state.safety.feed_is_demo || state.forecast_status !== "CURRENT") {
@@ -611,11 +706,20 @@ export default function Home() {
 
   const renderDecisionCard = () => (
     <section className={`panel decision-card action-${proposal.action.toLowerCase()}`}>
-      <div className="decision-head"><span>Decision proposal</span><i>{profile}</i></div>
+      <div className="decision-head"><span>Decision proposal</span><i>{profile} · {proposal.broker_policy_id}</i></div>
       <strong className="decision-action">{proposal.action.replace("_", " ")}</strong>
       <p>{proposal.reason_codes.length ? reasonLabel(proposal.reason_codes[0]) : "Semua gate profil terpenuhi."}</p>
       <div className="decision-numbers">
-        <div><span>Net edge · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.expected_edge_after_cost_usd)}</strong></div>
+        <div><span>Median move setelah biaya · {proposal.reference_lot.toFixed(1)} lot</span><strong>{money(proposal.median_move_after_cost_usd)}</strong></div>
+        <div>
+          <span>Entry / reward / risk</span>
+          <strong>
+            {proposal.reference_entry_price === null
+              ? "—"
+              : `${proposal.reference_entry_price.toFixed(2)} · ${money(proposal.remaining_reward_usd)} / ${money(proposal.remaining_risk_usd)}`}
+          </strong>
+        </div>
+        <div><span>Reward / risk tersisa</span><strong>{proposal.reward_risk_ratio.toFixed(2)}×</strong></div>
         <div>
           <span>Model MFE / MAE · {forecastSide}</span>
           <strong>
@@ -688,7 +792,7 @@ export default function Home() {
       <div className="workspace">
         <div className="mobile-decision">{renderDecisionCard()}</div>
         <section className="primary-column">
-          <div className="panel chart-panel">
+          <div className={`panel chart-panel ${forecastIsStale ? "forecast-stale" : ""}`}>
             <div className="panel-heading">
               <div>
                 <span className="eyebrow">Market + forecast envelope</span>
@@ -717,6 +821,12 @@ export default function Home() {
             </div>
 
             <div className="market-chart" aria-label="Grafik candle historis dan prediction band">
+              {forecastIsStale ? (
+                <div className="stale-forecast-overlay" role="status">
+                  <strong>FORECAST HISTORIS / STALE</strong>
+                  <span>Tidak boleh digunakan untuk keputusan entry.</span>
+                </div>
+              ) : null}
               <div className="price-axis">
                 <span>{maxPrice.toFixed(2)}</span>
                 <span>{((maxPrice + minPrice) / 2).toFixed(2)}</span>
@@ -758,7 +868,7 @@ export default function Home() {
                 >
                   <span>SL {barrierStop.toFixed(2)}</span>
                 </div>
-                {state.forecast.points.map((point, index) => {
+                {state.forecast.points.map((point) => {
                   const upper = state.forecast.origin_close * Math.exp(point.q90);
                   const innerUpper = state.forecast.origin_close * Math.exp(point.q75);
                   const median = state.forecast.origin_close * Math.exp(point.q50);
@@ -770,7 +880,14 @@ export default function Home() {
                   const innerHeight = ((innerUpper - innerLower) / range) * 100;
                   const medianTop = ((maxPrice - median) / range) * 100;
                   return (
-                    <div className="forecast-step" key={point.horizon_bars} style={{ left: `${index * 24}%`, width: "25%" }}>
+                    <div
+                      className="forecast-step"
+                      key={point.horizon_bars}
+                      style={{
+                        left: `${(point.horizon_bars / maxForecastHorizon) * 88}%`,
+                        width: "12%",
+                      }}
+                    >
                       <i className="band-80" style={{ top: `${top}%`, height: `${Math.max(1, bandHeight)}%` }} />
                       <i className="band-50" style={{ top: `${innerTop}%`, height: `${Math.max(1, innerHeight)}%` }} />
                       <b className="median" style={{ top: `${medianTop}%` }} />
@@ -796,11 +913,11 @@ export default function Home() {
               <div className="direction-values">
                 <div className="direction-stat up" aria-label={`Probabilitas naik ${probabilityUpPercent.toFixed(1)}%`}>
                   <i aria-hidden="true">↑</i>
-                  <strong>{probabilityUpPercent.toFixed(1)}%</strong>
+                  <strong>{forecastIsStale ? "—" : `${probabilityUpPercent.toFixed(1)}%`}</strong>
                 </div>
                 <div className="direction-stat down" aria-label={`Probabilitas turun ${probabilityDownPercent.toFixed(1)}%`}>
                   <i aria-hidden="true">↓</i>
-                  <strong>{probabilityDownPercent.toFixed(1)}%</strong>
+                  <strong>{forecastIsStale ? "—" : `${probabilityDownPercent.toFixed(1)}%`}</strong>
                 </div>
               </div>
               <div
@@ -808,23 +925,23 @@ export default function Home() {
                 aria-label={`${probabilityUpPercent.toFixed(1)}% naik, ${probabilityDownPercent.toFixed(1)}% turun`}
                 role="img"
               >
-                <i className="up" style={{ width: `${probabilityUpPercent}%` }} />
-                <i className="down" style={{ width: `${probabilityDownPercent}%` }} />
+                <i className="up" style={{ width: forecastIsStale ? "0%" : `${probabilityUpPercent}%` }} />
+                <i className="down" style={{ width: forecastIsStale ? "0%" : `${probabilityDownPercent}%` }} />
               </div>
-              <small className="direction-summary">{directionSummary}</small>
+              <small className="direction-summary">{forecastIsStale ? "Forecast stale — bukan sinyal" : directionSummary}</small>
             </article>
             <article className="panel metric">
               <span>TP before invalidation · {forecastSide} · 3 bar</span>
-              <strong>{percent(barrierProbability)}</strong>
-              <div className="meter amber"><i style={{ width: percent(barrierProbability) }} /></div>
-              <small>Gate Sniper 60% · sisi harus konsisten</small>
+              <strong>{forecastIsStale ? "—" : percent(barrierProbability)}</strong>
+              <div className="meter amber"><i style={{ width: forecastIsStale ? "0%" : percent(barrierProbability) }} /></div>
+              <small>{forecastIsStale ? "Forecast stale — bukan sinyal" : "Gate Sniper 60% · sisi harus konsisten"}</small>
             </article>
             <article className="panel metric">
               <span>Offline holdout coverage</span>
-              <strong>{percent(state.forecast.calibration.observed_coverage)}</strong>
-              <div className="meter coverage"><i style={{ width: percent(state.forecast.calibration.observed_coverage) }} /></div>
+              <strong>{forecastIsStale ? "—" : percent(state.forecast.calibration.observed_coverage)}</strong>
+              <div className="meter coverage"><i style={{ width: forecastIsStale ? "0%" : percent(state.forecast.calibration.observed_coverage) }} /></div>
               <small>
-                Artifact evaluation · target 80% · n={state.forecast.calibration.sample_size}
+                {forecastIsStale ? "Forecast stale — artifact tidak aktif" : `Artifact evaluation · target 80% · n=${state.forecast.calibration.sample_size}`}
               </small>
             </article>
             <article className="panel metric">
@@ -867,7 +984,7 @@ export default function Home() {
               </small>
             </article>
             <article className="panel metric">
-              <span>Proposal TP before SL · {profile} · 200 prediksi</span>
+              <span>Proposal TP dalam horizon · {profile} · 200 prediksi</span>
               <strong>{realizedTpRate === null ? "—" : percent(realizedTpRate)}</strong>
               <div className="meter realized">
                 <i style={{ width: realizedTpRate === null ? "0%" : percent(realizedTpRate) }} />
@@ -875,8 +992,8 @@ export default function Home() {
               <small>
                 {activeProposalEvaluation
                   ? realizedTpRate === null
-                    ? `Mengumpulkan outcome valid · ${activeProposalEvaluation.tp_before_sl_samples}/${MIN_LIVE_EVIDENCE}`
-                    : `TP/SL n=${activeProposalEvaluation.tp_before_sl_samples} · no-hit=${activeProposalEvaluation.no_hit_samples} · ambigu=${activeProposalEvaluation.ambiguous_samples}`
+                    ? `Mengumpulkan outcome valid · ${activeProposalEvaluation.tp_first_within_horizon_samples}/${MIN_LIVE_EVIDENCE}`
+                    : `TP/horizon n=${activeProposalEvaluation.tp_first_within_horizon_samples} · conditional TP/SL=${activeProposalEvaluation.tp_vs_sl_conditional_rate === null ? "—" : percent(activeProposalEvaluation.tp_vs_sl_conditional_rate)} · ambigu=${activeProposalEvaluation.ambiguous_samples}`
                   : "Menunggu evaluation API"}
               </small>
             </article>
@@ -898,7 +1015,7 @@ export default function Home() {
             </div>
             <label className="risk-input">
               <span>Risk budget <strong>{riskPercent.toFixed(1)}%</strong></span>
-              <input aria-label="Risk budget percent" disabled={!state.forecast.excursion_modelled || state.forecast_status !== "CURRENT"} max="3" min="0.1" onChange={(event) => setRiskPercent(Number(event.target.value))} step="0.1" type="range" value={riskPercent} />
+              <input aria-label="Risk budget percent" disabled={!state.forecast.excursion_modelled || state.forecast_status !== "CURRENT" || (proposal.action !== "LONG" && proposal.action !== "SHORT")} max="3" min="0.1" onChange={(event) => setRiskPercent(Number(event.target.value))} step="0.1" type="range" value={riskPercent} />
             </label>
             <div className="lot-preview">
               <span>Lot indikatif</span><strong>{riskPreview.lot === null ? "—" : riskPreview.lot.toFixed(1)}</strong>
@@ -918,6 +1035,8 @@ export default function Home() {
             <div className="gate-row"><span><i className="ok" /> Feed completeness</span><strong>{percent(state.snapshot.data_quality.completeness)}</strong></div>
             <div className="gate-row"><span><i className={coverageHealthy ? "ok" : "warn"} /> Calibration</span><strong>{coverageHealthy ? "In range" : "Out of range"}</strong></div>
             <div className="gate-row"><span><i className={state.forecast.drift_detected ? "bad" : "ok"} /> Drift detector</span><strong>{state.forecast.drift_detected ? "Detected" : "Clear"}</strong></div>
+            <div className="gate-row"><span><i className="warn" /> Live direction Brier</span><strong>{activeEvaluation?.direction_brier?.toFixed(4) ?? "—"}</strong></div>
+            <div className="gate-row"><span><i className="warn" /> Barrier calibration ECE</span><strong>{evaluation?.barrier_expected_calibration_error === null || evaluation?.barrier_expected_calibration_error === undefined ? "—" : percent(evaluation.barrier_expected_calibration_error)}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Data source</span><strong>{state.safety.feed_is_demo ? "Demo" : "MT5 live"}</strong></div>
           </section>
 

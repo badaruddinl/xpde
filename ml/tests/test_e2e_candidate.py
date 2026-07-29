@@ -105,7 +105,10 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
             for row in latest.itertuples(index=False)
         ],
     }
-    forecast = CandidateModel(output).forecast(snapshot)
+    forecast = CandidateModel(
+        output,
+        allow_ineligible_for_testing=True,
+    ).forecast(snapshot)
     assert forecast["model_id"] == manifest["model_id"]
     assert forecast["barrier_spec_id"] == BARRIER_SPEC_ID
     assert forecast["barrier_horizon_bars"] == 3

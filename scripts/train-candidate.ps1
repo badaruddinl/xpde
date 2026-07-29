@@ -28,12 +28,12 @@ try {
     $manifestPath = Join-Path $repoRoot "$Output\manifest.json"
     $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
     if ($manifest.eligible_for_shadow -eq $true) {
-        $latest = Join-Path $repoRoot "artifacts\catboost\latest"
-        if (Test-Path -LiteralPath $latest) {
-            Remove-Item -LiteralPath $latest -Recurse -Force
+        & $python (Join-Path $PSScriptRoot "import-colab-artifact.py") `
+            (Join-Path $repoRoot $Output)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Candidate passed training gates but failed load-and-forecast promotion."
         }
-        Copy-Item -LiteralPath (Join-Path $repoRoot $Output) -Destination $latest -Recurse
-        Write-Output "Eligible candidate copied to artifacts\catboost\latest."
+        Write-Output "Eligible candidate verified and atomically promoted to artifacts\catboost\latest."
     }
     Write-Output "Candidate artifact: $Output"
     Write-Output "Restart the realtime bridge to load an eligible shadow candidate."

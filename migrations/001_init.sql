@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS model_registry (
     model_type TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('candidate', 'challenger', 'champion', 'retired')),
     feature_version TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 0,
+    eligibility_gate_version INTEGER NOT NULL DEFAULT 0,
+    training_mode TEXT NOT NULL DEFAULT '',
+    eligible_for_shadow INTEGER NOT NULL DEFAULT 0,
+    barrier_spec_id TEXT NOT NULL DEFAULT '',
     artifact_path TEXT NOT NULL,
     metrics_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -64,7 +69,11 @@ CREATE TABLE IF NOT EXISTS model_registry (
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id TEXT PRIMARY KEY,
     model_id TEXT NOT NULL,
+    feature_version TEXT,
     barrier_spec_id TEXT,
+    direction_probability_up REAL,
+    barrier_probability_long REAL,
+    barrier_probability_short REAL,
     symbol TEXT NOT NULL,
     timeframe TEXT NOT NULL,
     origin_bar_timestamp TEXT,
@@ -76,6 +85,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     outcome_matures_at TEXT,
     forecast_json TEXT NOT NULL,
     proposal_json TEXT NOT NULL,
+    is_duplicate INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -192,8 +202,12 @@ CREATE INDEX IF NOT EXISTS idx_market_bars_time
     ON market_bars(symbol, timeframe, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_predictions_time
     ON predictions(generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_predictions_origin_model
+    ON predictions(origin_bar_timestamp, model_id);
 CREATE INDEX IF NOT EXISTS idx_prediction_horizon_outcomes_time
     ON prediction_horizon_outcomes(settled_at DESC, horizon_bars);
+CREATE INDEX IF NOT EXISTS idx_prediction_horizon_outcomes_prediction
+    ON prediction_horizon_outcomes(prediction_id, horizon_bars);
 CREATE INDEX IF NOT EXISTS idx_prediction_proposal_outcomes_time
     ON prediction_proposal_outcomes(settled_at DESC, profile, horizon_bars);
 CREATE INDEX IF NOT EXISTS idx_feedback_prediction

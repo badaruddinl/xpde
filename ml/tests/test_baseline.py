@@ -42,3 +42,10 @@ def test_baseline_emits_monotonic_direct_horizons() -> None:
         quantiles = [point[name] for name in ("q10", "q25", "q50", "q75", "q90")]
         assert quantiles == sorted(quantiles)
     assert 0.0 <= forecast["direction_probability_up"] <= 1.0
+
+
+def test_prediction_id_is_deterministic_for_same_contract_origin() -> None:
+    snapshot = sample_snapshot()
+    first = forecast_from_snapshot(snapshot)
+    second = forecast_from_snapshot(snapshot)
+    assert first["prediction_id"] == second["prediction_id"]

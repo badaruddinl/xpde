@@ -38,6 +38,66 @@ struct AppState {
     store: Arc<Store>,
     runtime: Arc<RwLock<RuntimeState>>,
     started_at: DateTime<Utc>,
+    policies: PolicySet,
+}
+
+#[derive(Debug, Clone)]
+struct PolicySet {
+    scalper: DecisionPolicy,
+    sniper: DecisionPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyFile {
+    broker_profile: BrokerPolicyFile,
+    policy: ProfilePoliciesFile,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrokerPolicyFile {
+    broker_policy_id: String,
+    commission_usd_per_lot: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfilePoliciesFile {
+    scalper: ProfilePolicyFile,
+    sniper: ProfilePolicyFile,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfilePolicyFile {
+    max_spread_usd: f64,
+    max_spread_atr_ratio: f64,
+    slippage_buffer_usd: f64,
+    max_entry_deviation_atr: f64,
+    min_reward_risk_ratio: f64,
+    min_direction_probability: f64,
+    min_barrier_probability: f64,
+}
+
+fn load_policy_set() -> Result<PolicySet, String> {
+    let path = env::var("XPDE_CONFIG_PATH").unwrap_or_else(|_| "config/default.toml".to_owned());
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read policy config {path}: {error}"))?;
+    let config: PolicyFile = toml::from_str(&contents)
+        .map_err(|error| format!("failed to parse policy config {path}: {error}"))?;
+    let apply = |mut policy: DecisionPolicy, values: &ProfilePolicyFile| {
+        policy.broker_policy_id = config.broker_profile.broker_policy_id.clone();
+        policy.commission_usd_per_lot = config.broker_profile.commission_usd_per_lot;
+        policy.max_spread_usd = values.max_spread_usd;
+        policy.max_spread_atr_ratio = values.max_spread_atr_ratio;
+        policy.slippage_buffer_usd = values.slippage_buffer_usd;
+        policy.max_entry_deviation_atr = values.max_entry_deviation_atr;
+        policy.min_reward_risk_ratio = values.min_reward_risk_ratio;
+        policy.min_direction_probability = values.min_direction_probability;
+        policy.min_barrier_probability = values.min_barrier_probability;
+        policy
+    };
+    Ok(PolicySet {
+        scalper: apply(DecisionPolicy::scalper(), &config.policy.scalper),
+        sniper: apply(DecisionPolicy::sniper(), &config.policy.sniper),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +174,12 @@ struct ModelRegistration {
     model_type: String,
     status: String,
     feature_version: String,
+    schema_version: i64,
+    eligibility_gate_version: i64,
+    training_mode: String,
+    eligible_for_shadow: bool,
+    barrier_spec_id: String,
+    eligibility_gates: serde_json::Map<String, serde_json::Value>,
     artifact_path: String,
     metrics: serde_json::Value,
 }
@@ -169,6 +235,11 @@ struct ModelRecord {
     model_type: String,
     status: String,
     feature_version: String,
+    schema_version: i64,
+    eligibility_gate_version: i64,
+    training_mode: String,
+    eligible_for_shadow: bool,
+    barrier_spec_id: String,
     artifact_path: String,
     metrics: serde_json::Value,
     created_at: String,
@@ -212,7 +283,32 @@ impl Store {
         ensure_column(&connection, "predictions", "origin_bar_timestamp", "TEXT")?;
         ensure_column(&connection, "predictions", "origin_close", "REAL")?;
         ensure_column(&connection, "predictions", "origin_bar_index", "INTEGER")?;
+        ensure_column(&connection, "predictions", "feature_version", "TEXT")?;
         ensure_column(&connection, "predictions", "barrier_spec_id", "TEXT")?;
+        ensure_column(
+            &connection,
+            "predictions",
+            "direction_probability_up",
+            "REAL",
+        )?;
+        ensure_column(
+            &connection,
+            "predictions",
+            "barrier_probability_long",
+            "REAL",
+        )?;
+        ensure_column(
+            &connection,
+            "predictions",
+            "barrier_probability_short",
+            "REAL",
+        )?;
+        ensure_column(
+            &connection,
+            "predictions",
+            "is_duplicate",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&connection, "predictions", "decision_valid_until", "TEXT")?;
         ensure_column(&connection, "predictions", "outcome_matures_at", "TEXT")?;
         ensure_column(
@@ -228,9 +324,75 @@ impl Store {
         ensure_column(&connection, "human_feedback", "selected_reason", "TEXT")?;
         ensure_column(
             &connection,
+            "model_registry",
+            "schema_version",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "model_registry",
+            "eligibility_gate_version",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "model_registry",
+            "training_mode",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
+            "model_registry",
+            "eligible_for_shadow",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "model_registry",
+            "barrier_spec_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
             "prediction_horizon_outcomes",
             "barrier_short_outcome",
             "TEXT",
+        )?;
+        connection.execute_batch(
+            "UPDATE predictions
+             SET feature_version=COALESCE(
+               feature_version,
+               json_extract(forecast_json, '$.feature_version'),
+               'unknown'
+             ),
+             direction_probability_up=COALESCE(
+               direction_probability_up,
+               json_extract(forecast_json, '$.direction_probability_up')
+             ),
+             barrier_probability_long=COALESCE(
+               barrier_probability_long,
+               json_extract(forecast_json, '$.barrier_probability_long')
+             ),
+             barrier_probability_short=COALESCE(
+               barrier_probability_short,
+               json_extract(forecast_json, '$.barrier_probability_short')
+             );
+             DROP INDEX IF EXISTS ux_predictions_model_origin_contract;
+             UPDATE predictions SET is_duplicate=0;
+             UPDATE predictions
+             SET is_duplicate=1
+             WHERE rowid NOT IN (
+               SELECT MIN(rowid)
+               FROM predictions
+               GROUP BY model_id, symbol, timeframe, origin_bar_timestamp,
+                        feature_version, barrier_spec_id
+             );
+             CREATE UNIQUE INDEX ux_predictions_model_origin_contract
+             ON predictions(
+               model_id, symbol, timeframe, origin_bar_timestamp,
+               feature_version, barrier_spec_id
+             )
+             WHERE is_duplicate=0;",
         )?;
         connection.execute(
             "DELETE FROM market_bars
@@ -424,7 +586,7 @@ impl Store {
         snapshot: &MarketSnapshot,
         forecast: &ForecastEnvelope,
         proposals: &[DecisionProposal],
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<bool, rusqlite::Error> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         let decision_valid_until = proposals
             .first()
@@ -434,17 +596,24 @@ impl Store {
             .first()
             .map(|proposal| proposal.outcome_matures_at)
             .unwrap_or(forecast.generated_at);
-        connection.execute(
-            "INSERT OR REPLACE INTO predictions
-             (prediction_id, model_id, barrier_spec_id, symbol, timeframe, origin_bar_timestamp,
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO predictions
+             (prediction_id, model_id, feature_version, barrier_spec_id,
+              direction_probability_up, barrier_probability_long,
+              barrier_probability_short,
+              symbol, timeframe, origin_bar_timestamp,
               origin_close, origin_bar_index, generated_at, expires_at,
               decision_valid_until, outcome_matures_at,
-              forecast_json, proposal_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              forecast_json, proposal_json, is_duplicate, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19)",
             params![
                 forecast.prediction_id.to_string(),
                 forecast.model_id,
+                forecast.feature_version,
                 forecast.barrier_spec_id,
+                forecast.direction_probability_up,
+                forecast.barrier_probability_long,
+                forecast.barrier_probability_short,
                 snapshot.symbol,
                 snapshot.timeframe,
                 forecast.origin_bar_timestamp.to_rfc3339(),
@@ -459,7 +628,53 @@ impl Store {
                 Utc::now().to_rfc3339(),
             ],
         )?;
-        Ok(())
+        Ok(inserted == 1)
+    }
+
+    fn prediction_for_contract(
+        &self,
+        snapshot: &MarketSnapshot,
+        forecast: &ForecastEnvelope,
+    ) -> Result<Option<(ForecastEnvelope, Vec<DecisionProposal>)>, rusqlite::Error> {
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let row = connection.query_row(
+            "SELECT forecast_json, proposal_json
+             FROM predictions
+             WHERE model_id=?1 AND symbol=?2 AND timeframe=?3
+               AND origin_bar_timestamp=?4 AND feature_version=?5
+               AND barrier_spec_id=?6 AND is_duplicate=0
+             LIMIT 1",
+            params![
+                forecast.model_id,
+                snapshot.symbol,
+                snapshot.timeframe,
+                forecast.origin_bar_timestamp.to_rfc3339(),
+                forecast.feature_version,
+                forecast.barrier_spec_id,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+        match row {
+            Ok((forecast_json, proposal_json)) => {
+                let saved_forecast = serde_json::from_str(&forecast_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                let saved_proposals = serde_json::from_str(&proposal_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(Some((saved_forecast, saved_proposals)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn save_feedback(&self, feedback: &HumanFeedback) -> Result<(), rusqlite::Error> {
@@ -489,13 +704,19 @@ impl Store {
         let connection = self.connection.lock().expect("database mutex poisoned");
         connection.execute(
             "INSERT INTO model_registry
-             (model_id, model_type, status, feature_version, artifact_path, metrics_json,
-              created_at, promoted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+             (model_id, model_type, status, feature_version, schema_version,
+              eligibility_gate_version, training_mode, eligible_for_shadow,
+              barrier_spec_id, artifact_path, metrics_json, created_at, promoted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
              ON CONFLICT(model_id) DO UPDATE SET
                model_type=excluded.model_type,
                status=excluded.status,
                feature_version=excluded.feature_version,
+               schema_version=excluded.schema_version,
+               eligibility_gate_version=excluded.eligibility_gate_version,
+               training_mode=excluded.training_mode,
+               eligible_for_shadow=excluded.eligible_for_shadow,
+               barrier_spec_id=excluded.barrier_spec_id,
                artifact_path=excluded.artifact_path,
                metrics_json=excluded.metrics_json",
             params![
@@ -503,6 +724,11 @@ impl Store {
                 model.model_type,
                 model.status,
                 model.feature_version,
+                model.schema_version,
+                model.eligibility_gate_version,
+                model.training_mode,
+                model.eligible_for_shadow,
+                model.barrier_spec_id,
                 model.artifact_path,
                 model.metrics.to_string(),
                 Utc::now().to_rfc3339(),
@@ -523,22 +749,28 @@ impl Store {
     fn list_models(&self) -> Result<Vec<ModelRecord>, rusqlite::Error> {
         let connection = self.connection.lock().expect("database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT model_id, model_type, status, feature_version, artifact_path,
-                    metrics_json, created_at, promoted_at
+            "SELECT model_id, model_type, status, feature_version, schema_version,
+                    eligibility_gate_version, training_mode, eligible_for_shadow,
+                    barrier_spec_id, artifact_path, metrics_json, created_at, promoted_at
              FROM model_registry ORDER BY created_at DESC",
         )?;
         statement
             .query_map([], |row| {
-                let metrics_json: String = row.get(5)?;
+                let metrics_json: String = row.get(10)?;
                 Ok(ModelRecord {
                     model_id: row.get(0)?,
                     model_type: row.get(1)?,
                     status: row.get(2)?,
                     feature_version: row.get(3)?,
-                    artifact_path: row.get(4)?,
+                    schema_version: row.get(4)?,
+                    eligibility_gate_version: row.get(5)?,
+                    training_mode: row.get(6)?,
+                    eligible_for_shadow: row.get(7)?,
+                    barrier_spec_id: row.get(8)?,
+                    artifact_path: row.get(9)?,
                     metrics: serde_json::from_str(&metrics_json).unwrap_or(serde_json::Value::Null),
-                    created_at: row.get(6)?,
-                    promoted_at: row.get(7)?,
+                    created_at: row.get(11)?,
+                    promoted_at: row.get(12)?,
                 })
             })?
             .collect()
@@ -555,11 +787,37 @@ impl Store {
                  FROM predictions p
                  WHERE p.origin_bar_timestamp IS NOT NULL
                    AND p.origin_close IS NOT NULL
+                   AND p.is_duplicate=0
                    AND EXISTS (
                      SELECT 1 FROM market_bars b
                      WHERE b.symbol=p.symbol
                        AND b.timeframe=p.timeframe
                        AND b.timestamp>p.origin_bar_timestamp
+                   )
+                   AND (
+                     EXISTS (
+                       SELECT 1
+                       FROM (
+                         SELECT 1 AS horizon_bars
+                         UNION ALL SELECT 3
+                         UNION ALL SELECT 6
+                         UNION ALL SELECT 12
+                       ) required
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM prediction_horizon_outcomes o
+                         WHERE o.prediction_id=p.prediction_id
+                           AND o.horizon_bars=required.horizon_bars
+                       )
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM prediction_horizon_outcomes o
+                       WHERE o.prediction_id=p.prediction_id
+                         AND o.horizon_bars=3
+                         AND (
+                           o.barrier_long_outcome IS NULL
+                           OR o.barrier_short_outcome IS NULL
+                         )
+                     )
                    )
                  ORDER BY p.origin_bar_timestamp",
             )?;
@@ -806,11 +1064,26 @@ impl Store {
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END),
                     COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome IN
+                      ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
+                    AVG(CASE
+                          WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                          WHEN o.barrier_outcome IN
+                            ('SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 0.0
+                        END),
+                    AVG(
+                      (p.direction_probability_up
+                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                      *
+                      (p.direction_probability_up
+                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                    )
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
              WHERE p.model_id != 'baseline-demo-v1'
                AND p.barrier_spec_id=?1
+               AND p.is_duplicate=0
                AND o.horizon_bars=3",
             [BARRIER_SPEC_ID],
             |row| {
@@ -822,6 +1095,10 @@ impl Store {
                     "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
                     "no_hit_samples": row.get::<_, i64>(5)?,
                     "ambiguous_samples": row.get::<_, i64>(6)?,
+                    "tp_first_within_horizon_samples": row.get::<_, i64>(7)?,
+                    "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(8)?,
+                    "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(4)?,
+                    "direction_brier": row.get::<_, Option<f64>>(9)?,
                 }))
             },
         )?;
@@ -834,10 +1111,25 @@ impl Store {
                               WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                             END),
                         COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                        COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                        COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                        COUNT(CASE WHEN o.barrier_outcome IN
+                          ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
+                        AVG(CASE
+                              WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                              WHEN o.barrier_outcome IN
+                                ('SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 0.0
+                            END),
+                        AVG(
+                          (p.direction_probability_up
+                           - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                          *
+                          (p.direction_probability_up
+                           - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                        )
                  FROM prediction_horizon_outcomes o
                  JOIN predictions p ON p.prediction_id=o.prediction_id
                  WHERE o.horizon_bars=3 AND p.barrier_spec_id=?1
+                   AND p.is_duplicate=0
                  GROUP BY p.model_id ORDER BY MAX(o.settled_at) DESC",
             )?;
             statement
@@ -851,18 +1143,23 @@ impl Store {
                         "tp_before_sl_rate": row.get::<_, Option<f64>>(5)?,
                         "no_hit_samples": row.get::<_, i64>(6)?,
                         "ambiguous_samples": row.get::<_, i64>(7)?,
+                        "tp_first_within_horizon_samples": row.get::<_, i64>(8)?,
+                        "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(9)?,
+                        "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(5)?,
+                        "direction_brier": row.get::<_, Option<f64>>(10)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         let current_model = connection.query_row(
             "WITH recent AS (
-               SELECT o.*
+               SELECT o.*, p.direction_probability_up
                FROM prediction_horizon_outcomes o
                JOIN predictions p ON p.prediction_id=o.prediction_id
                WHERE o.horizon_bars=3
                  AND p.model_id=?1
                  AND p.barrier_spec_id=?2
+                 AND p.is_duplicate=0
                ORDER BY o.origin_bar_timestamp DESC
                LIMIT 200
              )
@@ -875,7 +1172,21 @@ impl Store {
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END),
                     COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome IN
+                      ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
+                    AVG(CASE
+                          WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                          WHEN o.barrier_outcome IN
+                            ('SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 0.0
+                        END),
+                    AVG(
+                      (o.direction_probability_up
+                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                      *
+                      (o.direction_probability_up
+                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                    )
              FROM recent o",
             params![current_model_id, BARRIER_SPEC_ID],
             |row| {
@@ -888,6 +1199,10 @@ impl Store {
                     "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
                     "no_hit_samples": row.get::<_, i64>(5)?,
                     "ambiguous_samples": row.get::<_, i64>(6)?,
+                    "tp_first_within_horizon_samples": row.get::<_, i64>(7)?,
+                    "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(8)?,
+                    "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(4)?,
+                    "direction_brier": row.get::<_, Option<f64>>(9)?,
                 }))
             },
         )?;
@@ -902,13 +1217,28 @@ impl Store {
                           WHEN o.barrier_outcome='SL_FIRST' THEN 0.0
                         END),
                     COUNT(CASE WHEN o.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                    COUNT(CASE WHEN o.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                    COUNT(CASE WHEN o.barrier_outcome IN
+                      ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
+                    AVG(CASE
+                          WHEN o.barrier_outcome='TP_FIRST' THEN 1.0
+                          WHEN o.barrier_outcome IN
+                            ('SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 0.0
+                        END),
+                    AVG(
+                      (p.direction_probability_up
+                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                      *
+                      (p.direction_probability_up
+                       - CASE WHEN o.actual_return>=0.0 THEN 1.0 ELSE 0.0 END)
+                    )
              FROM prediction_horizon_outcomes o
              JOIN predictions p ON p.prediction_id=o.prediction_id
              WHERE o.horizon_bars=3
                AND p.model_id=?1
                AND p.generated_at>=?2
-               AND p.barrier_spec_id=?3",
+               AND p.barrier_spec_id=?3
+               AND p.is_duplicate=0",
             params![current_model_id, session_started_at_text, BARRIER_SPEC_ID],
             |row| {
                 Ok(serde_json::json!({
@@ -921,25 +1251,34 @@ impl Store {
                     "tp_before_sl_rate": row.get::<_, Option<f64>>(4)?,
                     "no_hit_samples": row.get::<_, i64>(5)?,
                     "ambiguous_samples": row.get::<_, i64>(6)?,
+                    "tp_first_within_horizon_samples": row.get::<_, i64>(7)?,
+                    "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(8)?,
+                    "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(4)?,
+                    "direction_brier": row.get::<_, Option<f64>>(9)?,
                 }))
             },
         )?;
         let forecast_barrier_by_side = {
             let mut statement = connection.prepare(
                 "WITH recent AS (
-                   SELECT o.barrier_long_outcome, o.barrier_short_outcome
+                   SELECT o.barrier_long_outcome, o.barrier_short_outcome,
+                          p.barrier_probability_long AS probability_long,
+                          p.barrier_probability_short AS probability_short
                    FROM prediction_horizon_outcomes o
                    JOIN predictions p ON p.prediction_id=o.prediction_id
                    WHERE o.horizon_bars=3
                      AND p.model_id=?1
                      AND p.barrier_spec_id=?2
+                     AND p.is_duplicate=0
                    ORDER BY o.origin_bar_timestamp DESC
                    LIMIT 200
                  ),
                  sides AS (
-                   SELECT 'LONG' AS side, barrier_long_outcome AS outcome FROM recent
+                   SELECT 'LONG' AS side, barrier_long_outcome AS outcome,
+                          probability_long AS probability FROM recent
                    UNION ALL
-                   SELECT 'SHORT' AS side, barrier_short_outcome AS outcome FROM recent
+                   SELECT 'SHORT' AS side, barrier_short_outcome AS outcome,
+                          probability_short AS probability FROM recent
                  )
                  SELECT side,
                         COUNT(outcome),
@@ -949,7 +1288,22 @@ impl Store {
                               WHEN outcome='SL_FIRST' THEN 0.0
                             END),
                         COUNT(CASE WHEN outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                        COUNT(CASE WHEN outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                        COUNT(CASE WHEN outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                        COUNT(CASE WHEN outcome IN
+                          ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
+                        AVG(CASE
+                              WHEN outcome='TP_FIRST' THEN 1.0
+                              WHEN outcome IN
+                                ('SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 0.0
+                            END),
+                        AVG(CASE
+                              WHEN outcome IN
+                                ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY')
+                              THEN
+                                (probability - CASE WHEN outcome='TP_FIRST' THEN 1.0 ELSE 0.0 END)
+                                *
+                                (probability - CASE WHEN outcome='TP_FIRST' THEN 1.0 ELSE 0.0 END)
+                            END)
                  FROM sides GROUP BY side ORDER BY side",
             )?;
             statement
@@ -961,6 +1315,142 @@ impl Store {
                         "tp_before_sl_rate": row.get::<_, Option<f64>>(3)?,
                         "no_hit_samples": row.get::<_, i64>(4)?,
                         "ambiguous_samples": row.get::<_, i64>(5)?,
+                        "tp_first_within_horizon_samples": row.get::<_, i64>(6)?,
+                        "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(7)?,
+                        "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(3)?,
+                        "brier_score": row.get::<_, Option<f64>>(8)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let barrier_calibration_bins = {
+            let mut statement = connection.prepare(
+                "WITH recent AS (
+                   SELECT o.barrier_long_outcome, o.barrier_short_outcome,
+                          p.barrier_probability_long AS probability_long,
+                          p.barrier_probability_short AS probability_short
+                   FROM prediction_horizon_outcomes o
+                   JOIN predictions p ON p.prediction_id=o.prediction_id
+                   WHERE o.horizon_bars=3
+                     AND p.model_id=?1
+                     AND p.barrier_spec_id=?2
+                     AND p.is_duplicate=0
+                   ORDER BY o.origin_bar_timestamp DESC
+                   LIMIT 200
+                 ),
+                 sides AS (
+                   SELECT 'LONG' AS side, barrier_long_outcome AS outcome,
+                          probability_long AS probability FROM recent
+                   UNION ALL
+                   SELECT 'SHORT' AS side, barrier_short_outcome AS outcome,
+                          probability_short AS probability FROM recent
+                 ),
+                 valid AS (
+                   SELECT side, outcome, probability,
+                          MIN(9, CAST(probability * 10.0 AS INTEGER)) AS bin_index,
+                          CASE WHEN outcome='TP_FIRST' THEN 1.0 ELSE 0.0 END AS observed
+                   FROM sides
+                   WHERE outcome IN
+                     ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY')
+                     AND probability IS NOT NULL
+                 )
+                 SELECT side, bin_index, COUNT(*), AVG(probability), AVG(observed),
+                        AVG((probability-observed)*(probability-observed))
+                 FROM valid
+                 GROUP BY side, bin_index
+                 ORDER BY side, bin_index",
+            )?;
+            statement
+                .query_map(params![current_model_id, BARRIER_SPEC_ID], |row| {
+                    Ok(serde_json::json!({
+                        "side": row.get::<_, String>(0)?,
+                        "bin_index": row.get::<_, i64>(1)?,
+                        "sample_size": row.get::<_, i64>(2)?,
+                        "mean_probability": row.get::<_, f64>(3)?,
+                        "observed_tp_rate": row.get::<_, f64>(4)?,
+                        "brier_score": row.get::<_, f64>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let calibration_sample_size = barrier_calibration_bins
+            .iter()
+            .filter_map(|bin| bin["sample_size"].as_i64())
+            .sum::<i64>();
+        let barrier_expected_calibration_error = if calibration_sample_size > 0 {
+            Some(
+                barrier_calibration_bins
+                    .iter()
+                    .map(|bin| {
+                        let samples = bin["sample_size"].as_i64().unwrap_or(0) as f64;
+                        let predicted = bin["mean_probability"].as_f64().unwrap_or(0.0);
+                        let observed = bin["observed_tp_rate"].as_f64().unwrap_or(0.0);
+                        samples * (predicted - observed).abs()
+                    })
+                    .sum::<f64>()
+                    / calibration_sample_size as f64,
+            )
+        } else {
+            None
+        };
+        let forecast_quality_by_horizon = {
+            let mut statement = connection.prepare(
+                "WITH recent_predictions AS (
+                   SELECT *
+                   FROM predictions
+                   WHERE model_id=?1 AND is_duplicate=0
+                   ORDER BY origin_bar_timestamp DESC
+                   LIMIT 200
+                 ),
+                 forecast_points AS (
+                   SELECT p.prediction_id,
+                          CAST(json_extract(point.value, '$.horizon_bars') AS INTEGER) AS horizon_bars,
+                          CAST(json_extract(point.value, '$.q10') AS REAL) AS q10,
+                          CAST(json_extract(point.value, '$.q50') AS REAL) AS q50,
+                          CAST(json_extract(point.value, '$.q90') AS REAL) AS q90
+                   FROM recent_predictions p, json_each(p.forecast_json, '$.points') point
+                 ),
+                 scored AS (
+                   SELECT o.horizon_bars, o.actual_return, o.interval_hit,
+                          o.error_metrics_json, fp.q10, fp.q50, fp.q90
+                   FROM prediction_horizon_outcomes o
+                   JOIN forecast_points fp
+                     ON fp.prediction_id=o.prediction_id
+                    AND fp.horizon_bars=o.horizon_bars
+                 )
+                 SELECT horizon_bars, COUNT(*), AVG(interval_hit), AVG(q90-q10),
+                        AVG(CASE WHEN actual_return>=q10
+                                 THEN 0.10*(actual_return-q10)
+                                 ELSE -0.90*(actual_return-q10) END),
+                        AVG(CASE WHEN actual_return>=q50
+                                 THEN 0.50*(actual_return-q50)
+                                 ELSE -0.50*(actual_return-q50) END),
+                        AVG(CASE WHEN actual_return>=q90
+                                 THEN 0.90*(actual_return-q90)
+                                 ELSE -0.10*(actual_return-q90) END),
+                        AVG(CASE
+                              WHEN horizon_bars!=3
+                                OR json_extract(error_metrics_json, '$.mae_error_usd') IS NULL
+                                THEN NULL
+                              WHEN CAST(json_extract(error_metrics_json, '$.mae_error_usd') AS REAL)>=0
+                                THEN 1.0
+                              ELSE 0.0
+                            END)
+                 FROM scored
+                 GROUP BY horizon_bars
+                 ORDER BY horizon_bars",
+            )?;
+            statement
+                .query_map([current_model_id], |row| {
+                    Ok(serde_json::json!({
+                        "horizon_bars": row.get::<_, i64>(0)?,
+                        "sample_size": row.get::<_, i64>(1)?,
+                        "interval_coverage": row.get::<_, Option<f64>>(2)?,
+                        "mean_interval_width_log_return": row.get::<_, Option<f64>>(3)?,
+                        "pinball_q10": row.get::<_, Option<f64>>(4)?,
+                        "pinball_q50": row.get::<_, Option<f64>>(5)?,
+                        "pinball_q90": row.get::<_, Option<f64>>(6)?,
+                        "mae_q90_coverage": row.get::<_, Option<f64>>(7)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -971,6 +1461,7 @@ impl Store {
                    SELECT p.prediction_id
                    FROM predictions p
                    WHERE p.model_id=?1 AND p.barrier_spec_id=?2
+                     AND p.is_duplicate=0
                    ORDER BY p.origin_bar_timestamp DESC
                    LIMIT 200
                  )
@@ -982,7 +1473,14 @@ impl Store {
                               WHEN po.barrier_outcome='SL_FIRST' THEN 0.0
                             END),
                         COUNT(CASE WHEN po.barrier_outcome='NO_HIT_BEFORE_EXPIRY' THEN 1 END),
-                        COUNT(CASE WHEN po.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END)
+                        COUNT(CASE WHEN po.barrier_outcome='AMBIGUOUS_SAME_BAR' THEN 1 END),
+                        COUNT(CASE WHEN po.barrier_outcome IN
+                          ('TP_FIRST','SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 1 END),
+                        AVG(CASE
+                              WHEN po.barrier_outcome='TP_FIRST' THEN 1.0
+                              WHEN po.barrier_outcome IN
+                                ('SL_FIRST','NO_HIT_BEFORE_EXPIRY') THEN 0.0
+                            END)
                  FROM prediction_proposal_outcomes po
                  JOIN recent_predictions rp ON rp.prediction_id=po.prediction_id
                  WHERE po.horizon_bars=3
@@ -997,6 +1495,9 @@ impl Store {
                         "tp_before_sl_rate": row.get::<_, Option<f64>>(3)?,
                         "no_hit_samples": row.get::<_, i64>(4)?,
                         "ambiguous_samples": row.get::<_, i64>(5)?,
+                        "tp_first_within_horizon_samples": row.get::<_, i64>(6)?,
+                        "tp_first_within_horizon_rate": row.get::<_, Option<f64>>(7)?,
+                        "tp_vs_sl_conditional_rate": row.get::<_, Option<f64>>(3)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -1007,6 +1508,9 @@ impl Store {
             "current_model": current_model,
             "current_session": current_session,
             "forecast_barrier_by_side": forecast_barrier_by_side,
+            "barrier_calibration_bins": barrier_calibration_bins,
+            "barrier_expected_calibration_error": barrier_expected_calibration_error,
+            "forecast_quality_by_horizon": forecast_quality_by_horizon,
             "proposal_outcomes_by_profile": proposal_outcomes_by_profile,
             "by_model": by_model,
             "target_coverage": 0.80,
@@ -1061,11 +1565,13 @@ async fn main() {
         PathBuf::from(env::var("XPDE_DB_PATH").unwrap_or_else(|_| "data/xpde.sqlite".to_owned()));
     let bind = env::var("XPDE_BIND").unwrap_or_else(|_| "127.0.0.1:8787".to_owned());
     let store = Arc::new(Store::open(&database_path).expect("failed to initialize SQLite"));
+    let policies = load_policy_set().expect("failed to load broker policy config");
     let runtime = demo_state();
     let state = AppState {
         store,
         runtime: Arc::new(RwLock::new(runtime)),
         started_at: Utc::now(),
+        policies,
     };
     tokio::spawn(settlement_loop(state.store.clone()));
 
@@ -1211,13 +1717,9 @@ async fn post_snapshot(
     let scalper = decide(
         &runtime.snapshot,
         &runtime.forecast,
-        &DecisionPolicy::scalper(),
+        &state.policies.scalper,
     );
-    let sniper = decide(
-        &runtime.snapshot,
-        &runtime.forecast,
-        &DecisionPolicy::sniper(),
-    );
+    let sniper = decide(&runtime.snapshot, &runtime.forecast, &state.policies.sniper);
     runtime.proposals = vec![scalper, sniper];
     Ok(StatusCode::ACCEPTED)
 }
@@ -1244,13 +1746,30 @@ async fn post_forecast(
         ));
     }
     let proposals = vec![
-        decide(&runtime.snapshot, &forecast, &DecisionPolicy::scalper()),
-        decide(&runtime.snapshot, &forecast, &DecisionPolicy::sniper()),
+        decide(&runtime.snapshot, &forecast, &state.policies.scalper),
+        decide(&runtime.snapshot, &forecast, &state.policies.sniper),
     ];
-    state
+    let inserted = state
         .store
         .save_prediction(&runtime.snapshot, &forecast, &proposals)
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !inserted
+        && let Some((saved_forecast, saved_proposals)) = state
+            .store
+            .prediction_for_contract(&runtime.snapshot, &forecast)
+            .map_err(|error| ApiError::internal(error.to_string()))?
+    {
+        runtime.forecast = saved_forecast;
+        runtime.proposals = saved_proposals;
+        runtime.updated_at = Utc::now();
+        runtime.forecast_status = forecast_status(
+            &runtime.snapshot,
+            &runtime.forecast,
+            runtime.safety.feed_is_demo,
+            runtime.updated_at,
+        );
+        return Ok(StatusCode::OK);
+    }
     runtime.forecast = forecast;
     runtime.proposals = proposals;
     runtime.updated_at = Utc::now();
@@ -1329,6 +1848,33 @@ async fn post_model_registration(
             "champion promotion requires a separate manual approval workflow",
         ));
     }
+    let gates_are_booleans = model
+        .eligibility_gates
+        .values()
+        .all(serde_json::Value::is_boolean);
+    let all_gates_passed = model
+        .eligibility_gates
+        .values()
+        .all(|value| value.as_bool() == Some(true));
+    if model.status != "retired"
+        && (model.schema_version != 3
+            || model.eligibility_gate_version < 2
+            || model.training_mode != "candidate"
+            || model.barrier_spec_id != "atr-1.25tp-1.00sl-h3-v1"
+            || model.eligibility_gates.is_empty()
+            || !gates_are_booleans)
+    {
+        return Err(ApiError::bad_request(
+            "active model registration requires a schema-v3 candidate with explicit eligibility gates",
+        ));
+    }
+    if (model.eligible_for_shadow && !all_gates_passed)
+        || (model.status == "challenger" && !model.eligible_for_shadow)
+    {
+        return Err(ApiError::bad_request(
+            "eligible or challenger registration requires all shadow eligibility gates to pass",
+        ));
+    }
     state
         .store
         .register_model(&model)
@@ -1392,20 +1938,20 @@ async fn public_runtime_state(state: &AppState) -> RuntimeState {
             .max(0) as u64;
         runtime.snapshot.data_quality.tick_age_ms =
             runtime.snapshot.data_quality.tick_age_ms.max(bridge_age_ms);
-        if runtime.snapshot.data_quality.tick_age_ms > DecisionPolicy::scalper().max_tick_age_ms {
+        if runtime.snapshot.data_quality.tick_age_ms > state.policies.scalper.max_tick_age_ms {
             runtime.connection_status = "MT5_STALE";
         }
         runtime.proposals = vec![
             decide_at(
                 &runtime.snapshot,
                 &runtime.forecast,
-                &DecisionPolicy::scalper(),
+                &state.policies.scalper,
                 now,
             ),
             decide_at(
                 &runtime.snapshot,
                 &runtime.forecast,
-                &DecisionPolicy::sniper(),
+                &state.policies.sniper,
                 now,
             ),
         ];
@@ -1483,6 +2029,8 @@ fn demo_state() -> RuntimeState {
             tick_value: 0.01,
             stops_level_points: 0,
             digits: 2,
+            margin_per_lot_buy: Some(3.34),
+            margin_per_lot_sell: Some(3.34),
         },
         data_quality: DataQuality {
             completeness: 1.0,

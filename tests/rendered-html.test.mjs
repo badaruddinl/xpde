@@ -27,12 +27,12 @@ test("server-renders the XPDE shadow terminal", async () => {
   assert.match(html, /Probabilitas naik 57\.0%/);
   assert.match(html, /Probabilitas turun 43\.0%/);
   assert.match(html, /Peluang arah dalam 3 bar \/ 15 menit/);
-  assert.match(html, /Forecast current dan model excursion diperlukan/);
+  assert.match(html, /Sisa reward dari harga entry tidak memadai/);
   assert.match(html, /Offline holdout coverage/);
   assert.match(html, /Live coverage · 200 prediksi terakhir/);
   assert.match(html, /Current runtime session · direction/);
   assert.match(html, /Retry realtime/);
-  assert.match(html, /Proposal TP before SL · .*SCALPER.* · 200 prediksi/);
+  assert.match(html, /Proposal TP dalam horizon · .*SCALPER.* · 200 prediksi/);
   assert.match(html, /Decision support only/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
 });

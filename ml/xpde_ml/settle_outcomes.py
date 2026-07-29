@@ -1,3 +1,9 @@
+"""Offline analysis/replay settlement.
+
+The Rust server is the canonical production settlement worker. Do not run this
+module alongside it as a second live writer.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -50,6 +56,11 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         ("origin_bar_timestamp", "TEXT"),
         ("origin_close", "REAL"),
         ("origin_bar_index", "INTEGER"),
+        ("feature_version", "TEXT"),
+        ("direction_probability_up", "REAL"),
+        ("barrier_probability_long", "REAL"),
+        ("barrier_probability_short", "REAL"),
+        ("is_duplicate", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if column not in prediction_columns:
             connection.execute(
@@ -114,6 +125,7 @@ def settle_with_report(database_path: Path) -> dict[str, int]:
         FROM predictions p
         WHERE p.origin_bar_timestamp IS NOT NULL
           AND p.origin_close IS NOT NULL
+          AND COALESCE(p.is_duplicate, 0)=0
         ORDER BY p.origin_bar_timestamp
         """
     ).fetchall()

@@ -11,6 +11,14 @@ $xuva = Join-Path $env:USERPROFILE ".local\bin\xuva.exe"
 $candidateDir = Join-Path $repoRoot "artifacts\catboost\latest"
 $requiredCandidateFiles = @(
     "checksums.sha256",
+    "manifest.json",
+    "evaluation.json",
+    "model_card.md",
+    "direction.cbm",
+    "quantile_h1.cbm",
+    "quantile_h3.cbm",
+    "quantile_h6.cbm",
+    "quantile_h12.cbm",
     "barrier_long_h3.cbm",
     "barrier_short_h3.cbm",
     "mfe_long_h3.cbm",
@@ -114,9 +122,19 @@ if ($existingBridge) {
             $requiredCandidateFiles |
                 Where-Object { -not (Test-Path -LiteralPath (Join-Path $candidateDir $_)) }
         ).Count -eq 0
+        $gateProperties = @($manifest.eligibility_gates.PSObject.Properties)
+        $allGatesPassed = (
+            $gateProperties.Count -gt 0 -and
+            @($gateProperties | Where-Object { $_.Value -ne $true }).Count -eq 0
+        )
         if (
             $manifest.eligible_for_shadow -eq $true -and
-            [int]$manifest.schema_version -ge 2 -and
+            [int]$manifest.schema_version -eq 3 -and
+            [int]$manifest.eligibility_gate_version -ge 2 -and
+            $manifest.training_mode -eq "candidate" -and
+            $manifest.barrier_spec.id -eq "atr-1.25tp-1.00sl-h3-v1" -and
+            [int]$manifest.barrier_spec.horizon_bars -eq 3 -and
+            $allGatesPassed -and
             $hasRequiredFiles
         ) {
             $bridgeArguments += @("--model-dir", $candidateDir)

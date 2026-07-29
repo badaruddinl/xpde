@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .contracts import HORIZONS, validate_snapshot
+from .contracts import HORIZONS, deterministic_prediction_id, validate_snapshot
 from .dataset import (
     BARRIER_HORIZON,
     BARRIER_SPEC_ID,
@@ -16,6 +15,23 @@ from .dataset import (
     barrier_prices,
     engineer_features,
     postprocess_quantiles,
+)
+
+REQUIRED_ARTIFACT_FILES = frozenset(
+    {
+        *(f"quantile_h{horizon}.cbm" for horizon in HORIZONS),
+        "direction.cbm",
+        "barrier_long_h3.cbm",
+        "barrier_short_h3.cbm",
+        "mfe_long_h3.cbm",
+        "mae_long_h3.cbm",
+        "mfe_short_h3.cbm",
+        "mae_short_h3.cbm",
+        "evaluation.json",
+        "model_card.md",
+        "manifest.json",
+        "checksums.sha256",
+    }
 )
 
 
@@ -55,7 +71,12 @@ def _calibrate_probability(value: float, calibration: dict[str, Any]) -> float:
 
 
 class CandidateModel:
-    def __init__(self, artifact_dir: Path):
+    def __init__(
+        self,
+        artifact_dir: Path,
+        *,
+        allow_ineligible_for_testing: bool = False,
+    ):
         try:
             import catboost
         except ImportError as error:
@@ -66,21 +87,52 @@ class CandidateModel:
         self.manifest = json.loads(
             (artifact_dir / "manifest.json").read_text(encoding="utf-8")
         )
-        if int(self.manifest.get("schema_version", 0)) < 2:
-            raise ValueError(
-                "artifact schema is incompatible; train an XPDE schema v2 candidate"
-            )
+        if int(self.manifest.get("schema_version", 0)) != 3:
+            raise ValueError("artifact schema is incompatible; schema v3 is required")
+        if int(self.manifest.get("eligibility_gate_version", 0)) < 2:
+            raise ValueError("artifact eligibility gate version is incompatible")
+        if (
+            not allow_ineligible_for_testing
+            and self.manifest.get("training_mode") != "candidate"
+        ):
+            raise ValueError("only candidate-mode artifacts can run in shadow")
+        if (
+            not allow_ineligible_for_testing
+            and self.manifest.get("eligible_for_shadow") is not True
+        ):
+            raise ValueError("artifact did not pass shadow eligibility")
+        eligibility_gates = self.manifest.get("eligibility_gates")
+        if not isinstance(eligibility_gates, dict) or not eligibility_gates:
+            raise ValueError("artifact eligibility gates are missing")
+        if not allow_ineligible_for_testing and not all(
+            value is True for value in eligibility_gates.values()
+        ):
+            raise ValueError("artifact contains a failed eligibility gate")
+        declared_files = self.manifest.get("artifact_files")
+        if set(declared_files or ()) != REQUIRED_ARTIFACT_FILES:
+            raise ValueError("artifact file declaration is incomplete or unexpected")
+        actual_files = {path.name for path in artifact_dir.iterdir() if path.is_file()}
+        if actual_files != REQUIRED_ARTIFACT_FILES:
+            raise ValueError("artifact directory does not match the required file set")
+        checked_files = {
+            line.partition("  ")[2]
+            for line in (artifact_dir / "checksums.sha256")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        }
+        if checked_files != REQUIRED_ARTIFACT_FILES - {"checksums.sha256"}:
+            raise ValueError("artifact checksum entries do not cover every required file")
         if self.manifest["feature_version"] != FEATURE_VERSION:
             raise ValueError("artifact feature version is incompatible")
         if tuple(self.manifest["feature_columns"]) != FEATURE_COLUMNS:
             raise ValueError("artifact feature columns are incompatible")
-        if int(self.manifest["schema_version"]) >= 3:
-            barrier_spec = self.manifest.get("barrier_spec", {})
-            if (
-                barrier_spec.get("id") != BARRIER_SPEC_ID
-                or int(barrier_spec.get("horizon_bars", 0)) != BARRIER_HORIZON
-            ):
-                raise ValueError("artifact barrier contract is incompatible")
+        barrier_spec = self.manifest.get("barrier_spec", {})
+        if (
+            barrier_spec.get("id") != BARRIER_SPEC_ID
+            or int(barrier_spec.get("horizon_bars", 0)) != BARRIER_HORIZON
+        ):
+            raise ValueError("artifact barrier contract is incompatible")
         self.quantile_models = {}
         for horizon in HORIZONS:
             model = catboost.CatBoostRegressor()
@@ -189,7 +241,14 @@ class CandidateModel:
         atr_24 = float(features.iloc[-1]["atr_24"])
         barriers = barrier_prices(origin.close, atr_24)
         return {
-            "prediction_id": str(uuid.uuid4()),
+            "prediction_id": deterministic_prediction_id(
+                model_id=self.model_id,
+                symbol=snapshot["symbol"],
+                timeframe=snapshot["timeframe"],
+                origin_bar_timestamp=origin.timestamp.isoformat().replace("+00:00", "Z"),
+                feature_version=FEATURE_VERSION,
+                barrier_spec_id=BARRIER_SPEC_ID,
+            ),
             "model_id": self.model_id,
             "feature_version": FEATURE_VERSION,
             "origin_bar_timestamp": origin.timestamp.isoformat().replace("+00:00", "Z"),

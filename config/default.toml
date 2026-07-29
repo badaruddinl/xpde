@@ -10,6 +10,7 @@ poll_interval_ms = 1000
 max_tick_age_ms = 10000
 
 [broker_profile]
+broker_policy_id = "goldm-demo-v1"
 instrument_name = "GOLD"
 asset_class = "Precious Metals"
 expected_leverage = 1000
@@ -18,15 +19,22 @@ minimum_lot = 0.1
 maximum_lot = 100.0
 minimum_price_fluctuation = 0.01
 advertised_min_spread_usd = 0.24
+commission_usd_per_lot = 0.0
 
 [policy.scalper]
 max_spread_usd = 0.80
+max_spread_atr_ratio = 0.50
 slippage_buffer_usd = 0.08
+max_entry_deviation_atr = 0.50
+min_reward_risk_ratio = 1.00
 min_direction_probability = 0.56
 min_barrier_probability = 0.52
 
 [policy.sniper]
 max_spread_usd = 0.55
+max_spread_atr_ratio = 0.35
 slippage_buffer_usd = 0.08
+max_entry_deviation_atr = 0.35
+min_reward_risk_ratio = 1.25
 min_direction_probability = 0.64
 min_barrier_probability = 0.60

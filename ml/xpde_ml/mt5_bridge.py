@@ -80,6 +80,22 @@ def build_snapshot(
         code, message = mt5.last_error()
         raise RuntimeError(f"MetaTrader5 snapshot failed ({code}): {message}")
 
+    margin_buy = None
+    margin_sell = None
+    order_calc_margin = getattr(mt5, "order_calc_margin", None)
+    if callable(order_calc_margin):
+        try:
+            margin_buy = order_calc_margin(
+                mt5.ORDER_TYPE_BUY, SYMBOL, 1.0, float(tick.ask)
+            )
+            margin_sell = order_calc_margin(
+                mt5.ORDER_TYPE_SELL, SYMBOL, 1.0, float(tick.bid)
+            )
+        except Exception:
+            # Some brokers do not expose margin calculation until the market is open.
+            margin_buy = None
+            margin_sell = None
+
     tick_time_ms = int(getattr(tick, "time_msc", int(tick.time * 1000)))
     clock = broker_clock or BrokerClock()
     missing_flags: list[str] = []
@@ -141,6 +157,16 @@ def build_snapshot(
             "tick_value": float(symbol.trade_tick_value),
             "stops_level_points": int(symbol.trade_stops_level),
             "digits": int(symbol.digits),
+            "margin_per_lot_buy": (
+                float(margin_buy)
+                if margin_buy is not None and float(margin_buy) > 0
+                else None
+            ),
+            "margin_per_lot_sell": (
+                float(margin_sell)
+                if margin_sell is not None and float(margin_sell) > 0
+                else None
+            ),
         },
         "data_quality": {
             "completeness": 1.0 if not missing_flags else 0.0,
@@ -157,7 +183,11 @@ def build_snapshot(
     }
 
 
-def post_payload(api_url: str, payload: dict[str, Any], expected_status: int = 202) -> None:
+def post_payload(
+    api_url: str,
+    payload: dict[str, Any],
+    expected_status: int | tuple[int, ...] = 202,
+) -> None:
     request = urllib.request.Request(
         api_url,
         data=json.dumps(payload).encode("utf-8"),
@@ -166,7 +196,10 @@ def post_payload(api_url: str, payload: dict[str, Any], expected_status: int = 2
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            if response.status != expected_status:
+            accepted_statuses = (
+                (expected_status,) if isinstance(expected_status, int) else expected_status
+            )
+            if response.status not in accepted_statuses:
                 body = response.read().decode("utf-8", errors="replace")
                 raise PayloadRejected(api_url, response.status, body)
     except urllib.error.HTTPError as error:
@@ -309,6 +342,8 @@ def main() -> None:
                 )
             print(f"XPDE candidate model loaded: {candidate.model_id}", flush=True)
         retry_delay = max(args.interval, 0.5)
+        pending_startup_forecast: dict[str, Any] | None = None
+        pending_startup_bar: str | None = None
         while True:
             try:
                 startup_snapshot = build_snapshot(mt5, broker_clock=broker_clock)
@@ -334,12 +369,21 @@ def main() -> None:
                     )
                 post_payload(args.api_url, startup_snapshot)
                 if not args.snapshot_only and not startup_had_gap:
-                    startup_forecast = (
-                        candidate.forecast(startup_snapshot)
-                        if candidate is not None
-                        else forecast_from_snapshot(startup_snapshot)
+                    if (
+                        pending_startup_forecast is None
+                        or pending_startup_bar != latest_completed_bar
+                    ):
+                        pending_startup_forecast = (
+                            candidate.forecast(startup_snapshot)
+                            if candidate is not None
+                            else forecast_from_snapshot(startup_snapshot)
+                        )
+                        pending_startup_bar = latest_completed_bar
+                    post_payload(
+                        args.forecast_url,
+                        pending_startup_forecast,
+                        expected_status=(200, 202),
                     )
-                    post_payload(args.forecast_url, startup_forecast)
                     print(
                         f"XPDE startup forecast posted for {latest_completed_bar}",
                         flush=True,
@@ -373,6 +417,8 @@ def main() -> None:
             startup_snapshot["ask"],
         )
         last_tick_change = time.monotonic()
+        pending_forecast: dict[str, Any] | None = None
+        pending_forecast_bar: str | None = None
         retry_delay = max(args.interval, 0.5)
         while True:
             try:
@@ -408,6 +454,8 @@ def main() -> None:
                         clock=broker_clock,
                     )
                     last_forecast_bar = latest_bar
+                    pending_forecast = None
+                    pending_forecast_bar = None
                     skipped_retroactive_forecast = True
                     print(
                         "XPDE recovered a downtime gap; historical bars were "
@@ -421,13 +469,21 @@ def main() -> None:
                     and not skipped_retroactive_forecast
                     and latest_bar != last_forecast_bar
                 ):
-                    forecast = (
-                        candidate.forecast(snapshot)
-                        if candidate is not None
-                        else forecast_from_snapshot(snapshot)
+                    if pending_forecast is None or pending_forecast_bar != latest_bar:
+                        pending_forecast = (
+                            candidate.forecast(snapshot)
+                            if candidate is not None
+                            else forecast_from_snapshot(snapshot)
+                        )
+                        pending_forecast_bar = latest_bar
+                    post_payload(
+                        args.forecast_url,
+                        pending_forecast,
+                        expected_status=(200, 202),
                     )
-                    post_payload(args.forecast_url, forecast)
                     last_forecast_bar = latest_bar
+                    pending_forecast = None
+                    pending_forecast_bar = None
             except (
                 PayloadRejected,
                 urllib.error.URLError,

@@ -4,14 +4,25 @@ import argparse
 import json
 import math
 import urllib.request
-import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import fmean
 from typing import Any
 
-from .contracts import HORIZONS, QUANTILES, Bar, validate_quantiles, validate_snapshot
-from .dataset import BARRIER_HORIZON, BARRIER_SPEC_ID, barrier_prices
+from .contracts import (
+    HORIZONS,
+    QUANTILES,
+    Bar,
+    deterministic_prediction_id,
+    validate_quantiles,
+    validate_snapshot,
+)
+from .dataset import (
+    BARRIER_HORIZON,
+    BARRIER_SPEC_ID,
+    FEATURE_VERSION,
+    barrier_prices,
+)
 from .features import log_returns, true_ranges
 
 
@@ -92,9 +103,16 @@ def forecast_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     origin_bar_index = int(origin.timestamp.timestamp() // 300)
 
     return {
-        "prediction_id": str(uuid.uuid4()),
+        "prediction_id": deterministic_prediction_id(
+            model_id="empirical-direct-baseline-v1",
+            symbol=snapshot["symbol"],
+            timeframe=snapshot["timeframe"],
+            origin_bar_timestamp=origin.timestamp.isoformat().replace("+00:00", "Z"),
+            feature_version=FEATURE_VERSION,
+            barrier_spec_id=BARRIER_SPEC_ID,
+        ),
         "model_id": "empirical-direct-baseline-v1",
-        "feature_version": "goldm-m5-v1",
+        "feature_version": FEATURE_VERSION,
         "origin_bar_timestamp": origin.timestamp.isoformat().replace("+00:00", "Z"),
         "origin_close": origin.close,
         "origin_bar_index": origin_bar_index,

@@ -153,10 +153,73 @@ def _pinball(y_true, y_pred, alpha: float) -> float:
     return float(np.mean(np.maximum(alpha * errors, (alpha - 1) * errors)))
 
 
+def _pinball_values(y_true, y_pred, alpha: float):
+    import numpy as np
+
+    errors = y_true - y_pred
+    return np.maximum(alpha * errors, (alpha - 1) * errors)
+
+
 def _brier(y_true, probabilities) -> float:
     import numpy as np
 
     return float(np.mean((probabilities - y_true) ** 2))
+
+
+def _finite_sample_conformal_quantile(scores, coverage: float = 0.80) -> float:
+    import numpy as np
+
+    values = np.asarray(scores, dtype=float)
+    if values.size == 0:
+        raise ValueError("conformal calibration requires at least one score")
+    quantile_level = min(1.0, np.ceil((values.size + 1) * coverage) / values.size)
+    return float(np.quantile(values, quantile_level, method="higher"))
+
+
+def _block_bootstrap_improvement_lcb(
+    loss_improvements,
+    *,
+    confidence: float = 0.95,
+    samples: int = 500,
+) -> float:
+    import numpy as np
+
+    values = np.asarray(loss_improvements, dtype=float)
+    if values.size < 20:
+        return float("-inf")
+    block_length = max(2, int(np.sqrt(values.size)))
+    block_starts = np.arange(0, values.size - block_length + 1)
+    rng = np.random.default_rng(42)
+    means = []
+    block_count = int(np.ceil(values.size / block_length))
+    for _ in range(samples):
+        starts = rng.choice(block_starts, size=block_count, replace=True)
+        sample = np.concatenate(
+            [values[start : start + block_length] for start in starts]
+        )[: values.size]
+        means.append(float(np.mean(sample)))
+    return float(np.quantile(means, 1.0 - confidence, method="higher"))
+
+
+def _validate_barrier_class_coverage(
+    frame,
+    label: str,
+    *,
+    side: str,
+    partition: str,
+    minimum_per_class: int,
+) -> None:
+    counts = frame[label].astype(int).value_counts().to_dict()
+    missing = {
+        class_id: int(counts.get(class_id, 0))
+        for class_id in (0, 1, 2)
+        if int(counts.get(class_id, 0)) < minimum_per_class
+    }
+    if missing:
+        raise ValueError(
+            f"{side} barrier {partition} class coverage is insufficient; "
+            f"required={minimum_per_class} per class, observed={missing}"
+        )
 
 
 def _fit_with_temporal_early_stopping(model, x, y):
@@ -244,6 +307,12 @@ def _register(url: str, manifest: dict[str, Any], artifact_path: Path) -> None:
         "model_type": "catboost_multi_quantile",
         "status": "candidate",
         "feature_version": manifest["feature_version"],
+        "schema_version": manifest["schema_version"],
+        "eligibility_gate_version": manifest["eligibility_gate_version"],
+        "training_mode": manifest["training_mode"],
+        "eligible_for_shadow": manifest["eligible_for_shadow"],
+        "barrier_spec_id": manifest["barrier_spec"]["id"],
+        "eligibility_gates": manifest["eligibility_gates"],
         "artifact_path": str(artifact_path.resolve()),
         "metrics": manifest["metrics"],
     }
@@ -329,6 +398,8 @@ def train(args) -> dict[str, Any]:
     conformal: dict[str, float] = {}
     holdout_metrics: dict[str, dict[str, float]] = {}
     baseline_metrics: dict[str, dict[str, float]] = {}
+    h3_loss_improvements = None
+    h3_baseline_interval_width = 0.0
 
     evaluation_frame = dataset.iloc[: calibration_slice.stop].reset_index(drop=True)
     evaluation_x = evaluation_frame[list(FEATURE_COLUMNS)]
@@ -403,7 +474,10 @@ def train(args) -> dict[str, Any]:
             calibration_prediction[:, 0] - calibration_truth,
             calibration_truth - calibration_prediction[:, 4],
         )
-        correction = float(np.quantile(np.maximum(nonconformity, 0.0), 0.80))
+        correction = _finite_sample_conformal_quantile(
+            np.maximum(nonconformity, 0.0),
+            coverage=0.80,
+        )
         conformal[str(horizon)] = correction
 
         holdout_prediction_raw = np.asarray(model.predict(x_holdout))
@@ -443,6 +517,28 @@ def train(args) -> dict[str, Any]:
             )
             for index, alpha in enumerate(QUANTILES)
         }
+        baseline_metrics[str(horizon)]["interval_width"] = float(
+            train_quantiles[4] - train_quantiles[0]
+        )
+        if horizon == BARRIER_HORIZON:
+            per_quantile_improvements = []
+            for index, alpha in enumerate(QUANTILES):
+                baseline_prediction = np.repeat(
+                    train_quantiles[index], len(holdout_truth)
+                )
+                per_quantile_improvements.append(
+                    _pinball_values(holdout_truth, baseline_prediction, alpha)
+                    - _pinball_values(
+                        holdout_truth,
+                        holdout_prediction[:, index],
+                        alpha,
+                    )
+                )
+            h3_loss_improvements = np.mean(
+                np.vstack(per_quantile_improvements),
+                axis=0,
+            )
+            h3_baseline_interval_width = float(train_quantiles[4] - train_quantiles[0])
         model.save_model(args.output / f"quantile_h{horizon}.cbm")
         quantile_models[horizon] = model
 
@@ -485,6 +581,19 @@ def train(args) -> dict[str, Any]:
         side_holdout = dataset.iloc[holdout_slice].dropna(subset=[label])
         if min(len(side_train), len(side_calibration), len(side_holdout)) < 50:
             raise ValueError(f"not enough resolved {side} barrier labels")
+        minimum_class_samples = 50 if training_mode == "candidate" else 2
+        for partition, frame in (
+            ("train", side_train),
+            ("calibration", side_calibration),
+            ("holdout", side_holdout),
+        ):
+            _validate_barrier_class_coverage(
+                frame,
+                label,
+                side=side,
+                partition=partition,
+                minimum_per_class=minimum_class_samples,
+            )
         side_model = _fit_barrier_classifier(
             CatBoostClassifier,
             side_train[list(FEATURE_COLUMNS)],
@@ -603,6 +712,61 @@ def train(args) -> dict[str, Any]:
         )
     )
     pinball_improvement = 1.0 - mean_pinball_model / mean_pinball_baseline
+    h3_model_pinball = float(
+        np.mean(
+            [
+                holdout_metrics[str(BARRIER_HORIZON)][
+                    f"pinball_q{int(alpha * 100)}"
+                ]
+                for alpha in QUANTILES
+            ]
+        )
+    )
+    h3_baseline_pinball = float(
+        np.mean(
+            [
+                baseline_metrics[str(BARRIER_HORIZON)][
+                    f"pinball_q{int(alpha * 100)}"
+                ]
+                for alpha in QUANTILES
+            ]
+        )
+    )
+    h3_pinball_improvement = 1.0 - h3_model_pinball / h3_baseline_pinball
+    h3_q50_improvement = 1.0 - (
+        holdout_metrics[str(BARRIER_HORIZON)]["pinball_q50"]
+        / baseline_metrics[str(BARRIER_HORIZON)]["pinball_q50"]
+    )
+    h3_tail_model = float(
+        np.mean(
+            [
+                holdout_metrics[str(BARRIER_HORIZON)]["pinball_q10"],
+                holdout_metrics[str(BARRIER_HORIZON)]["pinball_q90"],
+            ]
+        )
+    )
+    h3_tail_baseline = float(
+        np.mean(
+            [
+                baseline_metrics[str(BARRIER_HORIZON)]["pinball_q10"],
+                baseline_metrics[str(BARRIER_HORIZON)]["pinball_q90"],
+            ]
+        )
+    )
+    h3_tail_improvement = 1.0 - h3_tail_model / h3_tail_baseline
+    if h3_loss_improvements is None:
+        raise RuntimeError("h3 holdout loss improvements were not collected")
+    h3_bootstrap_lcb = _block_bootstrap_improvement_lcb(h3_loss_improvements)
+    h3_interval_width = holdout_metrics[str(BARRIER_HORIZON)]["interval_width"]
+    h3_interval_width_ok = (
+        math.isfinite(h3_interval_width)
+        and h3_interval_width > 0.0
+        and h3_interval_width <= 3.0 * max(h3_baseline_interval_width, 1e-12)
+    )
+    h3_fold_stability_ok = all(
+        fold["pinball_q50"] <= fold["baseline_pinball_q50"]
+        for fold in fold_metrics[str(BARRIER_HORIZON)]
+    )
     barrier_beats_baseline = all(
         metrics["tp_first_brier"] < metrics["baseline_tp_first_brier"]
         for metrics in barrier_metrics.values()
@@ -635,6 +799,12 @@ def train(args) -> dict[str, Any]:
         "minimum_candidate_rows": candidate_sample_ok,
         "dataset_integrity": dataset_integrity_ok,
         "mean_pinball_improvement": pinball_improvement >= 0.01,
+        "h3_mean_pinball_improvement": h3_pinball_improvement > 0.0,
+        "h3_q50_improvement": h3_q50_improvement > 0.0,
+        "h3_tail_improvement": h3_tail_improvement > 0.0,
+        "h3_interval_width": h3_interval_width_ok,
+        "h3_worst_fold": h3_fold_stability_ok,
+        "h3_block_bootstrap_lcb": h3_bootstrap_lcb > 0.0,
         "h3_coverage": 0.74 <= coverage_h3 <= 0.86,
         "direction_brier": (
             direction_metrics["brier"] <= direction_metrics["baseline_brier"]
@@ -654,7 +824,7 @@ def train(args) -> dict[str, Any]:
         "model_id": model_id,
         "status": "candidate",
         "eligible_for_shadow": eligible,
-        "eligibility_gate_version": 2,
+        "eligibility_gate_version": 3,
         "eligibility_gates": eligibility_gates,
         "training_mode": training_mode,
         "minimum_candidate_rows": minimum_candidate_rows,
@@ -728,6 +898,16 @@ def train(args) -> dict[str, Any]:
             "mean_pinball_model": mean_pinball_model,
             "mean_pinball_baseline": mean_pinball_baseline,
             "pinball_improvement": pinball_improvement,
+            "h3": {
+                "mean_pinball_model": h3_model_pinball,
+                "mean_pinball_baseline": h3_baseline_pinball,
+                "mean_pinball_improvement": h3_pinball_improvement,
+                "q50_improvement": h3_q50_improvement,
+                "tail_improvement": h3_tail_improvement,
+                "interval_width": h3_interval_width,
+                "baseline_interval_width": h3_baseline_interval_width,
+                "block_bootstrap_improvement_lcb_95": h3_bootstrap_lcb,
+            },
         },
     }
     artifact_files = [

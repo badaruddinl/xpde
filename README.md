@@ -16,9 +16,12 @@ records outcomes and feedback, then leaves the final decision to a human.
 - Purged walk-forward evaluation, conformal interval calibration, calibrated
   direction and symmetric LONG/SHORT barrier classifiers.
 - Exact prediction origin plus objective settlement for every 1/3/6/12-bar horizon.
+- Deterministic prediction IDs and a database uniqueness contract make retries idempotent.
 - Condition-dependent MFE/MAE models; lot preview remains disabled for the baseline.
-- Scalper and strict Sniper decision policies.
+- Scalper and strict Sniper policies use the current bid/ask, reject already-touched
+  barriers and require enough remaining reward/risk after costs.
 - Dynamic MT5 account and symbol specifications.
+- MT5 `order_calc_margin()` is authoritative for lot-preview margin when available.
 - SQLite WAL audit trail, prediction registry and outcome settlement.
 - Rust REST/WebSocket service bound to localhost.
 - Local dashboard with forecast interval, cost gate and feedback.
@@ -137,8 +140,9 @@ bars, train and register a CatBoost candidate:
 ```
 
 Every training run receives an immutable artifact directory. When its objective
-holdout gate passes, the launcher copies it to the local `latest` shadow slot and
-loads it on the next realtime bridge start. It remains registered as `candidate`;
+holdout gate passes, the artifact is loaded, exercised with a deterministic
+golden forecast, then atomically promoted to the local `latest` shadow slot.
+It remains registered as `candidate`;
 promotion to champion is deliberately manual and requires enough settled shadow
 predictions. Training artifacts and historical exports are local and ignored by
 Git.
@@ -163,7 +167,10 @@ manifest, runs Rust/Python/Next.js tests, trains the candidate, verifies artifac
 checksums and copies an immutable candidate folder plus ZIP back to Drive. The
 artifact records the Git commit, dirty state, runtime and dependency versions.
 
-Candidate schema v3 contains `evaluation.json`, `model_card.md`,
+Only candidate schema v3 is executable. Schema v2 artifacts belong under
+`artifacts/catboost/retired/`; the launcher and retry path fall back to the
+empirical baseline rather than loading one. Candidate schema v3 contains
+`evaluation.json`, `model_card.md`,
 `checksums.sha256`, quantile/direction/barrier models and dynamic MFE/MAE
 models. Import a downloaded Colab ZIP through the checked and immutable importer:
 
@@ -172,16 +179,27 @@ models. Import a downloaded Colab ZIP through the checked and immutable importer
   .\downloads\xpde-candidate.zip
 ```
 
-The importer validates the schema, feature and barrier contracts, verifies every
-checksum, refuses duplicate run IDs and only promotes eligible candidates to the
-local `latest` shadow slot. The bridge repeats checksum and contract validation
-before loading a candidate.
+The importer requires the exact artifact file set, validates the schema, feature,
+barrier and eligibility contracts, verifies every checksum, loads every model,
+runs a finite/non-crossing golden forecast, refuses duplicate run IDs and only
+promotes eligible candidates to the local `latest` shadow slot. Promotion uses
+staging plus rollback. The bridge repeats checksum and contract validation before
+loading a candidate.
 
 Forecast barrier evaluation and actionable proposal evaluation are intentionally
 separate. Every settled H3 forecast records counterfactual LONG and SHORT
 TP-before-SL outcomes using the exact forecast target/stop. SCALPER and SNIPER
 proposal outcomes are stored independently, so a `WAIT` decision does not erase
 forecast quality and a proposal metric never masquerades as model coverage.
+`tp_first_within_horizon_rate` includes no-hit outcomes in its denominator and is
+the metric comparable to the trained probability; `tp_vs_sl_conditional_rate`
+is reported separately. Live monitoring also exposes direction/barrier Brier,
+reliability bins, expected calibration error, and per-horizon coverage, width and
+pinball loss.
+
+Rust is the canonical production settlement implementation. The Python
+`xpde-settle` command is retained for offline analysis/replay and must not run as
+a second production settlement worker.
 
 Useful read-only endpoints:
 

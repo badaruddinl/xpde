@@ -41,6 +41,10 @@ pub struct SymbolSpec {
     pub tick_value: f64,
     pub stops_level_points: u32,
     pub digits: u32,
+    #[serde(default)]
+    pub margin_per_lot_buy: Option<f64>,
+    #[serde(default)]
+    pub margin_per_lot_sell: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -261,12 +265,25 @@ pub enum DecisionAction {
 pub struct DecisionProposal {
     pub prediction_id: Uuid,
     pub profile: TradingProfile,
+    #[serde(default)]
+    pub broker_policy_id: String,
     pub action: DecisionAction,
     pub generated_at: DateTime<Utc>,
     pub decision_valid_until: DateTime<Utc>,
     pub outcome_matures_at: DateTime<Utc>,
-    pub expected_edge_after_cost_usd: f64,
+    #[serde(alias = "expected_edge_after_cost_usd")]
+    pub median_move_after_cost_usd: f64,
     pub reference_lot: f64,
+    #[serde(default)]
+    pub reference_entry_price: Option<f64>,
+    #[serde(default)]
+    pub remaining_reward_usd: f64,
+    #[serde(default)]
+    pub remaining_risk_usd: f64,
+    #[serde(default)]
+    pub reward_risk_ratio: f64,
+    #[serde(default)]
+    pub entry_deviation_from_origin: f64,
     pub invalidation_price: Option<f64>,
     pub target_price: Option<f64>,
     pub reason_codes: Vec<String>,
@@ -276,6 +293,7 @@ pub struct DecisionProposal {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DecisionPolicy {
     pub profile: TradingProfile,
+    pub broker_policy_id: String,
     pub max_tick_age_ms: u64,
     pub max_spread_usd: f64,
     pub commission_usd_per_lot: f64,
@@ -284,12 +302,16 @@ pub struct DecisionPolicy {
     pub min_barrier_probability: f64,
     pub min_coverage: f64,
     pub max_coverage: f64,
+    pub max_entry_deviation_atr: f64,
+    pub min_reward_risk_ratio: f64,
+    pub max_spread_atr_ratio: f64,
 }
 
 impl DecisionPolicy {
     pub fn scalper() -> Self {
         Self {
             profile: TradingProfile::Scalper,
+            broker_policy_id: "goldm-demo-v1".to_owned(),
             max_tick_age_ms: 10_000,
             max_spread_usd: 0.80,
             commission_usd_per_lot: 0.0,
@@ -298,12 +320,16 @@ impl DecisionPolicy {
             min_barrier_probability: 0.52,
             min_coverage: 0.76,
             max_coverage: 0.84,
+            max_entry_deviation_atr: 0.50,
+            min_reward_risk_ratio: 1.0,
+            max_spread_atr_ratio: 0.50,
         }
     }
 
     pub fn sniper() -> Self {
         Self {
             profile: TradingProfile::Sniper,
+            broker_policy_id: "goldm-demo-v1".to_owned(),
             max_tick_age_ms: 5_000,
             max_spread_usd: 0.55,
             commission_usd_per_lot: 0.0,
@@ -312,6 +338,9 @@ impl DecisionPolicy {
             min_barrier_probability: 0.60,
             min_coverage: 0.77,
             max_coverage: 0.83,
+            max_entry_deviation_atr: 0.35,
+            min_reward_risk_ratio: 1.25,
+            max_spread_atr_ratio: 0.35,
         }
     }
 }
@@ -337,12 +366,18 @@ pub fn decide_at(
     let no_prediction = |reason: &str, decision_valid_until, outcome_matures_at| DecisionProposal {
         prediction_id: forecast.prediction_id,
         profile: policy.profile,
+        broker_policy_id: policy.broker_policy_id.clone(),
         action: DecisionAction::NoPrediction,
         generated_at,
         decision_valid_until,
         outcome_matures_at,
-        expected_edge_after_cost_usd: 0.0,
+        median_move_after_cost_usd: 0.0,
         reference_lot: snapshot.symbol_spec.volume_min,
+        reference_entry_price: None,
+        remaining_reward_usd: 0.0,
+        remaining_risk_usd: 0.0,
+        reward_risk_ratio: 0.0,
+        entry_deviation_from_origin: 0.0,
         invalidation_price: None,
         target_price: None,
         reason_codes: vec![reason.to_owned()],
@@ -460,19 +495,81 @@ pub fn decide_at(
         _ => unreachable!("selected side is always directional"),
     };
     let reference_lot = snapshot.symbol_spec.volume_min;
-    let expected_move_usd =
-        (forecast.origin_close * horizon.q50.exp() - forecast.origin_close).abs();
+    let reference_entry_price = match selected_side {
+        DecisionAction::Long => snapshot.ask,
+        DecisionAction::Short => snapshot.bid,
+        _ => unreachable!("selected side is always directional"),
+    };
+    let median_price = forecast.origin_close * horizon.q50.exp();
     let all_in_cost_usd = snapshot.spread_usd()
         + policy.slippage_buffer_usd
         + policy.commission_usd_per_lot / snapshot.symbol_spec.contract_size;
-    let edge_per_lot = (expected_move_usd - all_in_cost_usd) * snapshot.symbol_spec.contract_size;
-    let expected_edge = edge_per_lot * reference_lot;
+    let median_move_price = match selected_side {
+        DecisionAction::Long => median_price - reference_entry_price,
+        DecisionAction::Short => reference_entry_price - median_price,
+        _ => unreachable!("selected side is always directional"),
+    };
+    let median_move_after_cost =
+        (median_move_price - all_in_cost_usd) * snapshot.symbol_spec.contract_size * reference_lot;
+    let (remaining_reward_price, remaining_risk_price, entry_inside_barrier) = match selected_side {
+        DecisionAction::Long => (
+            target_price - reference_entry_price,
+            reference_entry_price - stop_price,
+            reference_entry_price < target_price && snapshot.bid > stop_price,
+        ),
+        DecisionAction::Short => (
+            reference_entry_price - target_price,
+            stop_price - reference_entry_price,
+            reference_entry_price > target_price && snapshot.ask < stop_price,
+        ),
+        _ => unreachable!("selected side is always directional"),
+    };
+    let remaining_reward_usd =
+        remaining_reward_price.max(0.0) * snapshot.symbol_spec.contract_size * reference_lot;
+    let remaining_risk_usd =
+        remaining_risk_price.max(0.0) * snapshot.symbol_spec.contract_size * reference_lot;
+    let reward_risk_ratio = if remaining_risk_usd > 0.0 {
+        remaining_reward_usd / remaining_risk_usd
+    } else {
+        0.0
+    };
+    let entry_deviation_from_origin = (reference_entry_price - forecast.origin_close).abs();
+    let inferred_atr = match selected_side {
+        DecisionAction::Long => (forecast.target_price_long - forecast.origin_close) / 1.25,
+        DecisionAction::Short => (forecast.origin_close - forecast.target_price_short) / 1.25,
+        _ => unreachable!("selected side is always directional"),
+    }
+    .max(snapshot.symbol_spec.tick_size);
+    let barrier_already_touched =
+        snapshot
+            .current_bar
+            .as_ref()
+            .is_some_and(|bar| match selected_side {
+                DecisionAction::Long => bar.high >= target_price || bar.low <= stop_price,
+                DecisionAction::Short => bar.low <= target_price || bar.high >= stop_price,
+                _ => false,
+            });
 
     let direction_ok = direction_probability >= policy.min_direction_probability;
     let barrier_ok = barrier_probability >= policy.min_barrier_probability;
 
-    if expected_edge <= 0.0 {
-        reasons.push("EDGE_TOO_SMALL_AFTER_COST".to_owned());
+    if barrier_already_touched {
+        reasons.push("BARRIER_ALREADY_TOUCHED".to_owned());
+    }
+    if !entry_inside_barrier {
+        reasons.push("ENTRY_PRICE_OUTSIDE_BARRIER".to_owned());
+    }
+    if entry_deviation_from_origin / inferred_atr > policy.max_entry_deviation_atr {
+        reasons.push("ENTRY_DEVIATION_TOO_LARGE".to_owned());
+    }
+    if snapshot.spread_usd() / inferred_atr > policy.max_spread_atr_ratio {
+        reasons.push("SPREAD_ABOVE_ATR_LIMIT".to_owned());
+    }
+    if median_move_after_cost <= 0.0
+        || remaining_reward_price <= all_in_cost_usd
+        || reward_risk_ratio < policy.min_reward_risk_ratio
+    {
+        reasons.push("REMAINING_EDGE_TOO_SMALL".to_owned());
     }
     if !direction_ok {
         reasons.push("DIRECTION_PROBABILITY_TOO_LOW".to_owned());
@@ -503,12 +600,18 @@ pub fn decide_at(
     DecisionProposal {
         prediction_id: forecast.prediction_id,
         profile: policy.profile,
+        broker_policy_id: policy.broker_policy_id.clone(),
         action,
         generated_at,
         decision_valid_until,
         outcome_matures_at,
-        expected_edge_after_cost_usd: expected_edge,
+        median_move_after_cost_usd: median_move_after_cost,
         reference_lot,
+        reference_entry_price: Some(reference_entry_price),
+        remaining_reward_usd,
+        remaining_risk_usd,
+        reward_risk_ratio,
+        entry_deviation_from_origin,
         invalidation_price: invalidation,
         target_price: target,
         reason_codes: reasons,
@@ -619,6 +722,8 @@ mod tests {
                 tick_value: 0.01,
                 stops_level_points: 0,
                 digits: 2,
+                margin_per_lot_buy: Some(3.34),
+                margin_per_lot_sell: Some(3.34),
             },
             data_quality: DataQuality {
                 completeness: 1.0,
@@ -680,7 +785,7 @@ mod tests {
             &DecisionPolicy::scalper(),
         );
         assert_eq!(decision.action, DecisionAction::Long);
-        assert!(decision.expected_edge_after_cost_usd > 0.0);
+        assert!(decision.median_move_after_cost_usd > 0.0);
         assert!(
             decision
                 .risk_warnings
@@ -714,6 +819,10 @@ mod tests {
         let decision = decide(&sample_snapshot(), &forecast, &DecisionPolicy::scalper());
         assert_eq!(decision.target_price, Some(forecast.target_price_long));
         assert_eq!(decision.invalidation_price, Some(forecast.stop_price_long));
+        assert_eq!(decision.reference_entry_price, Some(sample_snapshot().ask));
+        assert!(decision.remaining_reward_usd > 0.0);
+        assert!(decision.remaining_risk_usd > 0.0);
+        assert!(decision.reward_risk_ratio >= 1.0);
         assert_eq!(
             decision.decision_valid_until,
             forecast.origin_bar_timestamp + chrono::Duration::minutes(10)
@@ -721,6 +830,42 @@ mod tests {
         assert_eq!(
             decision.outcome_matures_at,
             forecast.origin_bar_timestamp + chrono::Duration::minutes(20)
+        );
+    }
+
+    #[test]
+    fn touched_barrier_forces_wait_before_entry() {
+        let forecast = sample_forecast();
+        let mut snapshot = sample_snapshot();
+        snapshot.current_bar = Some(MarketBar {
+            timestamp: snapshot.timestamp,
+            open: forecast.origin_close,
+            high: forecast.target_price_long,
+            low: forecast.origin_close,
+            close: forecast.origin_close,
+            tick_volume: 10.0,
+        });
+        let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+        assert_eq!(decision.action, DecisionAction::Wait);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"BARRIER_ALREADY_TOUCHED".to_owned())
+        );
+    }
+
+    #[test]
+    fn consumed_remaining_reward_forces_wait() {
+        let forecast = sample_forecast();
+        let mut snapshot = sample_snapshot();
+        snapshot.ask = forecast.target_price_long - 0.01;
+        snapshot.bid = snapshot.ask - 0.24;
+        let decision = decide(&snapshot, &forecast, &DecisionPolicy::scalper());
+        assert_eq!(decision.action, DecisionAction::Wait);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"REMAINING_EDGE_TOO_SMALL".to_owned())
         );
     }
 

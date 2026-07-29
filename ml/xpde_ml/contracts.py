@@ -3,6 +3,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+import uuid
+
+PREDICTION_ID_NAMESPACE = uuid.UUID("dfe13b8f-5417-4c25-9af5-80a03f41ce5f")
+
+
+def deterministic_prediction_id(
+    *,
+    model_id: str,
+    symbol: str,
+    timeframe: str,
+    origin_bar_timestamp: str,
+    feature_version: str,
+    barrier_spec_id: str,
+) -> str:
+    key = "|".join(
+        (
+            model_id,
+            symbol,
+            timeframe,
+            origin_bar_timestamp,
+            feature_version,
+            barrier_spec_id,
+        )
+    )
+    return str(uuid.uuid5(PREDICTION_ID_NAMESPACE, key))
 
 SUPPORTED_SYMBOL = "GOLDm#"
 SUPPORTED_TIMEFRAME = "M5"

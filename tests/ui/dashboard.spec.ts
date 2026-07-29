@@ -18,7 +18,7 @@ async function keepDemoFixture(page: Page) {
 
 test("desktop renders forecast contract and has no serious accessibility violations", async ({
   page,
-}, testInfo) => {
+}) => {
   await keepDemoFixture(page);
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto("/");
@@ -37,9 +37,11 @@ test("desktop renders forecast contract and has no serious accessibility violati
       ["serious", "critical"].includes(violation.impact ?? ""),
     ),
   ).toEqual([]);
-  await page.screenshot({
+  await expect(page).toHaveScreenshot("xpde-desktop.png", {
+    animations: "disabled",
+    caret: "hide",
     fullPage: true,
-    path: testInfo.outputPath("xpde-desktop.png"),
+    maxDiffPixelRatio: 0.02,
   });
 });
 
@@ -59,4 +61,10 @@ test("mobile keeps decision proposal before the forecast chart", async ({ page }
   expect(decisionBox).not.toBeNull();
   expect(chartBox).not.toBeNull();
   expect(decisionBox!.y).toBeLessThan(chartBox!.y);
+  await expect(page).toHaveScreenshot("xpde-mobile.png", {
+    animations: "disabled",
+    caret: "hide",
+    fullPage: true,
+    maxDiffPixelRatio: 0.02,
+  });
 });
