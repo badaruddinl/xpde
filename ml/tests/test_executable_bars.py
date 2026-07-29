@@ -4,10 +4,12 @@ from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
+from xpde_ml.contracts import has_complete_executable_feature_window
 from xpde_ml.executable_bars import (
     ExecutableBarTracker,
     aggregate_executable_ticks,
     collect_executable_bars,
+    overlay_executable_bars,
 )
 from xpde_ml.mt5_bridge import (
     MarketCalendar,
@@ -121,7 +123,12 @@ def test_tracker_overlap_keeps_distinct_quotes_with_the_same_millisecond() -> No
 
     class Mt5:
         COPY_TICKS_ALL = 0
+        TIMEFRAME_M5 = 5
         calls = 0
+
+        @staticmethod
+        def copy_rates_from_pos(*_args):
+            return [{"time": base / 1000}]
 
         def copy_ticks_range(self, *_args):
             self.calls += 1
@@ -166,7 +173,12 @@ def test_tracker_recounts_raw_ticks_instead_of_freezing_count_on_overlap() -> No
 
     class Mt5:
         COPY_TICKS_ALL = 0
+        TIMEFRAME_M5 = 5
         calls = 0
+
+        @staticmethod
+        def copy_rates_from_pos(*_args):
+            return [{"time": base / 1000}]
 
         def copy_ticks_range(self, *_args):
             self.calls += 1
@@ -213,7 +225,12 @@ def test_tracker_recounts_previous_bucket_after_m5_rollover() -> None:
 
     class Mt5:
         COPY_TICKS_ALL = 0
+        TIMEFRAME_M5 = 5
         calls = 0
+
+        @staticmethod
+        def copy_rates_from_pos(*_args):
+            return [{"time": base / 1000}]
 
         def copy_ticks_range(self, *_args):
             self.calls += 1
@@ -250,15 +267,25 @@ def test_tracker_recounts_previous_bucket_after_m5_rollover() -> None:
     assert tracker.bars["2026-07-29T10:05:00Z"]["executable_tick_count"] == 1
 
 
-def test_tracker_rehydrates_retention_window_when_cache_is_empty() -> None:
-    now = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
+def test_tracker_rehydrates_from_completed_trading_bars_after_weekend() -> None:
+    now = datetime(2026, 8, 2, 23, 10, tzinfo=UTC)
+    oldest_completed = datetime(2026, 7, 31, 17, 45, tzinfo=UTC)
 
     class Mt5:
         COPY_TICKS_ALL = 0
-        requested_start = None
+        TIMEFRAME_M5 = 5
+        requested_starts = []
+        requested_count = None
+
+        def copy_rates_from_pos(self, _symbol, _timeframe, _start, count):
+            self.requested_count = count
+            return [
+                {"time": (oldest_completed + timedelta(minutes=5 * index)).timestamp()}
+                for index in range(count)
+            ]
 
         def copy_ticks_range(self, _symbol, start, _end, _mode):
-            self.requested_start = start
+            self.requested_starts.append(start)
             return []
 
         @staticmethod
@@ -275,7 +302,181 @@ def test_tracker_rehydrates_retention_window_when_cache_is_empty() -> None:
         now_epoch=now.timestamp(),
     )
 
-    assert mt5.requested_start == now - timedelta(hours=2)
+    assert mt5.requested_count == 24
+    assert mt5.requested_starts[0] == oldest_completed
+
+
+def test_tracker_rehydrates_stale_non_empty_cache_after_twelve_hour_gap() -> None:
+    stale = datetime(2026, 7, 29, 7, 0, tzinfo=UTC)
+    now = datetime(2026, 7, 29, 19, 0, tzinfo=UTC)
+    oldest_completed = now - timedelta(hours=6)
+
+    class Mt5:
+        COPY_TICKS_ALL = 0
+        TIMEFRAME_M5 = 5
+        history_calls = 0
+        requested_starts = []
+
+        def copy_rates_from_pos(self, *_args):
+            self.history_calls += 1
+            return [{"time": oldest_completed.timestamp()}]
+
+        def copy_ticks_range(self, _symbol, start, _end, _mode):
+            self.requested_starts.append(start)
+            tick_time = int(oldest_completed.timestamp() * 1000)
+            return [
+                {"time_msc": tick_time, "bid": 4000.0, "ask": 4000.2},
+            ]
+
+        @staticmethod
+        def last_error():
+            return 0, "ok"
+
+    tracker = ExecutableBarTracker(retention_bars=64)
+    stale_msc = int(stale.timestamp() * 1000)
+    tracker.last_tick_msc = stale_msc
+    tracker.bars[stale.isoformat().replace("+00:00", "Z")] = {
+        "timestamp": stale.isoformat().replace("+00:00", "Z"),
+        "bid_open": 3900.0,
+        "bid_high": 3900.0,
+        "bid_low": 3900.0,
+        "bid_close": 3900.0,
+        "ask_open": 3900.2,
+        "ask_high": 3900.2,
+        "ask_low": 3900.2,
+        "ask_close": 3900.2,
+        "executable_tick_count": 1,
+        "first_tick_msc": stale_msc,
+        "last_tick_msc": stale_msc,
+        "_tick_path": [[stale_msc, 3900.0, 3900.2]],
+    }
+    mt5 = Mt5()
+
+    tracker.refresh(
+        mt5,
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=now.timestamp(),
+    )
+
+    assert mt5.history_calls == 1
+    assert mt5.requested_starts[0] == oldest_completed
+    assert stale.isoformat().replace("+00:00", "Z") in tracker.bars
+    assert oldest_completed.isoformat().replace("+00:00", "Z") in tracker.bars
+
+
+def test_weekend_rehydration_restores_complete_executable_feature_window() -> None:
+    oldest = datetime(2026, 7, 31, 20, 0, tzinfo=UTC)
+    now = datetime(2026, 8, 2, 23, 10, tzinfo=UTC)
+    chart_rates = [
+        {
+            "time": (oldest + timedelta(minutes=5 * index)).timestamp(),
+            "open": 4000.0 + index,
+            "high": 4000.0 + index,
+            "low": 4000.0 + index,
+            "close": 4000.0 + index,
+            "tick_volume": 1,
+        }
+        for index in range(24)
+    ]
+    ticks = [
+        {
+            "time_msc": int(rate["time"] * 1000) + 1_000,
+            "bid": rate["close"],
+            "ask": rate["close"] + 0.2,
+        }
+        for rate in chart_rates
+    ]
+
+    class Mt5:
+        COPY_TICKS_ALL = 0
+        TIMEFRAME_M5 = 5
+
+        @staticmethod
+        def copy_rates_from_pos(*_args):
+            return chart_rates
+
+        @staticmethod
+        def copy_ticks_range(_symbol, start, end, _mode):
+            return [
+                tick
+                for tick in ticks
+                if start.timestamp() * 1000
+                <= tick["time_msc"]
+                <= end.timestamp() * 1000
+            ]
+
+        @staticmethod
+        def last_error():
+            return 0, "ok"
+
+    tracker = ExecutableBarTracker(retention_bars=24)
+    tracker.refresh(
+        Mt5(),
+        symbol="GOLDm#",
+        clock=BrokerClock(),
+        now_epoch=now.timestamp(),
+    )
+    chart_bars = [
+        {
+            "timestamp": BrokerClock().iso_utc(rate["time"]),
+            "tick_volume": rate["tick_volume"],
+        }
+        for rate in chart_rates
+    ]
+    hydrated = overlay_executable_bars(chart_bars, tracker.bars)
+
+    assert len(tracker.bars) == 24
+    assert has_complete_executable_feature_window(hydrated)
+
+
+def test_catchup_hydrates_tracker_memory_without_replacing_broader_path() -> None:
+    start = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
+    tracker = ExecutableBarTracker(retention_bars=24)
+    bars = []
+    for index in range(24):
+        timestamp = start + timedelta(minutes=5 * index)
+        first = int(timestamp.timestamp() * 1000)
+        bars.append(
+            {
+                "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+                "bid_open": 4000.0 + index,
+                "bid_high": 4000.1 + index,
+                "bid_low": 4000.0 + index,
+                "bid_close": 4000.1 + index,
+                "ask_open": 4000.2 + index,
+                "ask_high": 4000.3 + index,
+                "ask_low": 4000.2 + index,
+                "ask_close": 4000.3 + index,
+                "executable_tick_count": 100,
+                "first_tick_msc": first,
+                "last_tick_msc": first + 299_000,
+                "executable_tick_path": [
+                    [first, 4000.0 + index, 4000.2 + index],
+                    [first + 299_000, 4000.1 + index, 4000.3 + index],
+                ],
+            }
+        )
+
+    tracker.ingest_completed_bars(bars)
+
+    assert len(tracker.bars) == 24
+    assert tracker.last_tick_msc == bars[-1]["last_tick_msc"]
+    assert all("_tick_path" in bar for bar in tracker.bars.values())
+    first_timestamp = str(bars[0]["timestamp"])
+    narrower = {
+        **bars[0],
+        "bid_high": bars[0]["bid_open"],
+        "bid_close": bars[0]["bid_open"],
+        "ask_high": bars[0]["ask_open"],
+        "ask_close": bars[0]["ask_open"],
+        "executable_tick_count": 1,
+        "last_tick_msc": bars[0]["first_tick_msc"],
+        "executable_tick_path": [bars[0]["executable_tick_path"][0]],
+    }
+    tracker.ingest_completed_bars([narrower])
+    assert tracker.bars[first_timestamp]["executable_tick_count"] == 100
+    assert tracker.bars[first_timestamp]["last_tick_msc"] == bars[0]["last_tick_msc"]
 
 
 def test_historical_chunk_overlap_never_regresses_the_tick_cursor() -> None:

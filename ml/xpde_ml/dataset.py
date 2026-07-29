@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from itertools import groupby
 import json
 
-from .contracts import HORIZONS
+from .contracts import HORIZONS, MINIMUM_EXECUTABLE_TICK_COVERAGE
 
 FEATURE_VERSION = "goldm-m5-v5"
 FEATURE_COLUMNS = (
@@ -57,7 +57,6 @@ EXECUTABLE_SIDE_CONTRACT_ID = (
     "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5"
 )
 LABEL_CONTRACT_ID = "exact-contiguous-m5-horizons-v1"
-MINIMUM_EXECUTABLE_TICK_COVERAGE = 0.95
 BARRIER_TP_ATR_MULTIPLIER = 1.25
 BARRIER_SL_ATR_MULTIPLIER = 1.0
 BARRIER_CLASS = {

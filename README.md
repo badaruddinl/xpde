@@ -43,6 +43,11 @@ records outcomes and feedback, then leaves the final decision to a human.
 - Realtime collection recounts the current and previous M5 bucket from
   authoritative raw ticks on every refresh. Overlap is never approximated from
   the compact price-change path, so executable tick coverage cannot freeze.
+- Empty, stale or underfilled tracker memory is rehydrated from the timestamps
+  of the latest 64 completed trading bars rather than a wall-clock lookback.
+  Catch-up paths also hydrate inference memory, and the candidate remains
+  fail-closed until its latest 24 completed bars have finite Bid/Ask closes with
+  at least 95% executable tick coverage.
 - Settlement verifies every expected M5 bucket, path metadata and completed-path
   source. Missing or partial windows remain `TICK_PATH_INCOMPLETE` or
   `SESSION_INTERRUPTED`; they can never become a false no-hit or enter
@@ -254,8 +259,10 @@ models. Import a downloaded Colab ZIP through the checked and immutable importer
 
 The importer requires the exact artifact file set, validates the schema, feature,
 barrier, executable-side and eligibility contracts, verifies every checksum,
-loads every model, runs a finite/non-crossing golden forecast, refuses duplicate
-run IDs and only promotes eligible candidates to the local `latest` shadow slot.
+loads every model, runs a finite/non-crossing golden forecast with a complete
+500-bar executable Bid/Ask history and the artifact's immutable broker tick size,
+refuses duplicate run IDs and only promotes eligible candidates to the local
+`latest` shadow slot.
 Promotion uses staging plus rollback. The importer registers the candidate when
 the core is available; otherwise the bridge registers it when it is loaded.
 The bridge repeats checksum and contract validation before loading a candidate.

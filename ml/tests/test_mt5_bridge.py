@@ -3,16 +3,19 @@ from __future__ import annotations
 import io
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from xpde_ml.contracts import has_complete_executable_feature_window
 from xpde_ml.mt5_bridge import (
     PayloadRejected,
+    RECOVERABLE_BRIDGE_ERRORS,
     completed_bar_distance,
     fetch_catchup_bars,
     forecast_envelope_matures_at,
     forecast_generation_delay_ms,
+    forecast_with_candidate,
     has_complete_tick_coverage,
     market_session_covers_forecast_envelope,
     next_retry_delay,
@@ -50,6 +53,50 @@ def test_live_tick_coverage_requires_at_least_ninety_five_percent() -> None:
     bar["executable_tick_count"] = 95
     assert has_complete_tick_coverage(bar)
     assert not has_complete_tick_coverage({"tick_volume": 0, "executable_tick_count": 10})
+
+
+def test_executable_feature_window_requires_24_finite_covered_bid_ask_bars() -> None:
+    start = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+    bars = [
+        {
+            "timestamp": (start + timedelta(minutes=5 * index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "bid_close": 4000.0 + index,
+            "ask_close": 4000.2 + index,
+            "tick_volume": 100,
+            "executable_tick_count": 100,
+        }
+        for index in range(24)
+    ]
+
+    assert has_complete_executable_feature_window(bars)
+    assert has_complete_executable_feature_window(list(reversed(bars)))
+    assert not has_complete_executable_feature_window(bars[:-1])
+    bars[-1]["timestamp"] = bars[-2]["timestamp"]
+    assert not has_complete_executable_feature_window(bars)
+    bars[-1]["timestamp"] = (
+        start + timedelta(minutes=5 * 23)
+    ).isoformat().replace("+00:00", "Z")
+    bars[-1]["executable_tick_count"] = 94
+    assert not has_complete_executable_feature_window(bars)
+    bars[-1]["executable_tick_count"] = 100
+    bars[-1]["ask_close"] = float("nan")
+    assert not has_complete_executable_feature_window(bars)
+
+
+def test_candidate_value_error_is_wrapped_without_masking_other_value_errors() -> None:
+    class Candidate:
+        @staticmethod
+        def forecast(_snapshot):
+            raise ValueError("latest feature row is incomplete")
+
+    with pytest.raises(RuntimeError, match="candidate inference rejected"):
+        forecast_with_candidate({}, Candidate())
+
+    assert ValueError not in RECOVERABLE_BRIDGE_ERRORS
+    assert KeyboardInterrupt not in RECOVERABLE_BRIDGE_ERRORS
+    assert SystemExit not in RECOVERABLE_BRIDGE_ERRORS
 
 
 def test_forecast_retry_accepts_already_accepted_response(

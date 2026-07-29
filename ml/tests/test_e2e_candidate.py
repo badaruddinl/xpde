@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import hashlib
+import importlib.util
 import json
 import os
+from pathlib import Path
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -15,6 +18,17 @@ pytest.importorskip("catboost")
 from xpde_ml.dataset import BARRIER_SPEC_ID, LABEL_CONTRACT_ID, build_training_frame
 from xpde_ml.model_inference import CandidateModel
 from xpde_ml.train_catboost import train
+
+IMPORT_SCRIPT = (
+    Path(__file__).resolve().parents[2] / "scripts" / "import-colab-artifact.py"
+)
+IMPORT_SPEC = importlib.util.spec_from_file_location(
+    "xpde_real_import_colab_artifact",
+    IMPORT_SCRIPT,
+)
+assert IMPORT_SPEC and IMPORT_SPEC.loader
+importer = importlib.util.module_from_spec(IMPORT_SPEC)
+IMPORT_SPEC.loader.exec_module(importer)
 
 
 pytestmark = pytest.mark.skipif(
@@ -129,17 +143,55 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
                 "tick_volume": row.tick_volume,
                 "bid_close": row.bid_close,
                 "ask_close": row.ask_close,
+                "executable_tick_count": int(row.tick_volume),
             }
             for row in latest.itertuples(index=False)
         ],
     }
-    forecast = CandidateModel(
+    candidate = CandidateModel(
         output,
         allow_ineligible_for_testing=True,
-    ).forecast(snapshot)
+    )
+    forecast = candidate.forecast(snapshot)
     assert forecast["model_id"] == manifest["model_id"]
     assert forecast["barrier_spec_id"] == BARRIER_SPEC_ID
     assert forecast["barrier_horizon_bars"] == 3
     assert forecast["stop_price_long"] < forecast["origin_close"]
     assert forecast["target_price_long"] > forecast["origin_close"]
     assert len(forecast["points"]) == 4
+    reordered_snapshot = {**snapshot, "bars": list(reversed(snapshot["bars"]))}
+    reordered_forecast = candidate.forecast(reordered_snapshot)
+    assert reordered_forecast["origin_close"] == forecast["origin_close"]
+    assert reordered_forecast["points"] == forecast["points"]
+    incomplete_snapshot = copy.deepcopy(snapshot)
+    incomplete_snapshot["bars"][-24].pop("ask_close")
+    with pytest.raises(ValueError, match="executable feature window requires 24"):
+        candidate.forecast(incomplete_snapshot)
+
+    # Exercise the production importer with real CatBoost model files. The
+    # synthetic training run uses smoke eligibility by design, so promote its
+    # otherwise valid artifact only inside this isolated integration fixture.
+    manifest["training_mode"] = "candidate"
+    manifest["eligible_for_shadow"] = True
+    manifest["eligibility_gates"] = {
+        name: True for name in manifest["eligibility_gates"]
+    }
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    checksums = []
+    for filename in sorted(importer.REQUIRED_ARTIFACT_FILES - {"checksums.sha256"}):
+        digest = hashlib.sha256((output / filename).read_bytes()).hexdigest()
+        checksums.append(f"{digest}  {filename}")
+    (output / "checksums.sha256").write_text(
+        "\n".join(checksums) + "\n",
+        encoding="utf-8",
+    )
+
+    imported = importer.import_candidate(output, tmp_path / "verified-artifacts")
+
+    assert imported.name == manifest["model_id"]
+    assert (
+        tmp_path / "verified-artifacts" / "latest" / "manifest.json"
+    ).is_file()

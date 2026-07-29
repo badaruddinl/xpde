@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 import json
 import math
 import shutil
@@ -51,37 +52,54 @@ def _artifact_root(path: Path) -> Path:
     return matches[0].parent
 
 
-def _golden_snapshot() -> dict:
+def _golden_snapshot(*, tick_size: float) -> dict:
+    if not math.isfinite(tick_size) or tick_size <= 0.0:
+        raise ValueError("golden snapshot requires a finite positive broker tick size")
     start = datetime(2026, 1, 1, tzinfo=UTC)
     bars = []
     close = 3300.0
+    spread = tick_size * 24
     for index in range(500):
         opening = close
         close = opening + 0.12 * math.sin(index / 7.0) + 0.03
+        high = max(opening, close) + 0.35
+        low = min(opening, close) - 0.35
+        tick_volume = 1000 + index
         bars.append(
             {
                 "timestamp": (start + timedelta(minutes=5 * index))
                 .isoformat()
                 .replace("+00:00", "Z"),
                 "open": opening,
-                "high": max(opening, close) + 0.35,
-                "low": min(opening, close) - 0.35,
+                "high": high,
+                "low": low,
                 "close": close,
-                "tick_volume": 1000.0 + index,
+                "tick_volume": float(tick_volume),
+                "bid_open": opening,
+                "bid_high": high,
+                "bid_low": low,
+                "bid_close": close,
+                "ask_open": opening + spread,
+                "ask_high": high + spread,
+                "ask_low": low + spread,
+                "ask_close": close + spread,
+                "executable_tick_count": tick_volume,
             }
         )
+    digits = max(0, -Decimal(str(tick_size)).as_tuple().exponent)
     return {
         "symbol": "GOLDm#",
         "timeframe": "M5",
-        "bid": close - 0.12,
-        "ask": close + 0.12,
-        "symbol_spec": {"tick_size": 0.01, "digits": 2},
+        "bid": close,
+        "ask": close + spread,
+        "symbol_spec": {"tick_size": tick_size, "digits": digits},
         "bars": bars,
     }
 
 
-def _verify_golden_forecast(path: Path) -> None:
-    snapshot = _golden_snapshot()
+def _verify_golden_forecast(path: Path, manifest: dict) -> None:
+    tick_size = float(manifest["barrier_spec"]["tick_size"])
+    snapshot = _golden_snapshot(tick_size=tick_size)
     forecast = CandidateModel(path).forecast(snapshot)
     numeric_fields = (
         "origin_close",
@@ -107,7 +125,6 @@ def _verify_golden_forecast(path: Path) -> None:
         or forecast["stop_price_short"] <= forecast["origin_close"]
     ):
         raise ValueError("golden forecast violates the barrier contract")
-    tick_size = float(snapshot["symbol_spec"]["tick_size"])
     if any(
         not math.isclose(
             float(forecast[field]) / tick_size,
@@ -192,7 +209,7 @@ def verify_candidate(path: Path) -> dict:
     model_id = str(manifest.get("model_id", "")).strip()
     if not model_id or Path(model_id).name != model_id:
         raise ValueError("artifact model_id is invalid")
-    _verify_golden_forecast(path)
+    _verify_golden_forecast(path, manifest)
     return manifest
 
 

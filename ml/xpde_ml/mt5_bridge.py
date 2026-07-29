@@ -16,7 +16,11 @@ import tomllib
 
 from .backfill_transport import post_backfill_payloads
 from .baseline import forecast_from_snapshot
-from .contracts import HORIZONS
+from .contracts import (
+    HORIZONS,
+    has_complete_executable_feature_window,
+    has_complete_tick_coverage,
+)
 from .executable_bars import (
     CHART_MODE_BID,
     ExecutableBarTracker,
@@ -29,20 +33,6 @@ from .time_utils import BrokerClock, environment_integer
 SYMBOL = "GOLDm#"
 TIMEFRAME = "M5"
 MAX_TICK_AGE_MS = 10_000
-MINIMUM_EXECUTABLE_TICK_COVERAGE = 0.95
-
-
-def has_complete_tick_coverage(
-    bar: dict[str, Any], minimum_ratio: float = MINIMUM_EXECUTABLE_TICK_COVERAGE
-) -> bool:
-    tick_volume = float(bar.get("tick_volume", 0.0))
-    executable_count = int(bar.get("executable_tick_count", 0))
-    return (
-        0.0 <= minimum_ratio <= 1.0
-        and tick_volume > 0.0
-        and executable_count > 0
-        and executable_count / tick_volume >= minimum_ratio
-    )
 MAX_FORECAST_GENERATION_DELAY_MS = 10_000
 
 
@@ -180,6 +170,15 @@ class PayloadRejected(RuntimeError):
         super().__init__(f"{url} rejected payload with HTTP {status}: {detail}")
 
 
+RECOVERABLE_BRIDGE_ERRORS = (
+    PayloadRejected,
+    urllib.error.URLError,
+    TimeoutError,
+    OSError,
+    RuntimeError,
+)
+
+
 def load_local_env(path: Path = Path(".env")) -> None:
     if not path.is_file():
         return
@@ -195,6 +194,20 @@ def load_local_env(path: Path = Path(".env")) -> None:
 
 def next_retry_delay(current: float, maximum: float) -> float:
     return min(maximum, max(current * 2, 0.5))
+
+
+def forecast_with_candidate(
+    snapshot: dict[str, Any],
+    candidate: Any | None,
+) -> dict[str, Any]:
+    if candidate is None:
+        return forecast_from_snapshot(snapshot)
+    try:
+        return candidate.forecast(snapshot)
+    except ValueError as error:
+        raise RuntimeError(
+            f"candidate inference rejected the current feature frame: {error}"
+        ) from error
 
 
 def initialize_mt5(mt5: Any) -> None:
@@ -374,6 +387,8 @@ def build_snapshot(
         missing_flags.append("EXECUTABLE_TICK_PATH_MISSING")
     if bars and not has_complete_tick_coverage(bars[-1]):
         missing_flags.append("EXECUTABLE_TICK_COVERAGE_INCOMPLETE")
+    if not has_complete_executable_feature_window(bars):
+        missing_flags.append("FEATURE_WINDOW_EXECUTABLE_HISTORY_INCOMPLETE")
     current_bar = None
     if current_rates is not None and len(current_rates) == 1:
         rate = current_rates[0]
@@ -713,6 +728,7 @@ def main() -> None:
                         through_timestamp=latest_completed_bar,
                         clock=broker_clock,
                     )
+                    executable_tracker.ingest_completed_bars(catchup_bars)
                     post_catchup(args.backfill_url, catchup_bars, clock=broker_clock)
                     startup_had_gap = True
                     print(
@@ -735,10 +751,9 @@ def main() -> None:
                         pending_startup_forecast is None
                         or pending_startup_bar != latest_completed_bar
                     ):
-                        pending_startup_forecast = (
-                            candidate.forecast(startup_snapshot)
-                            if candidate is not None
-                            else forecast_from_snapshot(startup_snapshot)
+                        pending_startup_forecast = forecast_with_candidate(
+                            startup_snapshot,
+                            candidate,
                         )
                         pending_startup_bar = latest_completed_bar
                     post_payload(
@@ -762,13 +777,7 @@ def main() -> None:
                         flush=True,
                     )
                 break
-            except (
-                PayloadRejected,
-                urllib.error.URLError,
-                TimeoutError,
-                OSError,
-                RuntimeError,
-            ) as error:
+            except RECOVERABLE_BRIDGE_ERRORS as error:
                 print(
                     f"XPDE startup retrying in {retry_delay:.1f}s after: {error}",
                     file=sys.stderr,
@@ -840,6 +849,7 @@ def main() -> None:
                         through_timestamp=latest_bar,
                         clock=broker_clock,
                     )
+                    executable_tracker.ingest_completed_bars(catchup_bars)
                     post_catchup(
                         args.backfill_url,
                         catchup_bars,
@@ -889,11 +899,7 @@ def main() -> None:
                         )
                         continue
                     if pending_forecast is None or pending_forecast_bar != latest_bar:
-                        pending_forecast = (
-                            candidate.forecast(snapshot)
-                            if candidate is not None
-                            else forecast_from_snapshot(snapshot)
-                        )
+                        pending_forecast = forecast_with_candidate(snapshot, candidate)
                         pending_forecast_bar = latest_bar
                     post_payload(
                         args.forecast_url,
@@ -903,13 +909,7 @@ def main() -> None:
                     last_forecast_bar = latest_bar
                     pending_forecast = None
                     pending_forecast_bar = None
-            except (
-                PayloadRejected,
-                urllib.error.URLError,
-                TimeoutError,
-                OSError,
-                RuntimeError,
-            ) as error:
+            except RECOVERABLE_BRIDGE_ERRORS as error:
                 print(
                     f"XPDE bridge retrying in {retry_delay:.1f}s after: {error}",
                     file=sys.stderr,

@@ -11,6 +11,7 @@ pub const BARRIER_SPEC_ID: &str = "atr-1.25tp-1.00sl-h3-executable-tick-aligned-
 pub const EXECUTABLE_SIDE_CONTRACT_ID: &str =
     "bid-entry-exit-long-ask-exit-short-complete-tick-sequence-v5";
 pub const MINIMUM_EXECUTABLE_TICK_COVERAGE: f64 = 0.95;
+pub const EXECUTABLE_FEATURE_WINDOW_BARS: usize = 24;
 pub const BARRIER_HORIZON_BARS: u32 = 3;
 pub const FORECAST_HORIZONS: [u32; 4] = [1, 3, 6, 12];
 pub const MAX_FORECAST_HORIZON_BARS: u32 = 12;
@@ -352,6 +353,22 @@ impl MarketSnapshot {
 
     pub fn mid_price(&self) -> f64 {
         (self.ask + self.bid) / 2.0
+    }
+
+    pub fn has_complete_executable_feature_window(&self) -> bool {
+        if self.bars.len() < EXECUTABLE_FEATURE_WINDOW_BARS {
+            return false;
+        }
+        let mut ordered = self.bars.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|bar| bar.timestamp);
+        let window = &ordered[ordered.len() - EXECUTABLE_FEATURE_WINDOW_BARS..];
+        window
+            .windows(2)
+            .all(|pair| pair[0].timestamp < pair[1].timestamp)
+            && window.iter().all(|bar| {
+                bar.has_executable_sides()
+                    && bar.has_complete_tick_coverage(MINIMUM_EXECUTABLE_TICK_COVERAGE)
+            })
     }
 
     pub fn rolling_exit_spread(&self, maximum_bars: usize, quantile: f64) -> Option<(f64, usize)> {
@@ -1745,6 +1762,23 @@ mod tests {
         bar.executable_tick_count = 95;
         assert!(bar.has_complete_tick_coverage(0.95));
         assert!(!bar.has_complete_tick_coverage(f64::NAN));
+    }
+
+    #[test]
+    fn executable_feature_window_requires_24_unique_covered_bid_ask_bars() {
+        let mut snapshot = sample_snapshot();
+        assert!(snapshot.has_complete_executable_feature_window());
+
+        snapshot.bars[0].executable_tick_count = 94;
+        assert!(!snapshot.has_complete_executable_feature_window());
+        snapshot.bars[0].executable_tick_count = 100;
+
+        snapshot.bars[0].ask_close = None;
+        assert!(!snapshot.has_complete_executable_feature_window());
+        snapshot.bars[0].ask_close = Some(3330.74);
+
+        snapshot.bars[0].timestamp = snapshot.bars[1].timestamp;
+        assert!(!snapshot.has_complete_executable_feature_window());
     }
 
     #[test]

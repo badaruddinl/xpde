@@ -116,6 +116,18 @@ completeness over the latest due 200-prediction cohort.
 The realtime tracker fully recounts the current and previous M5 bucket on each
 refresh. Completed history remains frozen after that overlap window, while raw
 tick count is never inferred from the smaller compact price-change sequence.
+An empty, stale or underfilled cache is rehydrated from the oldest timestamp in
+the latest 64 completed MT5 trading bars, not from elapsed wall-clock time.
+Retention is likewise counted in trading bars, so a weekend cannot evict the
+spread-feature window. Backfilled executable paths are merged into tracker
+memory without replacing a path that already has broader tick coverage.
+
+The same shared contract guards bridge output and direct `CandidateModel`
+inference: the latest 24 completed bars must have finite executable Bid/Ask
+closes and at least 95% tick coverage. An incomplete window is published as
+`FEATURE_WINDOW_EXECUTABLE_HISTORY_INCOMPLETE`; it cannot reach candidate
+inference. A defensive `ValueError` boundary retries operationally invalid
+feature frames without hiding process-control exceptions.
 
 After downtime, market bars and their ordered `COPY_TICKS_ALL` paths are
 backfilled from the last local completed candle. Requests are gzip-compressed
@@ -214,3 +226,6 @@ Every candidate includes a model card, machine-readable evaluation report and
 SHA-256 checksum list. Local inference accepts only complete schema-v3,
 gate-v3 artifacts with the exact executable-side contract. Candidates remain
 shadow-only and immutable in Drive.
+The checked importer derives its golden snapshot tick size from that immutable
+artifact contract and exercises the real model with 500 executable Bid/Ask bars
+before staging, promotion or registration.

@@ -8,7 +8,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .contracts import HORIZONS, deterministic_prediction_id, validate_snapshot
+from .contracts import (
+    HORIZONS,
+    deterministic_prediction_id,
+    has_complete_executable_feature_window,
+    validate_snapshot,
+)
 from .dataset import (
     BARRIER_HORIZON,
     BARRIER_SPEC_ID,
@@ -214,6 +219,17 @@ class CandidateModel:
         import pandas as pd
 
         bars = validate_snapshot(snapshot)
+        sources = sorted(
+            snapshot["bars"],
+            key=lambda source: datetime.fromisoformat(
+                str(source["timestamp"]).replace("Z", "+00:00")
+            ),
+        )
+        if not has_complete_executable_feature_window(sources):
+            raise ValueError(
+                "executable feature window requires 24 completed bars with "
+                "finite Bid/Ask closes and at least 95% tick coverage"
+            )
         raw = pd.DataFrame(
             [
                 {
@@ -234,7 +250,7 @@ class CandidateModel:
                         else np.nan
                     ),
                 }
-                for bar, source in zip(bars, snapshot["bars"], strict=True)
+                for bar, source in zip(bars, sources, strict=True)
             ]
         )
         features = engineer_features(raw)

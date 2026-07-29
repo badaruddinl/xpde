@@ -558,6 +558,8 @@ function reasonLabel(reason: string) {
     SESSION_INTERRUPTED: "Sesi market terputus sebelum horizon selesai",
     EXECUTABLE_TICK_COVERAGE_INCOMPLETE: "Coverage tick executable completed bar di bawah 95%",
     CURRENT_EXECUTABLE_TICK_COVERAGE_INCOMPLETE: "Coverage tick executable current bar di bawah 95%",
+    FEATURE_WINDOW_EXECUTABLE_HISTORY_INCOMPLETE:
+      "Riwayat Bid/Ask 24 bar untuk fitur spread belum lengkap",
     LIVE_SETTLEMENT_COMPLETENESS_OUTSIDE_GATE: "Settlement completeness di bawah batas 98%",
     BROKER_STOPS_LEVEL_VIOLATION: "Target atau stop melanggar minimum stops broker",
     BROKER_LONG_ONLY: "Broker hanya mengizinkan entry LONG",
@@ -783,6 +785,13 @@ export default function Home() {
           : proposal.reason_codes.includes("MARKET_SESSION_BOUNDARY_UNAVAILABLE")
             ? ["MARKET SESSION UNKNOWN", "Batas sesi broker belum tersedia."]
           : state.snapshot.data_quality.missing_flags.some((flag) =>
+                flag === "FEATURE_WINDOW_EXECUTABLE_HISTORY_INCOMPLETE",
+              )
+            ? [
+                "FEATURE HISTORY INCOMPLETE",
+                "Menunggu 24 completed trading bars dengan coverage tick ≥95%.",
+              ]
+            : state.snapshot.data_quality.missing_flags.some((flag) =>
                 flag.includes("TICK_PATH"),
               )
             ? ["TICK PATH INCOMPLETE", "First-touch evidence belum lengkap."]

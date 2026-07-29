@@ -132,6 +132,18 @@ def test_imports_immutable_verified_candidate(tmp_path, monkeypatch) -> None:
         )
 
 
+def test_golden_snapshot_uses_artifact_tick_size_and_executable_history() -> None:
+    snapshot = importer._golden_snapshot(tick_size=0.05)
+
+    assert snapshot["symbol_spec"] == {"tick_size": 0.05, "digits": 2}
+    assert math.isclose(snapshot["ask"] - snapshot["bid"], 1.2)
+    assert len(snapshot["bars"]) == 500
+    for bar in snapshot["bars"][-24:]:
+        assert bar["bid_close"] == bar["close"]
+        assert math.isclose(bar["ask_close"] - bar["bid_close"], 1.2)
+        assert bar["executable_tick_count"] == int(bar["tick_volume"])
+
+
 def test_ineligible_candidate_is_not_copied_to_latest(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(importer, "CandidateModel", FakeCandidateModel)
     artifact = make_artifact(tmp_path / "source", eligible=False)

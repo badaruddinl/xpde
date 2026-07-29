@@ -4340,6 +4340,7 @@ async fn post_forecast(
         ));
     }
     if runtime.snapshot.symbol_spec.chart_mode != ChartMode::Bid
+        || !runtime.snapshot.has_complete_executable_feature_window()
         || !latest_completed.has_executable_sides()
         || !latest_completed.has_valid_tick_path()
         || !latest_completed.has_complete_tick_coverage(MINIMUM_EXECUTABLE_TICK_COVERAGE)
@@ -4350,7 +4351,7 @@ async fn post_forecast(
         })
     {
         return Err(ApiError::bad_request(
-            "forecast rejected because complete Bid/Ask tick coverage is unavailable",
+            "forecast rejected because the complete 24-bar Bid/Ask feature window or current tick coverage is unavailable",
         ));
     }
     let tick_size = runtime.snapshot.symbol_spec.tick_size;
