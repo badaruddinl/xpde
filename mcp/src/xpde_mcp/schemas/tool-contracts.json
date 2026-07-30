@@ -1,0 +1,53 @@
+{
+  "contract_version": "1.0",
+  "transport": "STDIO",
+  "network_listener_created": false,
+  "authority": {
+    "forecast": "XPDE_CORE",
+    "decision": "XPDE_CORE",
+    "technical_analysis": "MCP_DERIVED_CONTEXT_ONLY"
+  },
+  "tools": [
+    "xpde_get_current",
+    "xpde_get_analysis_bundle",
+    "xpde_get_recent_predictions",
+    "xpde_get_prediction_evidence",
+    "xpde_get_evaluation_summary",
+    "xpde_get_model_manifest",
+    "xpde_analyze_current",
+    "xpde_get_market_structure",
+    "xpde_explain_prediction",
+    "xpde_get_model_evidence"
+  ],
+  "forbidden_capabilities": [
+    "ORDER_EXECUTION",
+    "FEEDBACK_WRITE",
+    "MODEL_PROMOTION",
+    "POLICY_REPLACEMENT",
+    "RETRAINING",
+    "FORECAST_CREATION",
+    "SQLITE_WRITE",
+    "ARBITRARY_FILE_READ",
+    "HTTP_SERVER"
+  ],
+  "source_boundaries": {
+    "rest": {
+      "methods": ["GET"],
+      "routes": [
+        "/api/v1/state",
+        "/api/v1/evaluation/summary",
+        "/api/v1/models"
+      ],
+      "host": "LOOPBACK_ONLY"
+    },
+    "sqlite": {
+      "mode": "ro",
+      "query_only": true
+    },
+    "manifest": {
+      "filename": "manifest.json",
+      "root_environment_variable": "XPDE_ARTIFACT_ROOT",
+      "path_escape_allowed": false
+    }
+  }
+}

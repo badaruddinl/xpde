@@ -6,6 +6,22 @@ records outcomes and feedback, then leaves the final decision to a human.
 
 > This repository contains no auto-entry or order-execution capability.
 
+## Read-only technical-analysis MCP
+
+The separate package in [`mcp/`](mcp/) exposes XPDE over MCP STDIO without
+adding a write path or a second prediction model. Its primary
+`xpde_analyze_current` tool builds the versioned `xpde-ta-goldm-m5-v1` packet
+from completed M5 bars, strict M15/H1 aggregation, EMA/RSI/ATR/ROC, confirmed
+swing structure, support/resistance, the current forecast, exact Rust core
+proposal and model evidence.
+
+The MCP opens SQLite with `mode=ro` and `query_only`, calls only fixed local GET
+routes, confines manifest reads to `XPDE_ARTIFACT_ROOT`, and runs only through
+STDIO. It cannot execute orders, write feedback, promote/retrain models, replace
+policy, create forecasts, or change the database. Install it independently with
+`XPDE-Install-MCP.cmd`; the existing bridge/inference/training environment is
+unchanged.
+
 ## Current MVP
 
 - MetaTrader 5 read-only bridge for `GOLDm#`.

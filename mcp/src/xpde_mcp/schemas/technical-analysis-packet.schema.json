@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xpde.local/schemas/technical-analysis-packet-v1.json",
+  "title": "XPDE TechnicalAnalysisPacket",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "source_status",
+    "market",
+    "forecast",
+    "technical_views",
+    "levels",
+    "alignment",
+    "core_decision",
+    "evidence",
+    "observations",
+    "semantic_contract",
+    "interpretation_constraints"
+  ],
+  "properties": {
+    "contract": {
+      "type": "object",
+      "required": [
+        "packet_version",
+        "ta_contract_id",
+        "forecast_authority",
+        "decision_authority",
+        "indicator_input"
+      ],
+      "properties": {
+        "packet_version": { "const": "1.0" },
+        "ta_contract_id": { "const": "xpde-ta-goldm-m5-v1" },
+        "forecast_authority": { "const": "XPDE_CORE" },
+        "decision_authority": { "const": "XPDE_CORE" },
+        "native_timeframe": { "const": "M5" },
+        "derived_timeframes": {
+          "type": "array",
+          "items": { "enum": ["M15", "H1"] }
+        },
+        "indicator_input": { "const": "COMPLETED_BARS_ONLY" }
+      }
+    },
+    "source_status": {
+      "type": "object",
+      "required": [
+        "forecast_usable_as_guide",
+        "market_data_current",
+        "core_actionable",
+        "evidence_stage"
+      ],
+      "properties": {
+        "forecast_usable_as_guide": { "type": "boolean" },
+        "market_data_current": { "type": "boolean" },
+        "market_data_reason_codes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "core_actionable": { "type": "boolean" },
+        "evidence_stage": {
+          "enum": ["WARMING_UP", "HEALTHY", "DEGRADED", "SUSPENDED", "UNKNOWN"]
+        },
+        "forecast_status": { "type": ["string", "null"] },
+        "connection_status": { "type": ["string", "null"] },
+        "guide_statement": { "type": "string" }
+      }
+    },
+    "market": { "type": "object" },
+    "forecast": {
+      "type": "object",
+      "required": [
+        "origin_close_bid",
+        "direction",
+        "barrier",
+        "quantile_points"
+      ],
+      "properties": {
+        "direction": {
+          "type": "object",
+          "required": [
+            "probability_up",
+            "probability_non_up",
+            "non_up_definition",
+            "h3_q50_side"
+          ],
+          "properties": {
+            "probability_up": { "type": "number", "minimum": 0, "maximum": 1 },
+            "probability_non_up": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "non_up_definition": { "type": "string" },
+            "h3_q50_side": { "enum": ["BULLISH", "BEARISH", "FLAT"] }
+          }
+        },
+        "quantile_points": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "horizon_bars",
+              "horizon_minutes",
+              "quantiles_log_return",
+              "quantiles_bid_price"
+            ]
+          }
+        }
+      }
+    },
+    "technical_views": {
+      "type": "object",
+      "required": ["M5", "M15", "H1"],
+      "properties": {
+        "M5": { "$ref": "#/$defs/technicalView" },
+        "M15": { "$ref": "#/$defs/technicalView" },
+        "H1": { "$ref": "#/$defs/technicalView" }
+      }
+    },
+    "levels": { "type": "object" },
+    "alignment": {
+      "type": "object",
+      "required": ["state", "confluences", "conflicts", "limitations", "rule"],
+      "properties": {
+        "state": {
+          "enum": [
+            "ALIGNED",
+            "PARTIALLY_ALIGNED",
+            "CONFLICTED",
+            "NEUTRAL",
+            "INSUFFICIENT_DATA"
+          ]
+        },
+        "confluences": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/interpretation" }
+        },
+        "conflicts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/interpretation" }
+        },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "rule": { "type": "string" }
+      }
+    },
+    "core_decision": {
+      "type": "object",
+      "required": ["action", "must_preserve", "profile", "reason_codes", "proposal"],
+      "properties": {
+        "action": {
+          "enum": ["LONG", "SHORT", "WAIT", "NO_PREDICTION"]
+        },
+        "must_preserve": { "const": true },
+        "profile": { "enum": ["SCALPER", "SNIPER"] },
+        "proposal_id": { "type": ["string", "null"] },
+        "reason_codes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "proposal": { "type": "object" }
+      }
+    },
+    "evidence": { "type": "object" },
+    "observations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/observation" }
+    },
+    "semantic_contract": { "type": "object" },
+    "interpretation_constraints": {
+      "type": "object",
+      "required": [
+        "forecast_is_not_guarantee",
+        "preserve_core_decision",
+        "do_not_create_buy_sell_alternative",
+        "human_verification_required"
+      ],
+      "properties": {
+        "forecast_is_not_guarantee": { "const": true },
+        "preserve_core_decision": { "const": true },
+        "do_not_create_buy_sell_alternative": { "const": true },
+        "human_verification_required": { "const": true }
+      }
+    }
+  },
+  "$defs": {
+    "technicalView": {
+      "type": "object",
+      "required": [
+        "timeframe",
+        "bar_count",
+        "trend",
+        "momentum",
+        "structure",
+        "levels",
+        "aggregation",
+        "limitations"
+      ]
+    },
+    "observation": {
+      "type": "object",
+      "required": ["id", "category", "fact", "value", "source"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^obs-" },
+        "category": { "type": "string" },
+        "fact": { "type": "string" },
+        "value": {},
+        "source": {
+          "enum": ["XPDE_CORE", "XPDE_SQLITE", "MODEL_MANIFEST", "MCP_DERIVED"]
+        }
+      }
+    },
+    "interpretation": {
+      "type": "object",
+      "required": ["statement", "basis_ids", "strength"],
+      "properties": {
+        "statement": { "type": "string" },
+        "basis_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^obs-" }
+        },
+        "strength": { "enum": ["LOW", "MEDIUM", "HIGH"] }
+      }
+    }
+  }
+}

@@ -4,6 +4,13 @@ XPDE is a local, manual-only decision-support system for the MetaTrader 5
 symbol `GOLDm#`. It does not expose an order endpoint and the MT5 bridge never
 calls `order_send`.
 
+The optional read-only technical-analysis MCP is specified in
+[`mcp-technical-analysis.md`](mcp-technical-analysis.md). It is packaged
+separately from bridge/training dependencies and consumes only fixed GET
+endpoints, SQLite `mode=ro` evidence and artifact-root-confined manifests over
+STDIO. `XPDE_CORE` remains both forecast and decision authority; deterministic
+M5/M15/H1 technical context cannot create an alternative action.
+
 ```text
 MetaTrader 5 terminal
         |
