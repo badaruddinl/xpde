@@ -61,9 +61,15 @@ records outcomes and feedback, then leaves the final decision to a human.
 - Direction evidence uses the training truth (`actual_return > 0`) and scores
   the displayed classifier at `P(UP) >= 0.5`. Evaluation recomputes accuracy
   from probability and return, so legacy stored hit flags cannot bias it.
+- The binary complement is named `NON-UP` (negative or flat), never strict
+  DOWN. SHORT still requires independent negative q50 and SHORT barrier
+  agreement. Offline artifacts and the live 200-settled H3 window publish flat
+  samples, denominator and rate using `|log-return| <= 1e-12`.
 - Origin direction and barrier probabilities are hidden while market data is
   disconnected, closed, stale or incomplete. They remain visible during model
-  `WARMING_UP` when the underlying market data itself is current.
+  `WARMING_UP` when the underlying market data itself is current. Unavailable
+  text first reports the actual forecast lifecycle (waiting, mismatch, expired
+  or demo) before diagnosing connection or tick freshness.
 - Dynamic MT5 account, currency and symbol specifications.
 - MT5 `order_calc_margin()` and `order_calc_profit()` are authoritative for
   margin and account-currency PnL conversion when available.

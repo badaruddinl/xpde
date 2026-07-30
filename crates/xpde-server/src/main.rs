@@ -41,6 +41,7 @@ const MIGRATION: &str = include_str!("../../../migrations/001_init.sql");
 const BACKFILL_BODY_LIMIT_BYTES: usize = 2_000_000;
 const BACKFILL_MAX_BARS: usize = 250;
 const BACKFILL_MAX_TICK_POINTS: usize = 20_000;
+const FLAT_RETURN_LOG_EPSILON: f64 = 1.0e-12;
 
 #[derive(Clone)]
 struct AppState {
@@ -3707,6 +3708,36 @@ impl Store {
                 }))
             },
         )?;
+        let flat_return_h3 = connection.query_row(
+            "WITH recent AS (
+               SELECT o.actual_return
+               FROM prediction_horizon_outcomes o
+               JOIN predictions p ON p.prediction_id=o.prediction_id
+               WHERE o.horizon_bars=3
+                 AND p.model_id=?1
+                 AND p.barrier_spec_id=?2
+                 AND p.is_duplicate=0
+                 AND p.settlement_status='SETTLED'
+               ORDER BY o.origin_bar_timestamp DESC
+               LIMIT 200
+             )
+             SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN ABS(actual_return)<=?3 THEN 1 ELSE 0 END), 0),
+                    AVG(CASE WHEN ABS(actual_return)<=?3 THEN 1.0 ELSE 0.0 END)
+             FROM recent",
+            params![current_model_id, BARRIER_SPEC_ID, FLAT_RETURN_LOG_EPSILON],
+            |row| {
+                Ok(serde_json::json!({
+                    "scope": "CURRENT_MODEL_RECENT_SETTLED_H3",
+                    "model_id": current_model_id,
+                    "window": 200,
+                    "flat_return_log_epsilon": FLAT_RETURN_LOG_EPSILON,
+                    "flat_return_samples_h3": row.get::<_, i64>(1)?,
+                    "flat_return_denominator_h3": row.get::<_, i64>(0)?,
+                    "flat_return_rate_h3": row.get::<_, Option<f64>>(2)?,
+                }))
+            },
+        )?;
         let forecast_barrier_by_side = {
             let mut statement = connection.prepare(
                 "WITH recent AS (
@@ -4024,6 +4055,7 @@ impl Store {
             "overall": overall,
             "current_model": current_model,
             "current_session": current_session,
+            "flat_return_h3": flat_return_h3,
             "forecast_barrier_by_side": forecast_barrier_by_side,
             "direction_calibration_bins": direction_calibration_bins,
             "direction_expected_calibration_error": direction_expected_calibration_error,
@@ -6474,6 +6506,13 @@ mod tests {
                 - 0.4)
                 .abs()
                 < 1e-12
+        );
+        assert_eq!(summary["flat_return_h3"]["flat_return_samples_h3"], 1);
+        assert_eq!(summary["flat_return_h3"]["flat_return_denominator_h3"], 2);
+        assert_eq!(summary["flat_return_h3"]["flat_return_rate_h3"], 0.5);
+        assert_eq!(
+            summary["flat_return_h3"]["flat_return_log_epsilon"],
+            FLAT_RETURN_LOG_EPSILON
         );
     }
 

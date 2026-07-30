@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .contracts import HORIZONS, QUANTILES
+from .contracts import FLAT_RETURN_LOG_EPSILON, HORIZONS, QUANTILES
 from .dataset import (
     BARRIER_HORIZON,
     BARRIER_SL_ATR_MULTIPLIER,
@@ -167,6 +167,27 @@ def _brier(y_true, probabilities) -> float:
     import numpy as np
 
     return float(np.mean((probabilities - y_true) ** 2))
+
+
+def _flat_return_diagnostics(
+    actual_returns,
+    epsilon: float = FLAT_RETURN_LOG_EPSILON,
+) -> dict[str, float | int]:
+    if not math.isfinite(epsilon) or epsilon < 0.0:
+        raise ValueError("flat-return epsilon must be finite and non-negative")
+    values = [float(value) for value in actual_returns]
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("flat-return diagnostics require finite returns")
+    flat_samples = sum(abs(value) <= epsilon for value in values)
+    denominator = len(values)
+    return {
+        "flat_return_log_epsilon": epsilon,
+        "flat_return_samples_h3": flat_samples,
+        "flat_return_denominator_h3": denominator,
+        "flat_return_rate_h3": (
+            flat_samples / denominator if denominator > 0 else 0.0
+        ),
+    }
 
 
 def _finite_sample_conformal_quantile(scores, coverage: float = 0.80) -> float:
@@ -619,6 +640,9 @@ def train(args) -> dict[str, Any]:
             direction_truth,
             np.repeat(float(dataset["direction_3"].iloc[train_slice].mean()), len(direction_truth)),
         ),
+        **_flat_return_diagnostics(
+            dataset["target_3"].iloc[holdout_slice].to_numpy()
+        ),
     }
     direction_model.save_model(args.output / "direction.cbm")
 
@@ -1022,6 +1046,13 @@ def train(args) -> dict[str, Any]:
                 f"- Feature version: `{FEATURE_VERSION}`",
                 f"- Dataset SHA-256: `{source_sha256}`",
                 f"- Eligible for shadow: `{str(eligible).lower()}`",
+                (
+                    "- Holdout flat return H3: "
+                    f"`{direction_metrics['flat_return_rate_h3']:.6f}` "
+                    f"(`{direction_metrics['flat_return_samples_h3']}`/"
+                    f"`{direction_metrics['flat_return_denominator_h3']}`, "
+                    f"`|log-return| <= {FLAT_RETURN_LOG_EPSILON:g}`)"
+                ),
                 "",
                 "This artifact cannot execute orders and requires manual promotion.",
                 "",

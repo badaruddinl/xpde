@@ -33,6 +33,21 @@ export function isMarketDataCurrent(input) {
  * @param {MarketDataCurrentInput} input
  */
 export function marketDataUnavailableMessage(input) {
+  if (input.forecastStatus === "WAITING_FOR_FIRST_FORECAST") {
+    return "Forecast belum tersedia — probabilitas disembunyikan";
+  }
+  if (input.forecastStatus === "ORIGIN_MISMATCH") {
+    return "Origin forecast tidak cocok — probabilitas disembunyikan";
+  }
+  if (input.forecastStatus === "EXPIRED") {
+    return "Forecast kedaluwarsa — probabilitas disembunyikan";
+  }
+  if (input.forecastStatus === "DEMO") {
+    return "Forecast demo — probabilitas disembunyikan";
+  }
+  if (input.forecastStatus !== "CURRENT") {
+    return "Forecast tidak current — probabilitas disembunyikan";
+  }
   if (input.connectionStatus !== "MT5_CONNECTED") {
     return "Data market terputus — probabilitas disembunyikan";
   }

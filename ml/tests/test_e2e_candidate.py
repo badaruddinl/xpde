@@ -125,6 +125,16 @@ def test_synthetic_csv_trains_loads_and_forecasts_schema_v3(tmp_path) -> None:
     assert manifest["schema_version"] == 3
     assert manifest["eligible_for_shadow"] is False
     assert manifest["barrier_spec"]["id"] == BARRIER_SPEC_ID
+    direction_metrics = manifest["metrics"]["direction"]
+    assert direction_metrics["flat_return_log_epsilon"] == 1e-12
+    assert (
+        direction_metrics["flat_return_denominator_h3"]
+        == manifest["rows"]["holdout"]
+    )
+    assert 0.0 <= direction_metrics["flat_return_rate_h3"] <= 1.0
+    model_card = (output / "model_card.md").read_text(encoding="utf-8")
+    assert "Holdout flat return H3" in model_card
+    assert "|log-return| <= 1e-12" in model_card
 
     latest = frame.tail(500)
     snapshot = {

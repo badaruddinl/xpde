@@ -14,6 +14,7 @@ from xpde_ml.train_catboost import (
     _apply_probability_calibrator,
     _block_bootstrap_improvement_lcb,
     _finite_sample_conformal_quantile,
+    _flat_return_diagnostics,
     _select_probability_calibrator,
     _validate_barrier_class_coverage,
 )
@@ -49,6 +50,18 @@ def test_large_calibration_split_compares_supported_calibrators() -> None:
 
 def test_conformal_quantile_uses_finite_sample_higher_rank() -> None:
     assert _finite_sample_conformal_quantile(np.arange(10), 0.80) == 9.0
+
+
+def test_flat_return_diagnostics_publish_explicit_epsilon_and_denominator() -> None:
+    metrics = _flat_return_diagnostics([0.0, 1e-13, -1e-13, 1e-6, -1e-6])
+    assert metrics == {
+        "flat_return_log_epsilon": 1e-12,
+        "flat_return_samples_h3": 3,
+        "flat_return_denominator_h3": 5,
+        "flat_return_rate_h3": 0.6,
+    }
+    with pytest.raises(ValueError, match="epsilon"):
+        _flat_return_diagnostics([0.0], epsilon=-1.0)
 
 
 def test_block_bootstrap_requires_positive_improvement_confidence() -> None:

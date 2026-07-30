@@ -107,6 +107,13 @@ LONG and SHORT retain `TP_FIRST`, `SL_FIRST`,
 are not assigned an invented order. A disagreement between q50,
 the direction classifier, and the stronger barrier side yields
 `FORECAST_SIDE_CONFLICT` and therefore `WAIT`.
+The direction classifier is binary UP versus NON-UP: its complement includes
+both negative and exactly flat H3 returns and is never presented as
+`P(DOWN)`. For SHORT, NON-UP support is only a gate; a negative H3 q50 and the
+SHORT first-touch classifier must independently agree. Offline holdout and live
+current-model evidence publish `flat_return_rate_h3`, its sample count,
+denominator and an explicit numerical definition
+`|log-return| <= 1e-12`. This diagnostic does not alter labels or policy gates.
 
 The same coverage invariant applies to live paths. SQLite stores source tick
 volume, executable tick count and coverage ratio alongside each ordered path.
@@ -145,6 +152,9 @@ Direction and barrier probabilities are shown only while the forecast is
 CURRENT, MT5 is connected, the market is open, all tick-age checks pass and no
 quality flag is missing. Model `WARMING_UP` does not hide diagnostic
 probabilities; it only prevents actionable policy output.
+When probability is unavailable, lifecycle explanations take precedence:
+waiting, origin mismatch, expired and demo forecasts cannot be mislabeled as a
+stale tick.
 
 After downtime, market bars and their ordered `COPY_TICKS_ALL` paths are
 backfilled from the last local completed candle. Requests are gzip-compressed

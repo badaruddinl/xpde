@@ -25,8 +25,8 @@ test("server-renders the XPDE shadow terminal", async () => {
   assert.match(html, /FORECAST/);
   assert.match(html, /Auto-trading nonaktif/);
   assert.match(html, /Probabilitas naik tidak tersedia/);
-  assert.match(html, /Probabilitas turun tidak tersedia/);
-  assert.match(html, /Data market terputus — probabilitas disembunyikan/);
+  assert.match(html, /Probabilitas tidak naik tidak tersedia/);
+  assert.match(html, /Forecast demo — probabilitas disembunyikan/);
   assert.match(html, /Origin forecast peluang arah · H3/);
   assert.match(html, /Sisa reward dari harga entry tidak memadai/);
   assert.match(html, /Offline holdout coverage/);
@@ -57,4 +57,6 @@ test("keeps the server and client hydration fixture deterministic", async () => 
   assert.match(fixture, /DEMO_REFERENCE_MS/);
   assert.match(source, /formatPrice\(state\.snapshot\.bid, priceDigits\)/);
   assert.match(source, /state\.snapshot\.symbol_spec\.digits/);
+  assert.match(source, /probabilityNonUpPercent/);
+  assert.doesNotMatch(source, /probabilityDown|Probabilitas turun/);
 });

@@ -982,7 +982,9 @@ pub fn decide_at(
     } else {
         None
     };
-    let classifier_side = if forecast.direction_probability_up >= 0.5 {
+    let probability_up = forecast.direction_probability_up;
+    let probability_non_up = 1.0 - probability_up;
+    let classifier_side = if probability_up >= probability_non_up {
         DecisionAction::Long
     } else {
         DecisionAction::Short
@@ -1011,22 +1013,25 @@ pub fn decide_at(
         };
         return no_prediction(reason, decision_valid_until, outcome_matures_at);
     }
-    let (direction_probability, barrier_probability, target_price, stop_price) = match selected_side
-    {
-        DecisionAction::Long => (
-            forecast.direction_probability_up,
-            forecast.barrier_probability_long,
-            forecast.target_price_long,
-            forecast.stop_price_long,
-        ),
-        DecisionAction::Short => (
-            1.0 - forecast.direction_probability_up,
-            forecast.barrier_probability_short,
-            forecast.target_price_short,
-            forecast.stop_price_short,
-        ),
-        _ => unreachable!("selected side is always directional"),
-    };
+    // For SHORT this is classifier support for NON-UP (negative or flat), not
+    // a claim that the binary classifier estimates P(strictly negative return).
+    // q50 and the side-specific barrier classifier must independently agree.
+    let (classifier_support_probability, barrier_probability, target_price, stop_price) =
+        match selected_side {
+            DecisionAction::Long => (
+                probability_up,
+                forecast.barrier_probability_long,
+                forecast.target_price_long,
+                forecast.stop_price_long,
+            ),
+            DecisionAction::Short => (
+                probability_non_up,
+                forecast.barrier_probability_short,
+                forecast.target_price_short,
+                forecast.stop_price_short,
+            ),
+            _ => unreachable!("selected side is always directional"),
+        };
     let reference_lot = snapshot.symbol_spec.volume_min;
     let reference_entry_price = match selected_side {
         DecisionAction::Long => snapshot.ask,
@@ -1128,7 +1133,7 @@ pub fn decide_at(
         .map(|(_, _, touched)| touched)
         .unwrap_or(false);
 
-    let direction_ok = direction_probability >= policy.min_direction_probability;
+    let classifier_support_ok = classifier_support_probability >= policy.min_direction_probability;
     let barrier_ok = barrier_probability >= policy.min_barrier_probability;
 
     if barrier_already_touched {
@@ -1172,7 +1177,7 @@ pub fn decide_at(
     {
         reasons.push("BROKER_STOPS_LEVEL_VIOLATION".to_owned());
     }
-    if !direction_ok {
+    if !classifier_support_ok {
         reasons.push("DIRECTION_PROBABILITY_TOO_LOW".to_owned());
     }
     if !barrier_ok {
@@ -1876,6 +1881,29 @@ mod tests {
         forecast.barrier_probability_long = 0.40;
         forecast.barrier_probability_short = 0.68;
         let decision = decide(&sample_snapshot(), &forecast, &DecisionPolicy::scalper());
+        assert_eq!(decision.action, DecisionAction::Wait);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"FORECAST_SIDE_CONFLICT".to_owned())
+        );
+    }
+
+    #[test]
+    fn non_up_classifier_support_cannot_create_short_without_negative_q50() {
+        let mut forecast = sample_forecast();
+        forecast.direction_probability_up = 0.20;
+        forecast.barrier_probability_long = 0.20;
+        forecast.barrier_probability_short = 0.80;
+        let h3 = forecast
+            .points
+            .iter_mut()
+            .find(|point| point.horizon_bars == BARRIER_HORIZON_BARS)
+            .expect("H3 forecast");
+        h3.q50 = 0.0001;
+
+        let decision = decide(&sample_snapshot(), &forecast, &DecisionPolicy::scalper());
+
         assert_eq!(decision.action, DecisionAction::Wait);
         assert!(
             decision

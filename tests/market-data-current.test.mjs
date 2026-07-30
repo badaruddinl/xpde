@@ -67,3 +67,35 @@ test("disconnected, incomplete, and stale probability states explain the cause",
     "Tick market stale — probabilitas disembunyikan",
   );
 });
+
+test("forecast lifecycle reasons take priority over otherwise fresh market data", () => {
+  assert.equal(
+    marketDataUnavailableMessage({
+      ...healthyContext,
+      forecastStatus: "WAITING_FOR_FIRST_FORECAST",
+    }),
+    "Forecast belum tersedia — probabilitas disembunyikan",
+  );
+  assert.equal(
+    marketDataUnavailableMessage({
+      ...healthyContext,
+      forecastStatus: "ORIGIN_MISMATCH",
+    }),
+    "Origin forecast tidak cocok — probabilitas disembunyikan",
+  );
+  assert.equal(
+    marketDataUnavailableMessage({
+      ...healthyContext,
+      forecastStatus: "EXPIRED",
+    }),
+    "Forecast kedaluwarsa — probabilitas disembunyikan",
+  );
+  assert.equal(
+    marketDataUnavailableMessage({
+      ...healthyContext,
+      forecastStatus: "DEMO",
+      connectionStatus: "WAITING_FOR_MT5",
+    }),
+    "Forecast demo — probabilitas disembunyikan",
+  );
+});

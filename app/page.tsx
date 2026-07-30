@@ -250,6 +250,15 @@ interface EvaluationSummary {
     model_id: string;
     started_at: string;
   };
+  flat_return_h3?: {
+    scope: "CURRENT_MODEL_RECENT_SETTLED_H3";
+    model_id: string;
+    window: number;
+    flat_return_log_epsilon: number;
+    flat_return_samples_h3: number;
+    flat_return_denominator_h3: number;
+    flat_return_rate_h3: number | null;
+  };
   by_model: Array<EvaluationMetrics & { model_id: string }>;
   forecast_barrier_by_side: Array<
     BarrierOutcomeMetrics & {
@@ -732,9 +741,9 @@ export default function Home() {
       : state.forecast.expected_mae_short;
   const probabilityUp = state.forecast.direction_probability_up;
   const probabilityUpPercent = Math.round(probabilityUp * 1000) / 10;
-  const probabilityDownPercent = Math.round((100 - probabilityUpPercent) * 10) / 10;
+  const probabilityNonUpPercent = Math.round((100 - probabilityUpPercent) * 10) / 10;
   const directionDifferencePoints = Math.abs(
-    probabilityUpPercent - probabilityDownPercent,
+    probabilityUpPercent - probabilityNonUpPercent,
   );
   const directionSummary =
     directionDifferencePoints < 0.1
@@ -1254,23 +1263,23 @@ export default function Home() {
                   <i aria-hidden="true">↑</i>
                   <strong>{marketDataCurrent ? `${probabilityUpPercent.toFixed(1)}%` : "—"}</strong>
                 </div>
-                <div className="direction-stat down" aria-label={marketDataCurrent ? `Probabilitas turun ${probabilityDownPercent.toFixed(1)}%` : "Probabilitas turun tidak tersedia"}>
-                  <i aria-hidden="true">↓</i>
-                  <strong>{marketDataCurrent ? `${probabilityDownPercent.toFixed(1)}%` : "—"}</strong>
+                <div className="direction-stat non-up" aria-label={marketDataCurrent ? `Probabilitas tidak naik, turun atau flat, ${probabilityNonUpPercent.toFixed(1)}%` : "Probabilitas tidak naik tidak tersedia"}>
+                  <i aria-hidden="true">≤</i>
+                  <strong>{marketDataCurrent ? `${probabilityNonUpPercent.toFixed(1)}%` : "—"}</strong>
                 </div>
               </div>
               <div
                 className="direction-meter"
-                aria-label={marketDataCurrent ? `${probabilityUpPercent.toFixed(1)}% naik, ${probabilityDownPercent.toFixed(1)}% turun` : "Probabilitas arah tidak tersedia"}
+                aria-label={marketDataCurrent ? `${probabilityUpPercent.toFixed(1)}% naik, ${probabilityNonUpPercent.toFixed(1)}% tidak naik, yaitu turun atau flat` : "Probabilitas arah tidak tersedia"}
                 role="img"
               >
                 <i className="up" style={{ width: marketDataCurrent ? `${probabilityUpPercent}%` : "0%" }} />
-                <i className="down" style={{ width: marketDataCurrent ? `${probabilityDownPercent}%` : "0%" }} />
+                <i className="non-up" style={{ width: marketDataCurrent ? `${probabilityNonUpPercent}%` : "0%" }} />
               </div>
               <small className="direction-summary">
                 {!marketDataCurrent
                   ? probabilityUnavailableMessage
-                  : `${directionSummary} · Tidak dikondisikan ulang terhadap current entry`}
+                  : `${directionSummary} · ≤ berarti turun atau flat · Tidak dikondisikan ulang terhadap current entry`}
               </small>
             </article>
             <article className="panel metric">
@@ -1380,6 +1389,7 @@ export default function Home() {
             <div className="gate-row"><span><i className={state.forecast.drift_detected ? "bad" : "ok"} /> Drift detector</span><strong>{state.forecast.drift_detected ? "Detected" : "Clear"}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Live direction Brier</span><strong>{activeEvaluation?.direction_brier?.toFixed(4) ?? "—"}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Direction calibration ECE</span><strong>{evaluation?.direction_expected_calibration_error === null || evaluation?.direction_expected_calibration_error === undefined ? "—" : percent(evaluation.direction_expected_calibration_error)}</strong></div>
+            <div className="gate-row"><span><i className="warn" /> Flat return H3 · |log r| ≤ 1e-12</span><strong>{evaluation?.flat_return_h3?.flat_return_rate_h3 === null || evaluation?.flat_return_h3?.flat_return_rate_h3 === undefined ? "—" : `${percent(evaluation.flat_return_h3.flat_return_rate_h3)} · ${evaluation.flat_return_h3.flat_return_samples_h3}/${evaluation.flat_return_h3.flat_return_denominator_h3}`}</strong></div>
             <div className="gate-row"><span><i className="warn" /> Barrier calibration ECE</span><strong>{evaluation?.barrier_expected_calibration_error === null || evaluation?.barrier_expected_calibration_error === undefined ? "—" : percent(evaluation.barrier_expected_calibration_error)}</strong></div>
             <div className="gate-row">
               <span><i className={state.model_health.settlement_completeness_rate === null ? "warn" : state.model_health.settlement_completeness_rate >= 0.98 ? "ok" : "bad"} /> Settlement completeness</span>
