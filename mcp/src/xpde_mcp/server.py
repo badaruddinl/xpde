@@ -21,7 +21,9 @@ def create_server(service: XpdeReadOnlyService) -> FastMCP:
         name="XPDE Read-Only Technical Analysis",
         instructions=(
             "Read-only XPDE analysis. Preserve XPDE core decisions. "
-            "Never create or execute replacement trade signals."
+            "Never create or execute replacement trade signals. "
+            "WARMING_UP remains guide-capable, DEGRADED requires strong caution, "
+            "and SUSPENDED is diagnostic-only."
         ),
     )
 

@@ -21,6 +21,8 @@ def align_forecast(
     confluences: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
     limitations: list[str] = []
+    confluence_timeframes: set[str] = set()
+    conflict_timeframes: set[str] = set()
 
     if forecast_side not in {"BULLISH", "BEARISH"}:
         return {
@@ -28,6 +30,12 @@ def align_forecast(
             "confluences": [],
             "conflicts": [],
             "limitations": ["H3 q50 is flat; directional alignment is undefined."],
+            "counts": {
+                "confluences": 0,
+                "conflicts": 0,
+                "confluence_timeframes": [],
+                "conflict_timeframes": [],
+            },
             "rule": "Deterministic context only; never replaces XPDE core decision.",
         }
 
@@ -42,6 +50,7 @@ def align_forecast(
             side = _technical_side(str(value))
             basis_id = f"obs-{key}-{timeframe.lower()}"
             if side == forecast_side:
+                confluence_timeframes.add(timeframe)
                 confluences.append(
                     {
                         "statement": (
@@ -50,9 +59,11 @@ def align_forecast(
                         ),
                         "basis_ids": ["obs-h3-q50", basis_id],
                         "strength": "MEDIUM",
+                        "timeframe": timeframe,
                     }
                 )
             elif side is not None:
+                conflict_timeframes.add(timeframe)
                 conflicts.append(
                     {
                         "statement": (
@@ -61,6 +72,7 @@ def align_forecast(
                         ),
                         "basis_ids": ["obs-h3-q50", basis_id],
                         "strength": "MEDIUM",
+                        "timeframe": timeframe,
                     }
                 )
             elif value == "INSUFFICIENT_DATA":
@@ -78,6 +90,7 @@ def align_forecast(
     if isinstance(nearby, dict):
         distance_atr = nearby.get("distance_atr")
         if isinstance(distance_atr, (int, float)) and distance_atr < 1.0:
+            conflict_timeframes.add("M5")
             conflicts.append(
                 {
                     "statement": (
@@ -85,6 +98,7 @@ def align_forecast(
                     ),
                     "basis_ids": ["obs-h3-q50", basis_id],
                     "strength": "MEDIUM",
+                    "timeframe": "M5",
                 }
             )
 
@@ -95,7 +109,7 @@ def align_forecast(
         state = "INSUFFICIENT_DATA" if limitations else "NEUTRAL"
     elif conflict_count > support_count:
         state = "CONFLICTED"
-    elif support_count >= 3 and conflict_count == 0:
+    elif len(confluence_timeframes) >= 2 and conflict_count == 0:
         state = "ALIGNED"
     elif support_count > 0:
         state = "PARTIALLY_ALIGNED"
@@ -109,6 +123,8 @@ def align_forecast(
         "counts": {
             "confluences": support_count,
             "conflicts": conflict_count,
+            "confluence_timeframes": sorted(confluence_timeframes),
+            "conflict_timeframes": sorted(conflict_timeframes),
         },
         "rule": "Deterministic context only; never replaces XPDE core decision.",
     }

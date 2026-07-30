@@ -26,6 +26,13 @@ from .structure import market_structure, swing_points
 from .types import Bar, normalize_m5_bars
 
 _PROFILE_TICK_AGE_LIMIT = {"SCALPER": 10_000, "SNIPER": 5_000}
+_KNOWN_MODEL_HEALTH_STATES = {
+    "WARMING_UP",
+    "HEALTHY",
+    "DEGRADED",
+    "SUSPENDED",
+}
+_GUIDE_MODEL_HEALTH_STATES = {"WARMING_UP", "HEALTHY", "DEGRADED"}
 
 
 def _finite_float(value: Any, field: str) -> float:
@@ -58,6 +65,55 @@ def market_data_current(state: dict[str, Any], profile: str) -> tuple[bool, list
         if not isinstance(value, (int, float)) or value > maximum:
             reasons.append(f"{field.upper()}_STALE")
     return not reasons, sorted(set(reasons))
+
+
+def model_health_status(state: dict[str, Any]) -> str:
+    """Return a bounded model-health value for the public MCP contract."""
+    value = state.get("model_health")
+    status = value.get("status") if isinstance(value, dict) else None
+    if not isinstance(status, str):
+        return "UNKNOWN"
+    normalized = status.upper()
+    return normalized if normalized in _KNOWN_MODEL_HEALTH_STATES else "UNKNOWN"
+
+
+def forecast_guide_semantics(
+    state: dict[str, Any],
+    *,
+    market_current: bool,
+) -> dict[str, Any]:
+    """Apply one health-aware guide policy across every MCP output."""
+    health = model_health_status(state)
+    usable = market_current and health in _GUIDE_MODEL_HEALTH_STATES
+    if not market_current:
+        statement = "Forecast tidak current dan hanya boleh dibaca sebagai diagnostik."
+    elif health == "HEALTHY":
+        statement = "Forecast tersedia dan dapat dipertimbangkan sebagai panduan."
+    elif health == "WARMING_UP":
+        statement = (
+            "Forecast tersedia sebagai panduan; live evidence masih WARMING_UP "
+            "dan belum matang."
+        )
+    elif health == "DEGRADED":
+        statement = (
+            "Forecast hanya dapat dipakai sebagai panduan dengan peringatan kuat "
+            "karena model health DEGRADED."
+        )
+    elif health == "SUSPENDED":
+        statement = (
+            "Model health SUSPENDED; forecast hanya boleh dibaca sebagai "
+            "diagnostik, bukan panduan."
+        )
+    else:
+        statement = (
+            "Status model health tidak diketahui; forecast hanya boleh dibaca "
+            "sebagai diagnostik."
+        )
+    return {
+        "forecast_usable_as_guide": usable,
+        "evidence_stage": health,
+        "guide_statement": statement,
+    }
 
 
 def normalize_forecast(forecast: dict[str, Any]) -> dict[str, Any]:
@@ -269,7 +325,7 @@ def _build_observations(
             "obs-model-health",
             "EVIDENCE",
             "Current XPDE live model-health stage.",
-            state.get("model_health", {}).get("status"),
+            model_health_status(state),
             "XPDE_CORE",
         ),
         _observation(
@@ -414,8 +470,12 @@ def build_technical_analysis_packet(
         for timeframe in ("M5", "M15", "H1")
     }
     market_current, current_reasons = market_data_current(state, profile)
+    guide = forecast_guide_semantics(state, market_current=market_current)
     action = proposal.get("action")
-    core_actionable = market_current and action in {"LONG", "SHORT"}
+    core_actionable = guide["forecast_usable_as_guide"] and action in {
+        "LONG",
+        "SHORT",
+    }
     model_id = forecast.get("model_id")
     model_record = next(
         (value for value in models if value.get("model_id") == model_id),
@@ -425,9 +485,9 @@ def build_technical_analysis_packet(
         forecast_side=forecast["direction"]["h3_q50_side"],
         views=views,
     )
-    if not market_current:
+    if not guide["forecast_usable_as_guide"]:
         alignment["limitations"].append(
-            "Current market/forecast context is not current; alignment is diagnostic only."
+            f"{guide['guide_statement']} Technical alignment is diagnostic only."
         )
     snapshot = state.get("snapshot", {})
     bid = _finite_float(snapshot.get("bid"), "snapshot.bid")
@@ -444,18 +504,14 @@ def build_technical_analysis_packet(
             "indicator_input": "COMPLETED_BARS_ONLY",
         },
         "source_status": {
-            "forecast_usable_as_guide": market_current,
+            "forecast_usable_as_guide": guide["forecast_usable_as_guide"],
             "market_data_current": market_current,
             "market_data_reason_codes": current_reasons,
             "core_actionable": core_actionable,
-            "evidence_stage": state.get("model_health", {}).get("status", "UNKNOWN"),
+            "evidence_stage": guide["evidence_stage"],
             "forecast_status": state.get("forecast_status"),
             "connection_status": state.get("connection_status"),
-            "guide_statement": (
-                "Forecast tersedia dan dapat dipertimbangkan sebagai panduan."
-                if market_current
-                else "Forecast tidak current dan hanya boleh dibaca sebagai diagnostik."
-            ),
+            "guide_statement": guide["guide_statement"],
         },
         "market": {
             "symbol": snapshot.get("symbol"),

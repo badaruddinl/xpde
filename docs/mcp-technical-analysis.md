@@ -54,7 +54,7 @@ artifact directory and `manifest.json` must remain under the resolved
 
 ## Technical contract
 
-`ta_contract_id = xpde-ta-goldm-m5-v1`
+`ta_contract_id = xpde-ta-goldm-m5-v2`
 
 Inputs:
 
@@ -109,6 +109,10 @@ No indicator or alignment rule emits LONG, SHORT, BUY, or SELL.
 - LONG exits are represented on Bid; SHORT exits are represented on Ask.
 - WARMING_UP does not remove a current forecast. It means live evidence is not
   mature enough for a stability or promotion claim.
+- DEGRADED keeps a current forecast available only as a guide with a strong
+  warning.
+- SUSPENDED and unknown model-health states make the forecast diagnostic-only,
+  even when market data is current.
 - WAIT and NO_PREDICTION are valid exact core outputs.
 
 `forecast_usable_as_guide`, `market_data_current`, `core_actionable`, and
@@ -127,7 +131,9 @@ Packet facts use:
 Every confluence or conflict lists `basis_ids` that refer to packet observation
 IDs. Technical alignment can be `ALIGNED`, `PARTIALLY_ALIGNED`, `CONFLICTED`,
 `NEUTRAL`, or `INSUFFICIENT_DATA`; it remains context and never changes the core
-action.
+action. `ALIGNED` requires directional confluence from at least two distinct
+timeframes with no conflict. Multiple supporting indicators from only one
+timeframe remain `PARTIALLY_ALIGNED`.
 
 The normative machine-readable files are:
 

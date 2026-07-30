@@ -71,7 +71,7 @@ artifact paths are resolved before use.
 - offline/live evidence;
 - observations with provenance IDs.
 
-The TA contract is `xpde-ta-goldm-m5-v1`:
+The TA contract is `xpde-ta-goldm-m5-v2`:
 
 - M5 is native;
 - M15 needs all three exact M5 components;
@@ -101,7 +101,8 @@ No indicator emits a trade signal.
 The prompt `analyze_current_xpde_prediction` instructs an agent to retain the
 core decision and treat WARMING_UP correctly: a current forecast remains usable
 as a guide while live evidence is not mature enough for stability or promotion
-claims.
+claims. DEGRADED remains a guide only with a strong warning, while SUSPENDED or
+an unknown model-health state is diagnostic-only.
 
 ## Semantic contract
 
@@ -112,6 +113,11 @@ claims.
 - Barrier probabilities are origin-based and are not recomputed for current
   entry.
 - WARMING_UP does not erase a current forecast.
+- DEGRADED requires a strong guide warning.
+- SUSPENDED and unknown health states are diagnostic-only.
+- ALIGNED requires conflict-free directional support from at least two distinct
+  timeframes; several supporting indicators from one timeframe remain
+  PARTIALLY_ALIGNED.
 - WAIT and NO_PREDICTION are valid core outputs.
 - An MCP/agent must not invent a replacement BUY/SELL decision.
 

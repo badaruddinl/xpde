@@ -18,6 +18,8 @@ Wajib:
 - Jangan membuat BUY/SELL alternatif.
 - Jangan menyatakan origin probability sebagai current-entry probability.
 - WARMING_UP berarti forecast tetap dapat dianalisis, tetapi live evidence belum matang.
+- DEGRADED berarti guide hanya boleh dibaca dengan peringatan kuat.
+- SUSPENDED berarti forecast diagnostic only, bukan guide.
 - WAIT dan NO_PREDICTION adalah output core yang valid.
 - Jangan mengeksekusi order, mengirim feedback, mempromosikan model, retraining,
   membuat forecast baru, atau mengubah database/policy.

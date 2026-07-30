@@ -10,7 +10,7 @@ records outcomes and feedback, then leaves the final decision to a human.
 
 The separate package in [`mcp/`](mcp/) exposes XPDE over MCP STDIO without
 adding a write path or a second prediction model. Its primary
-`xpde_analyze_current` tool builds the versioned `xpde-ta-goldm-m5-v1` packet
+`xpde_analyze_current` tool builds the versioned `xpde-ta-goldm-m5-v2` packet
 from completed M5 bars, strict M15/H1 aggregation, EMA/RSI/ATR/ROC, confirmed
 swing structure, support/resistance, the current forecast, exact Rust core
 proposal and model evidence.

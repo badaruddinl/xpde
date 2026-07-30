@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 from conftest import PREDICTION_ID, make_bar
 from jsonschema import Draft202012Validator
+from xpde_mcp.contracts import SEMANTIC_CONTRACT, TA_CONTRACT_ID
+from xpde_mcp.prompts import analyze_current_prompt
 from xpde_mcp.server import create_server
 from xpde_mcp.technical.alignment import align_forecast
 from xpde_mcp.technical.indicators import atr_wilder, ema, rsi_wilder
@@ -58,6 +60,7 @@ def test_requested_market_structure_depth_is_honored(service_fixture) -> None:
         timeframe="M15",
         bars=50,
     )
+    assert result["contract"]["ta_contract_id"] == TA_CONTRACT_ID
     assert result["view"]["bar_count"] == 50
 
 
@@ -70,6 +73,10 @@ def test_warming_up_forecast_is_usable_guide_but_wait_is_not_actionable(
         "forecast_usable_as_guide": True,
         "core_actionable": False,
         "evidence_stage": "WARMING_UP",
+        "guide_statement": (
+            "Forecast tersedia sebagai panduan; live evidence masih WARMING_UP "
+            "dan belum matang."
+        ),
         "reason_codes": [],
     }
     assert current["core_decision"]["action"] == "WAIT"
@@ -102,6 +109,7 @@ def test_packet_preserves_non_up_semantics_and_exact_core_decision(
 
 def test_packet_matches_published_json_schema(service_fixture) -> None:
     packet = service_fixture["service"].analyze_current()
+    assert packet["contract"]["ta_contract_id"] == TA_CONTRACT_ID
     path = (
         Path(__file__).resolve().parents[1]
         / "src"
@@ -119,6 +127,7 @@ def test_every_alignment_basis_references_an_observation(service_fixture) -> Non
     for collection in ("confluences", "conflicts"):
         for item in packet["alignment"][collection]:
             assert set(item["basis_ids"]) <= identifiers
+            assert item["timeframe"] in {"M5", "M15", "H1"}
 
 
 def test_stale_forecast_remains_diagnostic_not_usable(service_fixture) -> None:
@@ -137,13 +146,106 @@ def test_stale_forecast_remains_diagnostic_not_usable(service_fixture) -> None:
     service.api.get_state = original  # type: ignore[method-assign]
 
 
-def test_alignment_never_emits_trade_action() -> None:
-    view = {
-        "trend": {"state": "BULLISH"},
-        "momentum": {"state": "BULLISH"},
-        "structure": {"state": "BULLISH"},
-        "levels": {"nearest_resistance": None},
+@pytest.mark.parametrize(
+    ("health", "expected_stage", "usable", "statement_fragment"),
+    [
+        ("HEALTHY", "HEALTHY", True, "dipertimbangkan sebagai panduan"),
+        ("WARMING_UP", "WARMING_UP", True, "belum matang"),
+        ("DEGRADED", "DEGRADED", True, "peringatan kuat"),
+        ("SUSPENDED", "SUSPENDED", False, "bukan panduan"),
+        ("UNRECOGNIZED", "UNKNOWN", False, "tidak diketahui"),
+    ],
+)
+def test_health_guide_matrix_is_consistent_across_all_current_outputs(
+    service_fixture,
+    health: str,
+    expected_stage: str,
+    usable: bool,
+    statement_fragment: str,
+) -> None:
+    state = service_fixture["state"]
+    state["model_health"]["status"] = health
+    current = service_fixture["service"].get_current("SCALPER")
+    bundle_current = service_fixture["service"].get_analysis_bundle(profile="SCALPER")[
+        "current"
+    ]
+    packet = service_fixture["service"].analyze_current(profile="SCALPER")
+    outputs = [
+        current["source_status"],
+        bundle_current["source_status"],
+        packet["source_status"],
+    ]
+    for source_status in outputs:
+        assert source_status["evidence_stage"] == expected_stage
+        assert source_status["forecast_usable_as_guide"] is usable
+        assert statement_fragment in source_status["guide_statement"]
+
+
+def test_suspended_model_cannot_be_marked_actionable_even_with_directional_core_action(
+    service_fixture,
+) -> None:
+    state = service_fixture["state"]
+    state["model_health"]["status"] = "SUSPENDED"
+    for proposal in state["proposals"]:
+        proposal["action"] = "LONG"
+    current = service_fixture["service"].get_current("SCALPER")
+    packet = service_fixture["service"].analyze_current(profile="SCALPER")
+    assert current["core_decision"]["action"] == "LONG"
+    assert packet["core_decision"]["action"] == "LONG"
+    assert current["source_status"]["forecast_usable_as_guide"] is False
+    assert current["source_status"]["core_actionable"] is False
+    assert packet["source_status"]["core_actionable"] is False
+    assert any("diagnostik" in value for value in packet["alignment"]["limitations"])
+
+
+def test_missing_model_health_is_fail_closed_as_unknown_diagnostic(
+    service_fixture,
+) -> None:
+    service_fixture["state"]["model_health"] = None
+    current = service_fixture["service"].get_current("SCALPER")
+    packet = service_fixture["service"].analyze_current(profile="SCALPER")
+    for source_status in (current["source_status"], packet["source_status"]):
+        assert source_status["evidence_stage"] == "UNKNOWN"
+        assert source_status["forecast_usable_as_guide"] is False
+        assert "tidak diketahui" in source_status["guide_statement"]
+
+
+def test_machine_and_prompt_contracts_publish_health_guide_semantics() -> None:
+    assert SEMANTIC_CONTRACT["model_health_guide_semantics"] == {
+        "HEALTHY": "GUIDE",
+        "WARMING_UP": "GUIDE_WITH_IMMATURE_EVIDENCE",
+        "DEGRADED": "GUIDE_WITH_STRONG_CAUTION",
+        "SUSPENDED": "DIAGNOSTIC_ONLY",
+        "UNKNOWN": "DIAGNOSTIC_ONLY",
     }
+    prompt = analyze_current_prompt("SCALPER")
+    assert "DEGRADED berarti guide" in prompt
+    assert "SUSPENDED berarti forecast diagnostic only" in prompt
+
+
+def _alignment_view(
+    *,
+    trend: str = "MIXED",
+    momentum: str = "NEUTRAL",
+    structure: str = "RANGE_OR_MIXED",
+) -> dict:
+    return {
+        "trend": {"state": trend},
+        "momentum": {"state": momentum},
+        "structure": {"state": structure},
+        "levels": {
+            "nearest_resistance": None,
+            "nearest_support": None,
+        },
+    }
+
+
+def test_alignment_never_emits_trade_action() -> None:
+    view = _alignment_view(
+        trend="BULLISH",
+        momentum="BULLISH",
+        structure="BULLISH",
+    )
     result = align_forecast(
         forecast_side="BULLISH",
         views={"M5": view, "M15": view, "H1": view},
@@ -153,10 +255,126 @@ def test_alignment_never_emits_trade_action() -> None:
     assert "BUY" not in json.dumps(result)
 
 
+def test_three_supporting_facts_from_one_timeframe_are_only_partially_aligned() -> None:
+    result = align_forecast(
+        forecast_side="BULLISH",
+        views={
+            "M5": _alignment_view(
+                trend="BULLISH",
+                momentum="BULLISH",
+                structure="BULLISH",
+            ),
+            "M15": _alignment_view(),
+            "H1": _alignment_view(),
+        },
+    )
+    assert result["state"] == "PARTIALLY_ALIGNED"
+    assert result["counts"] == {
+        "confluences": 3,
+        "conflicts": 0,
+        "confluence_timeframes": ["M5"],
+        "conflict_timeframes": [],
+    }
+
+
+def test_support_from_two_distinct_timeframes_is_aligned_without_conflict() -> None:
+    result = align_forecast(
+        forecast_side="BULLISH",
+        views={
+            "M5": _alignment_view(trend="BULLISH"),
+            "M15": _alignment_view(momentum="BULLISH"),
+            "H1": _alignment_view(),
+        },
+    )
+    assert result["state"] == "ALIGNED"
+    assert result["counts"]["confluence_timeframes"] == ["M15", "M5"]
+    assert result["counts"]["conflicts"] == 0
+
+
+def test_cross_timeframe_support_with_any_directional_conflict_is_not_aligned() -> None:
+    result = align_forecast(
+        forecast_side="BULLISH",
+        views={
+            "M5": _alignment_view(trend="BULLISH"),
+            "M15": _alignment_view(momentum="BULLISH"),
+            "H1": _alignment_view(structure="BEARISH"),
+        },
+    )
+    assert result["state"] == "PARTIALLY_ALIGNED"
+    assert result["counts"]["confluence_timeframes"] == ["M15", "M5"]
+    assert result["counts"]["conflict_timeframes"] == ["H1"]
+
+
+def test_nearby_execution_level_prevents_otherwise_cross_timeframe_alignment() -> None:
+    m5 = _alignment_view(trend="BULLISH")
+    m5["levels"]["nearest_resistance"] = {"distance_atr": 0.75}
+    result = align_forecast(
+        forecast_side="BULLISH",
+        views={
+            "M5": m5,
+            "M15": _alignment_view(momentum="BULLISH"),
+            "H1": _alignment_view(),
+        },
+    )
+    assert result["state"] == "PARTIALLY_ALIGNED"
+    assert result["counts"]["confluence_timeframes"] == ["M15", "M5"]
+    assert result["counts"]["conflict_timeframes"] == ["M5"]
+    assert any(
+        "less than one ATR" in conflict["statement"] for conflict in result["conflicts"]
+    )
+
+
+def test_dominant_cross_timeframe_conflicts_are_classified_as_conflicted() -> None:
+    result = align_forecast(
+        forecast_side="BEARISH",
+        views={
+            "M5": _alignment_view(trend="BEARISH"),
+            "M15": _alignment_view(momentum="BULLISH"),
+            "H1": _alignment_view(structure="BULLISH"),
+        },
+    )
+    assert result["state"] == "CONFLICTED"
+    assert result["counts"]["confluences"] == 1
+    assert result["counts"]["conflicts"] == 2
+
+
+def test_directional_forecast_with_only_insufficient_views_is_insufficient() -> None:
+    result = align_forecast(
+        forecast_side="BULLISH",
+        views={
+            timeframe: _alignment_view(
+                trend="INSUFFICIENT_DATA",
+                momentum="INSUFFICIENT_DATA",
+                structure="INSUFFICIENT_DATA",
+            )
+            for timeframe in ("M5", "M15", "H1")
+        },
+    )
+    assert result["state"] == "INSUFFICIENT_DATA"
+    assert result["counts"]["confluences"] == 0
+    assert result["counts"]["conflicts"] == 0
+    assert len(result["limitations"]) == 9
+
+
+def test_flat_forecast_has_explicit_empty_alignment_provenance() -> None:
+    result = align_forecast(
+        forecast_side="FLAT",
+        views={timeframe: _alignment_view() for timeframe in ("M5", "M15", "H1")},
+    )
+    assert result["state"] == "NEUTRAL"
+    assert result["counts"] == {
+        "confluences": 0,
+        "conflicts": 0,
+        "confluence_timeframes": [],
+        "conflict_timeframes": [],
+    }
+
+
 def test_prediction_explanation_uses_origin_and_objective_evidence(
     service_fixture,
 ) -> None:
     result = service_fixture["service"].explain_prediction(PREDICTION_ID)
+    assert result["contract"]["ta_contract_id"] == TA_CONTRACT_ID
     assert result["contract"]["analysis_reference"] == "PREDICTION_ORIGIN"
     assert result["forecast"]["prediction_id"] == PREDICTION_ID
     assert len(result["evidence"]["horizon_outcomes"]) == 4

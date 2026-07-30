@@ -30,7 +30,7 @@
       ],
       "properties": {
         "packet_version": { "const": "1.0" },
-        "ta_contract_id": { "const": "xpde-ta-goldm-m5-v1" },
+        "ta_contract_id": { "const": "xpde-ta-goldm-m5-v2" },
         "forecast_authority": { "const": "XPDE_CORE" },
         "decision_authority": { "const": "XPDE_CORE" },
         "native_timeframe": { "const": "M5" },
@@ -47,7 +47,8 @@
         "forecast_usable_as_guide",
         "market_data_current",
         "core_actionable",
-        "evidence_stage"
+        "evidence_stage",
+        "guide_statement"
       ],
       "properties": {
         "forecast_usable_as_guide": { "type": "boolean" },
@@ -121,7 +122,14 @@
     "levels": { "type": "object" },
     "alignment": {
       "type": "object",
-      "required": ["state", "confluences", "conflicts", "limitations", "rule"],
+      "required": [
+        "state",
+        "confluences",
+        "conflicts",
+        "limitations",
+        "counts",
+        "rule"
+      ],
       "properties": {
         "state": {
           "enum": [
@@ -143,6 +151,30 @@
         "limitations": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "counts": {
+          "type": "object",
+          "required": [
+            "confluences",
+            "conflicts",
+            "confluence_timeframes",
+            "conflict_timeframes"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "confluences": { "type": "integer", "minimum": 0 },
+            "conflicts": { "type": "integer", "minimum": 0 },
+            "confluence_timeframes": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "enum": ["M5", "M15", "H1"] }
+            },
+            "conflict_timeframes": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "enum": ["M5", "M15", "H1"] }
+            }
+          }
         },
         "rule": { "type": "string" }
       }
@@ -215,7 +247,7 @@
     },
     "interpretation": {
       "type": "object",
-      "required": ["statement", "basis_ids", "strength"],
+      "required": ["statement", "basis_ids", "strength", "timeframe"],
       "properties": {
         "statement": { "type": "string" },
         "basis_ids": {
@@ -223,7 +255,8 @@
           "minItems": 1,
           "items": { "type": "string", "pattern": "^obs-" }
         },
-        "strength": { "enum": ["LOW", "MEDIUM", "HIGH"] }
+        "strength": { "enum": ["LOW", "MEDIUM", "HIGH"] },
+        "timeframe": { "enum": ["M5", "M15", "H1"] }
       }
     }
   }

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Final
 
 PACKET_VERSION: Final = "1.0"
-TA_CONTRACT_ID: Final = "xpde-ta-goldm-m5-v1"
+TA_CONTRACT_ID: Final = "xpde-ta-goldm-m5-v2"
 FORECAST_AUTHORITY: Final = "XPDE_CORE"
 DECISION_AUTHORITY: Final = "XPDE_CORE"
 SUPPORTED_SYMBOL: Final = "GOLDm#"
@@ -24,6 +24,13 @@ SEMANTIC_CONTRACT: Final = {
     "warming_up": (
         "Forecast remains usable as a guide while live evidence is immature."
     ),
+    "model_health_guide_semantics": {
+        "HEALTHY": "GUIDE",
+        "WARMING_UP": "GUIDE_WITH_IMMATURE_EVIDENCE",
+        "DEGRADED": "GUIDE_WITH_STRONG_CAUTION",
+        "SUSPENDED": "DIAGNOSTIC_ONLY",
+        "UNKNOWN": "DIAGNOSTIC_ONLY",
+    },
     "wait_is_valid_output": True,
     "no_prediction_is_valid_output": True,
     "core_decision_must_be_preserved": True,

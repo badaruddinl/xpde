@@ -6,7 +6,7 @@ from typing import Any
 
 from .api import XpdeApiClient
 from .config import Settings
-from .contracts import INTERPRETATION_CONSTRAINTS, SEMANTIC_CONTRACT
+from .contracts import INTERPRETATION_CONSTRAINTS, SEMANTIC_CONTRACT, TA_CONTRACT_ID
 from .database import ReadOnlyDatabase
 from .errors import ContractError, XpdeMcpError
 from .manifest import ManifestReader
@@ -14,7 +14,9 @@ from .technical.alignment import align_forecast
 from .technical.packet import (
     build_technical_analysis_packet,
     build_technical_view,
+    forecast_guide_semantics,
     market_data_current,
+    model_health_status,
     normalize_forecast,
 )
 from .technical.types import normalize_m5_bars
@@ -113,15 +115,17 @@ class XpdeReadOnlyService:
         if proposal is None:
             raise ContractError(f"XPDE state has no {profile} core proposal")
         current, reasons = market_data_current(state, profile)
+        guide = forecast_guide_semantics(state, market_current=current)
         action = proposal.get("action")
         return {
             "source_status": {
                 "market_data_current": current,
-                "forecast_usable_as_guide": current,
-                "core_actionable": current and action in {"LONG", "SHORT"},
-                "evidence_stage": state.get("model_health", {}).get(
-                    "status", "UNKNOWN"
+                "forecast_usable_as_guide": guide["forecast_usable_as_guide"],
+                "core_actionable": (
+                    guide["forecast_usable_as_guide"] and action in {"LONG", "SHORT"}
                 ),
+                "evidence_stage": guide["evidence_stage"],
+                "guide_statement": guide["guide_statement"],
                 "reason_codes": reasons,
             },
             "market": _compact_state(state)["snapshot"],
@@ -223,15 +227,17 @@ class XpdeReadOnlyService:
         if proposal is None:
             raise ContractError(f"XPDE state has no {profile} core proposal")
         current, reasons = market_data_current(state, profile)
+        guide = forecast_guide_semantics(state, market_current=current)
         action = proposal.get("action")
         return {
             "source_status": {
                 "market_data_current": current,
-                "forecast_usable_as_guide": current,
-                "core_actionable": current and action in {"LONG", "SHORT"},
-                "evidence_stage": state.get("model_health", {}).get(
-                    "status", "UNKNOWN"
+                "forecast_usable_as_guide": guide["forecast_usable_as_guide"],
+                "core_actionable": (
+                    guide["forecast_usable_as_guide"] and action in {"LONG", "SHORT"}
                 ),
+                "evidence_stage": guide["evidence_stage"],
+                "guide_statement": guide["guide_statement"],
                 "reason_codes": reasons,
             },
             "runtime": _compact_state(state),
@@ -312,7 +318,7 @@ class XpdeReadOnlyService:
         )
         return {
             "contract": {
-                "ta_contract_id": "xpde-ta-goldm-m5-v1",
+                "ta_contract_id": TA_CONTRACT_ID,
                 "decision_authority": "XPDE_CORE",
             },
             "symbol": symbol,
@@ -344,7 +350,7 @@ class XpdeReadOnlyService:
         }
         return {
             "contract": {
-                "ta_contract_id": "xpde-ta-goldm-m5-v1",
+                "ta_contract_id": TA_CONTRACT_ID,
                 "analysis_reference": "PREDICTION_ORIGIN",
                 "decision_authority": "XPDE_CORE",
             },
@@ -385,6 +391,6 @@ class XpdeReadOnlyService:
                 "manifest_read_error": manifest_error,
             },
             "live": evaluation,
-            "evidence_stage": state.get("model_health", {}).get("status", "UNKNOWN"),
+            "evidence_stage": model_health_status(state),
             "semantic_contract": SEMANTIC_CONTRACT,
         }
